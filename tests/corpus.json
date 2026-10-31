@@ -1,0 +1,114 @@
+[
+  {
+    "id": "sec-01",
+    "tier": "secret",
+    "text": "Here is my AWS key: AKIAIOSFODNN7EXAMPLE",
+    "expect": [
+      "SECRET"
+    ]
+  },
+  {
+    "id": "sec-02",
+    "tier": "secret",
+    "text": "Use sk-proj-abc123XYZdef456GHI789jkl012MNO345 as the token",
+    "expect": [
+      "SECRET"
+    ]
+  },
+  {
+    "id": "sec-03",
+    "tier": "secret",
+    "text": "JWT: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+    "expect": [
+      "SECRET"
+    ]
+  },
+  {
+    "id": "sec-04",
+    "tier": "secret",
+    "text": "postgres://admin:hunter2@db.internal:5432/prod",
+    "expect": [
+      "SECRET"
+    ]
+  },
+  {
+    "id": "sec-05",
+    "tier": "secret",
+    "text": "OPENAI_API_KEY=<PII_SECRET_a1b2c3d4>",
+    "expect": []
+  },
+  {
+    "id": "pii-01",
+    "tier": "pii",
+    "text": "Email alice@example.com or call +1-415-555-0199",
+    "expect": [
+      "PRIVATE_EMAIL",
+      "PRIVATE_PHONE"
+    ]
+  },
+  {
+    "id": "pii-02",
+    "tier": "pii",
+    "text": "Ship to Alice Smith, 123 Main St, Springfield IL 62704",
+    "expect": [
+      "PRIVATE_PERSON",
+      "PRIVATE_ADDRESS"
+    ]
+  },
+  {
+    "id": "pii-03",
+    "tier": "pii",
+    "text": "See https://internal.corp/api/v2/users for details",
+    "expect": [
+      "PRIVATE_URL"
+    ]
+  },
+  {
+    "id": "pii-04",
+    "tier": "pii",
+    "text": "Born 1985-03-12, SSN 123-45-6789",
+    "expect": [
+      "PRIVATE_DATE",
+      "ACCOUNT_NUMBER"
+    ]
+  },
+  {
+    "id": "pii-05",
+    "tier": "pii",
+    "text": "Contact bob@corp.io and carol@corp.io",
+    "expect": [
+      "PRIVATE_EMAIL",
+      "PRIVATE_EMAIL"
+    ]
+  },
+  {
+    "id": "neg-01",
+    "tier": "negative",
+    "text": "password = os.environ.get('DB_PASS')",
+    "expect": []
+  },
+  {
+    "id": "neg-02",
+    "tier": "negative",
+    "text": "The function returns a random 32-byte buffer",
+    "expect": []
+  },
+  {
+    "id": "neg-03",
+    "tier": "negative",
+    "text": "npm install @types/node@20.11.0",
+    "expect": []
+  },
+  {
+    "id": "neg-04",
+    "tier": "negative",
+    "text": "SHA256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    "expect": []
+  },
+  {
+    "id": "neg-05",
+    "tier": "negative",
+    "text": "Set retries to 3 and timeout to 30000ms",
+    "expect": []
+  }
+]

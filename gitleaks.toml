@@ -1,0 +1,181 @@
+# piifence gitleaks config: default rules + AWS key rule variant that also
+# matches documentation-style EXAMPLE key IDs. The stock aws-access-token rule
+# allowlists values ending in EXAMPLE (gitleaks/gitleaks config line ~217), so
+# the canonical example key never reaches a redaction pipeline. A redaction
+# gateway should treat it as a secret anyway.
+title = "piifence"
+[extend]
+useDefault = true
+
+[[rules]]
+id = "piifence-aws-access-token"
+description = "AWS access key ID, including documentation-style EXAMPLE values that the default rule allowlists"
+regex = '''\b((?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z2-7]{16})\b'''
+entropy = 3
+keywords = ["a3t", "akia", "asia", "abia", "acca"]
+
+[[rules]]
+id = "piifence-openai-project-key"
+description = "OpenAI project/service-account API key (gitleaks default rule length is too strict)"
+regex = '''\bsk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}\b'''
+keywords = ["sk-proj", "sk-svcacct", "sk-admin"]
+
+[[rules]]
+id = "piifence-url-credentials"
+description = "Credentials embedded in a URL (postgres, mysql, mongo, redis, amqp, ftp, http)"
+regex = '''\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|rediss|amqp|amqps|ftp|ftps|https?)://[^\s:/@]{0,64}:[^\s@/]{1,128}@[^\s]+'''
+keywords = ["://"]
+
+[[rules]]
+id = "piifence-opencode-key"
+description = "OpenCode API key (bare value in tool output, no assignment keyword)"
+regex = '''\boc_sk_[A-Za-z0-9_-]{20,}\b'''
+keywords = ["oc_sk_"]
+
+[[rules]]
+id = "piifence-password-assignment"
+description = "Password, secret, key or token assigned with = or : in env, config, shell or JSON; allows the symbols and base64 characters the default generic rule rejects"
+regex = '''(?i)(?:^|[\s"'\x60,;:/{(&?])[a-z0-9_.-]{0,40}?(?:password|passwd|pwd|passphrase|secret|api[_-]?key|access[_-]?key|auth[_-]?token|token)["']?\s*(?:[:=]|=>|:=)\s*(?:"([^"\r\n]{8,128})"|'([^'\r\n]{8,128})'|([^\s"'\x60][^\s\x60;,&]{7,127}))'''
+entropy = 3.0
+keywords = ["password", "passwd", "pwd", "passphrase", "secret", "key", "token"]
+
+[[rules.allowlists]]
+description = "references, templates and placeholders are not values"
+regexes = [
+    '''^(?:\$|\{|<|%\(|os\.|process\.|ENV\[|env\(|getenv|System\.getenv)''',
+    '''(?i)^(?:your|change[_-]?me|example|placeholder|sample|dummy|redacted|none|null|true|false|undefined)''',
+    '''(?i)_here$''',
+    '''^[x*#.-]{8,}$''',
+]
+
+[[rules.allowlists]]
+description = "code, not a value: a call, macro, path or method chain such as next(state, Token![:], token::Paren, a.b.clone()"
+regexes = [
+    '''^[A-Za-z_]\w*(?:(?:\.|::)[A-Za-z_]\w*)*(?:\(|!\(|!\[|::|\[)''',
+    '''^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$''',
+]
+
+[[rules.allowlists]]
+description = "identifiers that end in key or token but are not credentials"
+regexTarget = "match"
+regexes = [
+    '''(?i)(?:hot|mon|turn|pub(?:lic)?|primary|foreign|sort|hash|partition|index|idx|shard|cache|ssh[_-]?public|host|session[_-]?id|csrf|xsrf|anti[_-]?forgery|cancellation|continuation|page|next|prev|cursor)[_-]?(?:key|token)''',
+    '''(?i)(?:key|token)[_-]?(?:board|code|frame|word|up|down|left|right|press|ring|size|name|id|path|file|type|store|alias|length|count|expiry|expires|ttl|url|uri|endpoint)''',
+]
+
+[[rules]]
+id = "piifence-netrc-password"
+description = ".netrc credential line (machine … login … password …), also when split over lines"
+regex = '''(?i)\bmachine\s+\S+\s+login\s+\S+\s+password\s+(\S{8,})'''
+entropy = 3.0
+keywords = ["machine"]
+
+[[rules]]
+id = "piifence-authorization-header"
+description = "Authorization: Basic | Bearer | Token header with a literal credential (env references like $API_KEY do not match)"
+regex = '''(?i)\bauthorization["']?\s*[:=]\s*["']?(?:basic|bearer|token)\s+([A-Za-z0-9._~+/=-]{16,})'''
+entropy = 3.0
+keywords = ["authorization"]
+
+[[rules]]
+id = "piifence-azure-storage-account-key"
+description = "Azure storage connection string AccountKey"
+regex = '''(?i)accountkey=([A-Za-z0-9+/]{86}==)'''
+keywords = ["accountkey="]
+
+[[rules]]
+id = "piifence-azure-sas-signature"
+description = "Azure SAS token signature (sig= query parameter)"
+regex = '''(?i)(?:^|[?&;=\s])sig=([A-Za-z0-9%+/_-]{40,120})'''
+entropy = 3.0
+keywords = ["sig="]
+
+[[rules]]
+id = "piifence-discord-webhook"
+description = "Discord webhook URL (the token after the channel id grants posting rights)"
+regex = '''https://(?:canary\.|ptb\.)?discord(?:app)?\.com/api/webhooks/\d{17,20}/([A-Za-z0-9_-]{60,80})'''
+keywords = ["discord"]
+
+[[rules]]
+id = "piifence-dockerhub-pat"
+description = "Docker Hub personal access token"
+regex = '''\b(dckr_pat_[A-Za-z0-9_-]{27,})'''
+keywords = ["dckr_pat_"]
+
+[[rules]]
+id = "piifence-braintree-access-token"
+description = "Braintree access token"
+regex = '''\b(access_token\$(?:production|sandbox)\$[a-z0-9]{16}\$[0-9a-f]{32})\b'''
+keywords = ["access_token$"]
+
+# Delimiter-free variants of default rules. The defaults require a quote, space, ;
+# or line end after the value, so a key followed by &, <, CJK text or an ANSI escape
+# is missed. The vendor prefix makes these safe without that requirement.
+
+[[rules]]
+id = "piifence-anthropic-key"
+description = "Anthropic API/admin key, no delimiter required after the value"
+regex = '''\b(sk-ant-(?:api|admin)\d{2}-[A-Za-z0-9_-]{93}AA)'''
+keywords = ["sk-ant-"]
+
+[[rules]]
+id = "piifence-stripe-secret-key"
+description = "Stripe secret/restricted key, no delimiter required after the value"
+regex = '''\b((?:sk|rk)_(?:test|live|prod)_[A-Za-z0-9]{24,99})'''
+entropy = 2
+keywords = ["sk_test_", "sk_live_", "sk_prod_", "rk_test_", "rk_live_", "rk_prod_"]
+
+[[rules]]
+id = "piifence-jwt"
+description = "JSON Web Token, no delimiter required after the value"
+regex = '''\b(ey[a-zA-Z0-9]{17,}\.ey[a-zA-Z0-9\/\\_-]{17,}\.[a-zA-Z0-9\/\\_-]{10,}={0,2})'''
+entropy = 3
+keywords = ["ey"]
+
+[[rules]]
+id = "piifence-openrouter-key"
+description = "OpenRouter API key"
+regex = '''\b(sk-or-v1-[0-9a-f]{64})\b'''
+keywords = ["sk-or-v1-"]
+
+[[rules]]
+id = "piifence-groq-key"
+description = "Groq API key"
+regex = '''\b(gsk_[A-Za-z0-9]{40,})\b'''
+keywords = ["gsk_"]
+
+[[rules]]
+id = "piifence-replicate-token"
+description = "Replicate API token"
+regex = '''\b(r8_[A-Za-z0-9]{30,})\b'''
+keywords = ["r8_"]
+
+[[rules]]
+id = "piifence-xai-key"
+description = "xAI API key"
+regex = '''\b(xai-[A-Za-z0-9]{60,})\b'''
+keywords = ["xai-"]
+
+[[rules]]
+id = "piifence-stripe-webhook-secret"
+description = "Stripe webhook signing secret"
+regex = '''\b(whsec_[A-Za-z0-9]{24,})\b'''
+keywords = ["whsec_"]
+
+[[rules]]
+id = "piifence-supabase-pat"
+description = "Supabase personal access token"
+regex = '''\b(sbp_[0-9a-f]{40})\b'''
+keywords = ["sbp_"]
+
+[[rules]]
+id = "piifence-atlassian-api-token"
+description = "Atlassian API token"
+regex = '''\b(ATATT3[A-Za-z0-9_-]{100,})'''
+keywords = ["atatt3"]
+
+[[rules]]
+id = "piifence-nuget-key"
+description = "NuGet API key"
+regex = '''\b(oy2[a-z0-9]{43})\b'''
+keywords = ["oy2"]

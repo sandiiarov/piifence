@@ -1,0 +1,10 @@
+/target
+/data
+*.log
+.DS_Store
+piifence.toml
+plugin/*/tsconfig.json
+plugin/*/.claude-plugin/types/
+
+__pycache__/
+*.pyc

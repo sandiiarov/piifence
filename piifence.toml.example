@@ -1,0 +1,31 @@
+# piifence category configuration.
+# Copy to ./piifence.toml (repo-local), ~/.config/piifence/config.toml (user),
+# or point PIIF_CONFIG at it. PIIF_CATEGORIES env overrides the file.
+#
+# Only listed categories are detected and redacted; everything else is sent to
+# the provider untouched. Omitting `categories` (or no file) means ALL.
+# Valid names:
+#   account_number, private_address, private_email, private_person,
+#   private_phone, private_url, private_date, secret
+#
+# Run the neural model for `secret` as well as gitleaks (default true). Set
+# false for a faster rules-only secret mode; gitleaks catches known formats but
+# misses model-only secrets (e.g. some URL-embedded credentials).
+# llm_filter = true
+#
+# Example — only credentials and emails:
+# categories = ["secret", "private_email"]
+#
+# Example — everything except dates (e.g. dates are useful context):
+# categories = ["account_number", "private_address", "private_email", "private_person", "private_phone", "private_url", "secret"]
+
+categories = [
+  "account_number",
+  "private_address",
+  "private_email",
+  "private_person",
+  "private_phone",
+  "private_url",
+  "private_date",
+  "secret",
+]

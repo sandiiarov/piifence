@@ -1,0 +1,6 @@
+{
+  "name": "piifence-approval",
+  "version": "0.1.0",
+  "description": "Ask before sending sensitive values: Redact, Send raw, or Block.",
+  "author": { "name": "piifence" }
+}

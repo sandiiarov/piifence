@@ -1,0 +1,9 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "piifence-notice",
+  "version": "0.1.0",
+  "description": "Show a Claude Code notice when the piifence gateway redacted input before it reached the provider",
+  "author": {
+    "name": "piifence"
+  }
+}

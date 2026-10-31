@@ -1,0 +1,109 @@
+    Finished `release` profile [optimized] target(s) in 0.14s
+     Running `target/release/piifence-m1`
+Loading model from data
+Model config: 8 layers, 640 hidden, 128 experts (top-4)
+Tokenizer loaded (199998 tokens)
+Loading weights from data/model.safetensors ...
+Loaded 140 tensors from safetensors file.
+Model loaded successfully.
+Weights loaded in 8.6s
+Model loaded.
+Tokenized: 15 tokens in 0.5ms
+Forward pass: 741.4ms
+Viterbi decode: 0.0ms
+Total: 742.0ms, 0 spans detected
+✅ sec-01: got=["SECRET"] want=["SECRET"]
+     1.000  SECRET             "AKIAIOSFODNN7EXAMPLE"  [gitleaks:piifence-aws-access-token]
+Tokenized: 22 tokens in 0.4ms
+Forward pass: 434.7ms
+Viterbi decode: 0.0ms
+Total: 435.2ms, 1 spans detected
+✅ sec-02: got=["SECRET"] want=["SECRET"]
+     1.000  SECRET             "sk-proj-abc123XYZdef456GHI789jkl012MNO345"  [gitleaks:piifence-openai-project-key]
+Tokenized: 57 tokens in 0.3ms
+Forward pass: 246.7ms
+Viterbi decode: 0.1ms
+Total: 247.1ms, 1 spans detected
+✅ sec-03: got=["SECRET"] want=["SECRET"]
+     1.000  SECRET             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk"  [gitleaks:jwt]
+Tokenized: 14 tokens in 0.7ms
+Forward pass: 225.2ms
+Viterbi decode: 0.0ms
+Total: 225.9ms, 2 spans detected
+✅ sec-04: got=["SECRET"] want=["SECRET"]
+     1.000  SECRET             "postgres://admin:hunter2@db.internal:5432/prod"  [gitleaks:piifence-url-credentials]
+Tokenized: 17 tokens in 0.1ms
+Forward pass: 259.3ms
+Viterbi decode: 0.0ms
+Total: 259.5ms, 1 spans detected
+✅ sec-05: got=[] want=[]
+    [suppressed:placeholder]  0.970  SECRET             "PII_SECRET_a1b2c3d4"  [model]
+Tokenized: 15 tokens in 0.1ms
+Forward pass: 249.4ms
+Viterbi decode: 0.0ms
+Total: 249.5ms, 2 spans detected
+✅ pii-01: got=["PRIVATE_EMAIL", "PRIVATE_PHONE"] want=["PRIVATE_EMAIL", "PRIVATE_PHONE"]
+     1.000  PRIVATE_EMAIL      " alice@example.com"  [model]
+     1.000  PRIVATE_PHONE      " +1-415-555-0199"  [model]
+Tokenized: 15 tokens in 0.1ms
+Forward pass: 215.7ms
+Viterbi decode: 0.0ms
+Total: 215.9ms, 2 spans detected
+✅ pii-02: got=["PRIVATE_ADDRESS", "PRIVATE_PERSON"] want=["PRIVATE_ADDRESS", "PRIVATE_PERSON"]
+     1.000  PRIVATE_PERSON     " Alice Smith"  [model]
+     1.000  PRIVATE_ADDRESS    "123 Main St, Springfield IL 62704"  [model]
+Tokenized: 12 tokens in 0.3ms
+Forward pass: 265.8ms
+Viterbi decode: 0.0ms
+Total: 266.1ms, 1 spans detected
+✅ pii-03: got=["PRIVATE_URL"] want=["PRIVATE_URL"]
+     0.993  PRIVATE_URL        " https://internal.corp/api/v2/users"  [model]
+Tokenized: 18 tokens in 0.1ms
+Forward pass: 209.9ms
+Viterbi decode: 0.0ms
+Total: 210.1ms, 2 spans detected
+✅ pii-04: got=["ACCOUNT_NUMBER", "PRIVATE_DATE"] want=["ACCOUNT_NUMBER", "PRIVATE_DATE"]
+     1.000  PRIVATE_DATE       "1985-03-12"  [model]
+     1.000  ACCOUNT_NUMBER     "123-45-6789"  [model]
+Tokenized: 11 tokens in 0.1ms
+Forward pass: 145.7ms
+Viterbi decode: 0.0ms
+Total: 145.8ms, 2 spans detected
+✅ pii-05: got=["PRIVATE_EMAIL", "PRIVATE_EMAIL"] want=["PRIVATE_EMAIL", "PRIVATE_EMAIL"]
+     1.000  PRIVATE_EMAIL      " bob@corp.io"  [model]
+     1.000  PRIVATE_EMAIL      " carol@corp.io"  [model]
+Tokenized: 9 tokens in 0.1ms
+Forward pass: 217.6ms
+Viterbi decode: 0.0ms
+Total: 217.7ms, 1 spans detected
+✅ neg-01: got=[] want=[]
+    [suppressed:env-ref-allowlist]  0.542  SECRET             " os.environ.get('DB_PASS"  [model]
+Tokenized: 9 tokens in 0.1ms
+Forward pass: 283.7ms
+Viterbi decode: 0.0ms
+Total: 283.7ms, 0 spans detected
+✅ neg-02: got=[] want=[]
+Tokenized: 11 tokens in 0.1ms
+Forward pass: 158.3ms
+Viterbi decode: 0.0ms
+Total: 158.4ms, 0 spans detected
+✅ neg-03: got=[] want=[]
+Tokenized: 47 tokens in 0.1ms
+Forward pass: 227.8ms
+Viterbi decode: 0.1ms
+Total: 228.1ms, 0 spans detected
+✅ neg-04: got=[] want=[]
+Tokenized: 12 tokens in 0.1ms
+Forward pass: 216.7ms
+Viterbi decode: 0.0ms
+Total: 216.8ms, 0 spans detected
+✅ neg-05: got=[] want=[]
+
+--- per-tier ---
+negative   5/5
+pii        5/5
+secret     5/5
+
+gitleaks pre-pass: on (`gitleaks.toml`)
+guards: on — suppressed 2 spans (placeholder: 1, env-ref-allowlist: 1)
+15/15 passed

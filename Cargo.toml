@@ -1,0 +1,42 @@
+[package]
+name = "piifence-m1"
+version = "0.1.0"
+edition = "2021"
+default-run = "piifence-m1"
+description = "M1 validation harness for piifence: OpenAI Privacy Filter span extraction via privacy-filter-rs (NdArray + Accelerate backend)"
+publish = false
+
+[[bin]]
+name = "piifence-m1"
+path = "src/main.rs"
+
+[[bin]]
+name = "piifence-gateway"
+path = "src/bin/gateway.rs"
+
+[[bin]]
+name = "piifence"
+path = "src/bin/piifence.rs"
+
+[dependencies]
+# Verified 2026-10-25: crate v0.1.0 exposes the same API for every backend.
+# `mlx` was the first choice, but its vendored MLX 0.25.1 Metal kernels do not
+# compile with Xcode 27's Metal toolchain (constructor-initialization errors in
+# mlx/backend/metal/kernels/steel/gemm/mma.h). M1 therefore uses the CPU
+# NdArray backend with Apple Accelerate BLAS (README: 91 tok/s, correct).
+# Switch back to `default-features = false, features = ["mlx"]` only after the
+# MLX/Metal toolchain incompatibility is resolved.
+privacy-filter-rs = { version = "0.1", features = ["blas-accelerate"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+toml = "0.8"
+regex = "1"
+async-recursion = "1"
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
