@@ -242,7 +242,7 @@ gateway.
 
 Gateway endpoints used by the mod:
 
-- `POST /scan` `{text}` → `{findings: [{label, preview, start, end, engine, score}]}`;
+- `POST /scan` `{text}` → `{findings: [{label, preview, start, end, engine, score}], auto_approve}` (`auto_approve` is config.toml's choice or null);
   detection only, masked previews, no state change.
 - `POST /control/allow-prompt-once` — one-shot flag consumed by the next
   `/v1/messages` request; only the last user message text is skipped (tool results and

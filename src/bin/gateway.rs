@@ -78,6 +78,8 @@ struct AppState {
     placeholders: Arc<Mutex<Placeholders>>,
     stats: Arc<Mutex<Stats>>,
     allow_prompt_until: Arc<Mutex<Option<Instant>>>,
+    /// `auto_approve` from the config file, handed to the approval mod by `/scan`.
+    auto_approve: Option<&'static str>,
 }
 
 /// Consume the one-shot "Send raw" approval. Returns true only if one was granted
@@ -752,7 +754,7 @@ async fn proxy(
                         })
                     })
                     .collect();
-                let payload = json!({"findings": findings});
+                let payload = json!({"findings": findings, "auto_approve": state.auto_approve});
                 Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "application/json")
@@ -938,6 +940,7 @@ async fn main() -> anyhow::Result<()> {
     let config = piifence_m1::config::load()?;
     let categories = config.category_set()?;
     let llm_filter = config.llm_filter.unwrap_or(true);
+    let auto_approve = config.auto_approve()?;
     let use_gitleaks = std::env::var("PIIF_GITLEAKS")
         .map(|v| v != "0" && v != "off" && v != "false")
         .unwrap_or(true);
@@ -977,6 +980,7 @@ async fn main() -> anyhow::Result<()> {
     )?;
     eprintln!("Detector loaded; input-only redaction (responses streamed untouched)");
     eprintln!("llm filter: {llm_filter}");
+    eprintln!("auto approve: {}", auto_approve.unwrap_or("ask"));
     eprintln!("gitleaks: {use_gitleaks}");
     if use_gitleaks {
         match piifence_m1::gitleaks::config_path() {
@@ -1018,6 +1022,7 @@ async fn main() -> anyhow::Result<()> {
         placeholders: Arc::new(Mutex::new(Placeholders::default())),
         stats: Arc::new(Mutex::new(Stats::default())),
         allow_prompt_until: Arc::new(Mutex::new(None)),
+        auto_approve,
     };
 
     let app = Router::new()
@@ -1106,6 +1111,7 @@ mod tests {
             placeholders: Arc::new(Mutex::new(Placeholders::default())),
             stats: Arc::new(Mutex::new(Stats::default())),
             allow_prompt_until: Arc::new(Mutex::new(None)),
+            auto_approve: None,
         }
     }
 

@@ -60,10 +60,10 @@ agent runs:     curl -H "Authorization: Bearer $PIIF_SECRET_1" https://staging.e
 
 Secrets in command output, tool results and `CLAUDE.md` become variables automatically, with no question asked. If you close the dialog, the value is replaced with a placeholder. This is on by default with `piifence claude`.
 
-To skip the dialog and always make the same choice, set `autoApprovePiiFence` in `/config`, or in `~/.claude/settings.json`:
+To skip the dialog and always make the same choice, set `auto_approve` in `~/.config/piifence/config.toml`:
 
-```json
-{ "pluginConfigs": { "piifence-approval": { "options": { "autoApprovePiiFence": "replace" } } } }
+```toml
+auto_approve = "replace"
 ```
 
 | Value | What happens to every prompt with a sensitive value |
@@ -74,7 +74,7 @@ To skip the dialog and always make the same choice, set `autoApprovePiiFence` in
 | `send-raw` | send it unchanged, once per prompt |
 | `block` | keep the prompt from being sent |
 
-A toast says which choice was applied.
+A toast says which choice was applied. You can also set it per Claude Code profile as `autoApprovePiiFence` in `/config`; when that is anything but `ask`, it wins over `config.toml`.
 
 ### Secrets only, no model download
 

@@ -4,8 +4,9 @@ const KEY = 'if-ajsdlk231lj12kl12j1'
 const PROMPT = `use this API key ${KEY} please`
 
 // Stands for the gateway and the engine: /scan finds the key, env.set and
-// toast succeed, and every AskUserQuestion dialog is counted.
-function engine(on) {
+// toast succeed, and every AskUserQuestion dialog is counted. `autoApprove`
+// is what config.toml's `auto_approve` makes /scan return.
+function engine(on, autoApprove = null) {
   const seen = { asks: 0, env: [], raw: 0 }
   on('http.fetch', (_, e) => {
     if (e.url.endsWith('/control/allow-prompt-once')) {
@@ -16,7 +17,7 @@ function engine(on) {
     const findings = [
       { label: 'secret', start, end: start + KEY.length, preview: 'if-a…12j1' },
     ]
-    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ findings }) } }
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ findings, auto_approve: autoApprove }) } }
   })
   on('env.get', () => ({ value: undefined }))
   on('env.set', (_, e) => {
@@ -67,4 +68,18 @@ test('block drops the prompt without asking', { options: { autoApprovePiiFence: 
   const result = await $.prompt.submit({ text: PROMPT })
   expect(seen.asks).toBe(0)
   expect('drop' in result).toBe(true)
+})
+
+test('config.toml auto_approve applies without the setting', async ($, on) => {
+  const seen = engine(on, 'block')
+  const result = await $.prompt.submit({ text: PROMPT })
+  expect(seen.asks).toBe(0)
+  expect('drop' in result).toBe(true)
+})
+
+test('the Claude Code setting wins over config.toml', { options: { autoApprovePiiFence: 'redact' } }, async ($, on) => {
+  const seen = engine(on, 'block')
+  const result = await $.prompt.submit({ text: PROMPT })
+  expect(seen.asks).toBe(0)
+  expect(result.text).toBe(PROMPT)
 })

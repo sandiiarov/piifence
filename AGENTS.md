@@ -33,7 +33,9 @@ building the placeholder/redaction layer (M2).
   `/control/allow-prompt-once`); `piifence claude` loads it per session via
   `--plugin-dir` unless `~/.claude/skills/piifence-approval` exists. Its `userConfig`
   field `autoApprovePiiFence` (`ask` default, `replace`, `redact`, `send-raw`, `block`)
-  skips the dialog and applies that choice; `hooks/register.test.ts` covers each value
+  skips the dialog and applies that choice. Without it, the mod uses config.toml's
+  `auto_approve` (validated in `src/config.rs`, returned by gateway `/scan` as
+  `auto_approve`). `hooks/register.test.ts` covers each value and the precedence
   (`claude plugin test plugin/piifence-approval`).
 - Env replacement: the approval mod can set `PIIF_<CATEGORY>_<N>` (`$.env.set`, literal
   names, up to 4 per category per prompt) and rewrite the prompt span to

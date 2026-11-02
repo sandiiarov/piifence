@@ -54,7 +54,7 @@ async function scan($, text) {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ text }),
   })
-  if (!response.ok) return []
+  if (!response.ok) return { findings: [], autoApprove: undefined }
   const parsed = JSON.parse(response.text)
   const findings = Array.isArray(parsed.findings) ? parsed.findings : []
   // The gateway can report overlapping model/gitleaks spans for the same value;
@@ -74,7 +74,8 @@ async function scan($, text) {
     }
     deduped.push(finding)
   }
-  return deduped
+  // `auto_approve` from piifence's own config file, when it sets one.
+  return { findings: deduped, autoApprove: parsed.auto_approve ?? undefined }
 }
 
 // $.env.set needs the name as a string literal, so the variables are unrolled.
@@ -159,7 +160,7 @@ function rewriteText(text, slots) {
 }
 
 async function envReplaceText($, text) {
-  const findings = await scan($, text)
+  const { findings } = await scan($, text)
   if (findings.length === 0) return null
   const plan = planEnvironment(findings)
   if (!plan) return null
@@ -236,22 +237,28 @@ export function register(on, options) {
   const auto = autoChoice(options)
 
   on('prompt.submit', async ($, e, next) => {
-    let findings = []
+    let scanned
     try {
-      findings = await scan($, e.text)
+      scanned = await scan($, e.text)
     } catch {
       // Gateway unreachable: leave the prompt alone; the gateway will redact
       // when it comes back (or the request fails closed).
       return next(e)
     }
+    const { findings } = scanned
     if (findings.length === 0) return next(e)
 
+    // The Claude Code setting wins; otherwise piifence's config.toml `auto_approve`.
+    const fromConfig = autoChoice({ autoApprovePiiFence: scanned.autoApprove })
+    const source = auto !== 'ask' ? 'autoApprovePiiFence' : 'auto_approve in config.toml'
+    const configured = auto !== 'ask' ? auto : fromConfig
+
     const plan = planEnvironment(findings)
-    let choice = auto === 'ask' ? await askChoice($, findings, plan) : auto
+    let choice = configured === 'ask' ? await askChoice($, findings, plan) : configured
     // Over the variable limit, or a label with no variable: a placeholder instead.
     if (choice === 'replace' && !plan) choice = 'redact'
-    if (auto !== 'ask') {
-      tell($, `piifence (${choice}, from autoApprovePiiFence): ${findings.length} sensitive value(s)\n${describe(findings, choice === 'replace' ? plan : null)}`)
+    if (configured !== 'ask') {
+      tell($, `piifence (${choice}, from ${source}): ${findings.length} sensitive value(s)\n${describe(findings, choice === 'replace' ? plan : null)}`)
     }
 
     if (choice === 'block') {
