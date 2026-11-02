@@ -9,7 +9,9 @@
 //     still scanned and redacted).
 //   Block — the prompt returns to the input.
 //
-// Uses Claude Code's native dialog: $.ui.ask.
+// Uses Claude Code's native dialog: $.ui.ask. The `autoApprovePiiFence` setting
+// (replace, redact, send-raw, block) skips the dialog and applies that choice to
+// every prompt; `ask`, the default, keeps the dialog.
 
 const DEFAULT_GATEWAY = 'http://127.0.0.1:7788'
 const ENV_LIMIT = 4
@@ -174,7 +176,65 @@ async function envReplaceText($, text) {
   return rewriteText(text, plan.slots)
 }
 
-export function register(on) {
+// The choices the dialog offers, as the `autoApprovePiiFence` setting names them.
+// `ask` (the default) shows the dialog; any other value applies that choice to
+// every prompt without asking.
+const CHOICES = ['ask', 'replace', 'redact', 'send-raw', 'block']
+
+export function autoChoice(options) {
+  const configured = options?.autoApprovePiiFence
+  return CHOICES.includes(configured) ? configured : 'ask'
+}
+
+function describe(findings, plan) {
+  const lines = findings
+    .slice(0, 6)
+    .map((finding) => {
+      const slot = plan?.slots.find(
+        (candidate) =>
+          candidate.finding.start === finding.start && candidate.finding.end === finding.end,
+      )
+      return `  ${finding.label} ${finding.preview}${slot ? ` → $${slot.env}` : ''}`
+    })
+    .join('\n')
+  const more = findings.length > 6 ? `\n  … and ${findings.length - 6} more` : ''
+  return `${lines}${more}`
+}
+
+async function askChoice($, findings, plan) {
+  const options = []
+  if (plan) {
+    options.push(plan.slots.length === 1 ? `Use $${plan.slots[0].env}` : 'Use env vars')
+  }
+  options.push('Redact', 'Send raw', 'Block')
+  let answer
+  try {
+    answer = await $.ui.ask(
+      `piifence detected ${findings.length} sensitive value(s) in this prompt:\n${describe(findings, plan)}\n\nWhat should happen before this reaches the provider?`,
+      options,
+    )
+  } catch {
+    // Dismissed, or no interactive UI (e.g. claude -p): redact by default.
+    return 'redact'
+  }
+  if (plan && answer === options[0]) return 'replace'
+  if (answer === 'Send raw') return 'send-raw'
+  if (answer === 'Block') return 'block'
+  // Redact, or a typed custom answer: let the gateway replace spans.
+  return 'redact'
+}
+
+function tell($, text) {
+  try {
+    $.ui.toast(text)
+  } catch {
+    // No surface to show it on; the gateway notice still reports redactions.
+  }
+}
+
+export function register(on, options) {
+  const auto = autoChoice(options)
+
   on('prompt.submit', async ($, e, next) => {
     let findings = []
     try {
@@ -187,40 +247,18 @@ export function register(on) {
     if (findings.length === 0) return next(e)
 
     const plan = planEnvironment(findings)
-    const lines = findings
-      .slice(0, 6)
-      .map((finding) => {
-        const slot = plan?.slots.find(
-          (candidate) =>
-            candidate.finding.start === finding.start && candidate.finding.end === finding.end,
-        )
-        return `  ${finding.label} ${finding.preview}${slot ? ` → $${slot.env}` : ''}`
-      })
-      .join('\n')
-    const more = findings.length > 6 ? `\n  … and ${findings.length - 6} more` : ''
-
-    const options = []
-    if (plan) {
-      options.push(plan.slots.length === 1 ? `Use $${plan.slots[0].env}` : 'Use env vars')
-    }
-    options.push('Redact', 'Send raw', 'Block')
-
-    let answer
-    try {
-      answer = await $.ui.ask(
-        `piifence detected ${findings.length} sensitive value(s) in this prompt:\n${lines}${more}\n\nWhat should happen before this reaches the provider?`,
-        options,
-      )
-    } catch {
-      // Dismissed, or no interactive UI (e.g. claude -p): redact by default.
-      return next(e)
+    let choice = auto === 'ask' ? await askChoice($, findings, plan) : auto
+    // Over the variable limit, or a label with no variable: a placeholder instead.
+    if (choice === 'replace' && !plan) choice = 'redact'
+    if (auto !== 'ask') {
+      tell($, `piifence (${choice}, from autoApprovePiiFence): ${findings.length} sensitive value(s)\n${describe(findings, choice === 'replace' ? plan : null)}`)
     }
 
-    if (answer === 'Block') {
+    if (choice === 'block') {
       return { drop: 'piifence: prompt blocked. Remove the sensitive value and resend.' }
     }
 
-    if (answer === 'Send raw') {
+    if (choice === 'send-raw') {
       try {
         const response = await $.http.fetch(gatewayUrl($) + '/control/allow-prompt-once', {
           method: 'POST',
@@ -232,7 +270,7 @@ export function register(on) {
       return next(e)
     }
 
-    if (plan && answer === options[0]) {
+    if (choice === 'replace') {
       const setters = envSetters($)
       try {
         for (const slot of plan.slots) {
@@ -254,7 +292,7 @@ export function register(on) {
       })
     }
 
-    // Redact (or a typed custom answer): let the gateway replace spans.
+    // Redact: let the gateway replace spans.
     return next(e)
   }).catch(() => {
     // A failing hook must not turn into an unredacted prompt: the gateway still

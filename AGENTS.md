@@ -31,7 +31,10 @@ building the placeholder/redaction layer (M2).
 - Claude Code approval mod: `plugin/piifence-approval/` (`prompt.submit` hook using
   `$.ui.ask` for Use env var / Redact / Send raw / Block; talks to gateway `/scan` and
   `/control/allow-prompt-once`); `piifence claude` loads it per session via
-  `--plugin-dir` unless `~/.claude/skills/piifence-approval` exists.
+  `--plugin-dir` unless `~/.claude/skills/piifence-approval` exists. Its `userConfig`
+  field `autoApprovePiiFence` (`ask` default, `replace`, `redact`, `send-raw`, `block`)
+  skips the dialog and applies that choice; `hooks/register.test.ts` covers each value
+  (`claude plugin test plugin/piifence-approval`).
 - Env replacement: the approval mod can set `PIIF_<CATEGORY>_<N>` (`$.env.set`, literal
   names, up to 4 per category per prompt) and rewrite the prompt span to
   `$PIIF_<CATEGORY>_<N>`; the guard suppresses those env references, and Bash commands

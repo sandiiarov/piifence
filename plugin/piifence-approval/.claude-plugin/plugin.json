@@ -2,5 +2,14 @@
   "name": "piifence-approval",
   "version": "0.1.0",
   "description": "Ask before sending sensitive values: Redact, Send raw, or Block.",
-  "author": { "name": "piifence" }
+  "author": { "name": "piifence" },
+  "userConfig": {
+    "autoApprovePiiFence": {
+      "type": "string",
+      "title": "Auto-approve piifence",
+      "description": "What to do when a prompt holds a sensitive value: ask (show the dialog), replace (environment variable), redact, send-raw, or block.",
+      "options": ["ask", "replace", "redact", "send-raw", "block"],
+      "default": "ask"
+    }
+  }
 }
