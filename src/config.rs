@@ -39,10 +39,6 @@ pub struct Config {
     /// without asking: one of AUTO_APPROVE_CHOICES. Unset (or `ask`) shows the dialog.
     #[serde(default)]
     pub auto_approve: Option<String>,
-    /// Let the approval mod swap known values for environment variables in tool
-    /// output and CLAUDE.md too (default true). `piifence claude` hands it to the mod.
-    #[serde(default)]
-    pub env_in_tool_output: Option<bool>,
 }
 
 fn normalize(name: &str) -> String {
@@ -157,13 +153,6 @@ mod tests {
         let config: Config = toml::from_str("auto_approve = \"Send_Raw\"").unwrap();
         assert_eq!(config.auto_approve().unwrap(), Some("send-raw"));
         assert_eq!(Config::default().auto_approve().unwrap(), None);
-    }
-
-    #[test]
-    fn env_in_tool_output_reads() {
-        let config: Config = toml::from_str("env_in_tool_output = false").unwrap();
-        assert_eq!(config.env_in_tool_output, Some(false));
-        assert_eq!(Config::default().env_in_tool_output, None);
     }
 
     #[test]

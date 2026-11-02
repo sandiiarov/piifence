@@ -36,21 +36,15 @@ building the placeholder/redaction layer (M2).
   skips the dialog and applies that choice. Without it, the mod uses config.toml's
   `auto_approve` (validated in `src/config.rs`, returned by gateway `/scan` as
   `auto_approve`). `hooks/register.test.ts` covers each value and the precedence
-  (`claude plugin test plugin/piifence-approval`). config.toml's `env_in_tool_output =
-  false` makes `piifence claude` write `pluginConfigs` (`envInToolOutput: false`) into
-  its `--settings` file, so the mod skips registering `prompt.context` and
-  `session.append` (silences "hook was skipped" lines where a plugin above bypasses them).
+  (`claude plugin test plugin/piifence-approval`).
 - Env replacement: the approval mod can set `PIIF_<CATEGORY>_<N>` (`$.env.set`, literal
   names, up to 4 per category per prompt) and rewrite the prompt span to
   `$PIIF_<CATEGORY>_<N>`; the guard suppresses those env references, and Bash commands
-  can expand them. The same `session.append` hook rewrites `tool_result` content and
-  Bash-mode `command` rows (doors `tool-result` / `command`), and `prompt.context`
-  rewrites `claudeMd` / `attachedProject` context (CLAUDE.md and @ imports) to `$PIIF_…`
-  before they are stored/sent. `/scan` returns UTF-16 code-unit offsets so JS rewriting
-  matches Rust detection on non-ASCII text. System prompt/assistant history remain
-  gateway placeholders because the gateway cannot set `$.env` and the mod has no hook
-  for those request fields. The raw value stays in the Claude Code process, never the
-  provider.
+  can expand them. Only the prompt is env-replaced: the mod must not rewrite tool
+  results, CLAUDE.md or other transcript rows (what the user sees stays as it was), so
+  everything else the provider sees gets gateway placeholders. `/scan` returns UTF-16
+  code-unit offsets so JS rewriting matches Rust detection on non-ASCII text. The raw
+  value stays in the Claude Code process, never the provider.
 - Validation artifacts: `tests/m1-report.txt`, `docs/m1-notes.md`, `docs/labels.md`,
   `docs/prior-art.md`, `docs/gateway-spike.md`, `docs/model-options.md`.
 - Model weights live in `data/` (untracked, ~2.8 GB, fetched on demand).

@@ -216,23 +216,14 @@ values of one category in a single prompt).
 - **Block** — returns `{ drop: … }`: the prompt is not sent and the text returns to the
   input with `piifence: prompt blocked…`.
 
-Tool results and Bash-mode command rows get the same treatment: the mod's
-`session.append` hook rewrites `tool_result` content and `command` rows (Bash-mode output)
-to `$PIIF_…` before they are stored and sent, with the same env counters. A `Read` of a
-file containing a secret stores `$PIIF_SECRET_N` in the transcript, and a Bash-mode
-`!echo $PIIF_SECRET_1` stores `$PIIF_SECRET_N` as `<bash-stdout>` content; the raw value
-never reaches the provider.
+Only the prompt is env-replaced. `/scan` returns offsets in UTF-16 code units (what a
+JS `String.prototype.slice` uses), so prompts containing non-ASCII punctuation rewrite
+cleanly instead of splitting the value.
 
-Instruction files (`CLAUDE.md`, `@` imports) are env-replaced as well: the mod's
-`prompt.context` hook rewrites the `claudeMd` / `attachedProject` context blocks to
-`$PIIF_…` before the first request. `/scan` returns offsets in UTF-16 code units (what a
-JS `String.prototype.slice` uses), so instruction files containing non-ASCII punctuation
-rewrite cleanly instead of splitting the value.
-
-The system prompt, assistant history and other request fields still use the gateway's
-normal placeholder redaction: the gateway is a separate process and cannot set
-`$.env`, and the mod has no hook that rewrites those arbitrary request fields (assistant
-output is intentionally left alone). A secret there is replaced with an inert
+Tool results, `CLAUDE.md`, the system prompt, assistant history and other request fields
+use the gateway's normal placeholder redaction: the mod does not rewrite transcript rows
+(what the user sees stays as it was), and the gateway is a separate process that cannot
+set `$.env`. A secret there is replaced with an inert
 placeholder, which is safe but not usable as a shell variable. The env variables are
 available to Bash, so an agent can use them in commands (e.g.
 `curl -H "Authorization: Bearer $PIIF_SECRET_1" ...`) without the value crossing the

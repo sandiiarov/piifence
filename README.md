@@ -58,7 +58,7 @@ provider sees:  use this API key $PIIF_SECRET_1 to call the staging API
 agent runs:     curl -H "Authorization: Bearer $PIIF_SECRET_1" https://staging.example.com/...
 ```
 
-Secrets in command output, tool results and `CLAUDE.md` become variables automatically, with no question asked. If you close the dialog, the value is replaced with a placeholder. This is on by default with `piifence claude`.
+Only your prompt is changed this way: secrets in command output, tool results and `CLAUDE.md` reach the provider as placeholders, and what you see in Claude Code stays as it was. If you close the dialog, the value is replaced with a placeholder. This is on by default with `piifence claude`.
 
 To skip the dialog and always make the same choice, set `auto_approve` in `~/.config/piifence/config.toml`:
 
@@ -115,7 +115,6 @@ Claude Code ──request──▶ piifence (localhost) ──redacted request�
 - Input only: the agent works with placeholders or variable names, and responses are not scanned or rewritten.
 - Environment variables are limited to 4 per category (`$PIIF_SECRET_1` to `$PIIF_SECRET_4`) per session; after that, values become placeholders.
 - macOS only, and Claude Code is the only supported agent today.
-- Another Claude Code plugin that runs first can skip the mod's tool-output and `CLAUDE.md` hooks; Claude Code then prints "its session.append hook was skipped" on startup. Those values still become placeholders. To silence the lines, add `env_in_tool_output = false` to `config.toml`.
 
 ## Development
 

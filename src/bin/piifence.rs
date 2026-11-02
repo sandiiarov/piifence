@@ -341,16 +341,6 @@ fn wait_healthy(port: u16, child: &mut Child) -> bool {
     false
 }
 
-/// `env_in_tool_output` from the config file; true when unset or unreadable (the
-/// gateway reports a broken file itself and refuses to start).
-fn env_in_tool_output() -> bool {
-    resolve_config_path()
-        .and_then(|path| fs::read_to_string(path).ok())
-        .and_then(|text| toml::from_str::<piifence_m1::config::Config>(&text).ok())
-        .and_then(|config| config.env_in_tool_output)
-        .unwrap_or(true)
-}
-
 /// Configuration file for the gateway: PIIF_CONFIG, else
 /// ~/.config/piifence/config.toml, else piifence.toml next to the checkout.
 fn resolve_config_path() -> Option<PathBuf> {
@@ -419,17 +409,10 @@ fn write_settings_override(gateway_url: &str) -> std::io::Result<PathBuf> {
         "piifence-claude-settings-{}-{nonce}.json",
         std::process::id()
     ));
-    let mut settings = serde_json::json!({"env": {"ANTHROPIC_BASE_URL": gateway_url}});
-    // The mod decides which hooks to register before it can ask the gateway, so
-    // the config file's choice reaches it as a plugin option.
-    if !env_in_tool_output() {
-        let options = serde_json::json!({"options": {"envInToolOutput": false}});
-        settings["pluginConfigs"] = serde_json::json!({
-            "piifence-approval": options,
-            "piifence-approval@inline": options,
-        });
-    }
-    let content = format!("{settings}\n");
+    let content = format!(
+        "{{\"env\":{{\"ANTHROPIC_BASE_URL\":\"{}\"}}}}\n",
+        gateway_url
+    );
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

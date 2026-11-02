@@ -19,11 +19,6 @@
 # when set to anything but "ask", wins over this. Unknown values stop the gateway.
 # auto_approve = "replace"
 #
-# Also swap known values for environment variables in tool output and CLAUDE.md
-# (default true). Set false where another Claude Code plugin skips those hooks
-# and Claude Code reports it on every startup; the gateway still redacts them.
-# env_in_tool_output = true
-#
 # Example — only credentials and emails:
 # categories = ["secret", "private_email"]
 #
