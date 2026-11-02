@@ -115,6 +115,7 @@ Claude Code ──request──▶ piifence (localhost) ──redacted request�
 - Input only: the agent works with placeholders or variable names, and responses are not scanned or rewritten.
 - Environment variables are limited to 4 per category (`$PIIF_SECRET_1` to `$PIIF_SECRET_4`) per session; after that, values become placeholders.
 - macOS only, and Claude Code is the only supported agent today.
+- Another Claude Code plugin that runs first can skip the mod's tool-output and `CLAUDE.md` hooks; Claude Code then prints "its session.append hook was skipped" on startup. Those values still become placeholders. To silence the lines, add `env_in_tool_output = false` to `config.toml`.
 
 ## Development
 

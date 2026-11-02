@@ -36,7 +36,10 @@ building the placeholder/redaction layer (M2).
   skips the dialog and applies that choice. Without it, the mod uses config.toml's
   `auto_approve` (validated in `src/config.rs`, returned by gateway `/scan` as
   `auto_approve`). `hooks/register.test.ts` covers each value and the precedence
-  (`claude plugin test plugin/piifence-approval`).
+  (`claude plugin test plugin/piifence-approval`). config.toml's `env_in_tool_output =
+  false` makes `piifence claude` write `pluginConfigs` (`envInToolOutput: false`) into
+  its `--settings` file, so the mod skips registering `prompt.context` and
+  `session.append` (silences "hook was skipped" lines where a plugin above bypasses them).
 - Env replacement: the approval mod can set `PIIF_<CATEGORY>_<N>` (`$.env.set`, literal
   names, up to 4 per category per prompt) and rewrite the prompt span to
   `$PIIF_<CATEGORY>_<N>`; the guard suppresses those env references, and Bash commands

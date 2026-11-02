@@ -306,6 +306,9 @@ export function register(on, options) {
     // redacts, so let the prompt continue.
   })
 
+  // Off where a plugin above skips these two hooks anyway (Claude Code then
+  // reports each skip on startup); the gateway still redacts with placeholders.
+  if (options?.envInToolOutput === false) return
 
   // Instruction files (CLAUDE.md, @imports): the context block is what the
   // model reads, so rewrite it there too instead of leaving a placeholder.
