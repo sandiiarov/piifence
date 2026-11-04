@@ -29,7 +29,6 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
@@ -51,17 +50,12 @@ struct Stats {
     redactions: usize,
     /// Distinct placeholders assigned since the gateway started.
     values: usize,
-    allowed: usize,
     by_label: BTreeMap<String, usize>,
     recent: VecDeque<Value>,
     redact_ms_total: f64,
     redact_ms_last: f64,
     redact_ms_max: f64,
 }
-
-/// How long a "Send raw" approval stays valid. Short, so an approval that is never
-/// used (the prompt was blocked or cancelled) cannot let a later request through raw.
-const ALLOW_PROMPT_TTL: Duration = Duration::from_secs(60);
 
 /// Largest request body the gateway accepts. Claude Code sends the whole
 /// conversation on every turn, which can exceed axum's 2 MB default.
@@ -77,23 +71,10 @@ struct AppState {
     audit_body: Arc<Mutex<std::fs::File>>,
     placeholders: Arc<Mutex<Placeholders>>,
     stats: Arc<Mutex<Stats>>,
-    allow_prompt_until: Arc<Mutex<Option<Instant>>>,
-    /// `auto_approve` from the config file, handed to the approval mod by `/scan`.
-    auto_approve: Option<&'static str>,
-    /// Per-session settings and `$PIIF_…` values (see `Session`).
+    /// Per-session `$PIIF_…` values (see `Session`).
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     /// This request's session id (`session_id`), `""` outside a request or without one.
     session: String,
-}
-
-/// Consume the one-shot "Send raw" approval. Returns true only if one was granted
-/// and has not expired; either way the approval is gone afterwards.
-fn take_allow_prompt(state: &AppState) -> bool {
-    let mut until = state.allow_prompt_until.lock().unwrap();
-    match until.take() {
-        Some(deadline) => Instant::now() <= deadline,
-        None => false,
-    }
 }
 
 /// Reject requests a browser page or a DNS-rebinding site could make. Claude Code
@@ -305,8 +286,6 @@ impl EnvValues {
 /// Per-session state, keyed by the `x-piifence-session` id the wrapper gives each Claude Code session.
 #[derive(Default)]
 struct Session {
-    /// The approval mod's `autoApprovePiiFence` setting, sent with each `/scan`.
-    setting: Option<String>,
     env: EnvValues,
 }
 
@@ -329,17 +308,9 @@ fn with_session<T>(state: &AppState, f: impl FnOnce(&mut Session) -> T) -> T {
     f(sessions.entry(state.session.clone()).or_default())
 }
 
-/// The choice that applies to values outside the prompt: the mod's `autoApprovePiiFence` when it is set to anything but `ask`, else config.toml's `auto_approve`. Only `replace` changes anything there; every other choice means placeholders. Without a session id nothing could fetch the values, so it is never `replace`.
+/// Whether detected values become `$PIIF_…` names: always in a session. Without a session id nothing could fetch the values, so they get placeholders.
 fn replaces_with_env(state: &AppState) -> bool {
-    if state.session.is_empty() {
-        return false;
-    }
-    let setting = with_session(state, |session| session.setting.clone());
-    let choice = match setting.as_deref() {
-        Some(setting) if setting != "ask" => setting,
-        _ => state.auto_approve.unwrap_or("ask"),
-    };
-    choice == "replace"
+    !state.session.is_empty()
 }
 
 fn env_name_re() -> &'static Regex {
@@ -431,12 +402,6 @@ fn token_for(state: &AppState, replace: bool, label: &str, value: &str) -> (Stri
         }
     }
     next_placeholder(state, label, value)
-}
-
-fn record_allowed(state: &AppState) {
-    let mut stats = state.stats.lock().unwrap();
-    stats.requests += 1;
-    stats.allowed += 1;
 }
 
 impl Stats {
@@ -722,14 +687,10 @@ async fn redact_content(
     state: &AppState,
     content: &mut Value,
     tool_map: &HashMap<String, (String, String)>,
-    skip_text: bool,
 ) -> anyhow::Result<Vec<Value>> {
     let mut audit = Vec::new();
     match content {
         Value::String(text) => {
-            if skip_text {
-                return Ok(audit);
-            }
             let (out, mut entries) = redact_text_smart(state, text, "content").await?;
             if !entries.is_empty() {
                 *text = out;
@@ -738,7 +699,7 @@ async fn redact_content(
         }
         Value::Array(blocks) => {
             for block in blocks {
-                audit.extend(redact_block(state, block, tool_map, None, skip_text).await?);
+                audit.extend(redact_block(state, block, tool_map, None).await?);
             }
         }
         _ => {}
@@ -798,7 +759,6 @@ async fn redact_block(
     block: &mut Value,
     tool_map: &HashMap<String, (String, String)>,
     context: Option<&str>,
-    skip_text: bool,
 ) -> anyhow::Result<Vec<Value>> {
     let mut audit = Vec::new();
     let kind = block
@@ -808,9 +768,6 @@ async fn redact_block(
         .to_string();
     match kind.as_str() {
         "text" => {
-            if skip_text {
-                return Ok(audit);
-            }
             if let Some(Value::String(s)) = block.get_mut("text") {
                 let (out, mut entries) = match context {
                     Some(context) => {
@@ -843,9 +800,8 @@ async fn redact_block(
                 }
                 Some(Value::Array(inner)) => {
                     for item in inner {
-                        audit.extend(
-                            redact_block(state, item, tool_map, context.as_deref(), false).await?,
-                        );
+                        audit
+                            .extend(redact_block(state, item, tool_map, context.as_deref()).await?);
                     }
                 }
                 _ => {}
@@ -878,7 +834,7 @@ async fn redact_block(
                 .extend(redact_string_field(state, block, "source", "search_result.source").await?);
             if let Some(Value::Array(inner)) = block.get_mut("content") {
                 for item in inner {
-                    audit.extend(redact_block(state, item, tool_map, context, false).await?);
+                    audit.extend(redact_block(state, item, tool_map, context).await?);
                 }
             }
         }
@@ -887,11 +843,7 @@ async fn redact_block(
     Ok(audit)
 }
 
-async fn redact_payload(
-    state: &AppState,
-    body: &mut Value,
-    allow_prompt_once: bool,
-) -> anyhow::Result<Vec<Value>> {
+async fn redact_payload(state: &AppState, body: &mut Value) -> anyhow::Result<Vec<Value>> {
     let mut audit = Vec::new();
     // Map tool_use id -> (tool name, serialized input) so tool_result content can
     // be scanned with the call that produced it as model context.
@@ -917,21 +869,14 @@ async fn redact_payload(
         }
     }
     if let Some(system) = body.get_mut("system") {
-        audit.extend(redact_content(state, system, &tool_map, false).await?);
+        audit.extend(redact_content(state, system, &tool_map).await?);
     }
     if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
-        let last_user = messages
-            .iter()
-            .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"));
-        for (index, message) in messages.iter_mut().enumerate() {
+        for message in messages.iter_mut() {
             if let Some(content) = message.get_mut("content") {
-                let skip_text = allow_prompt_once && Some(index) == last_user;
-                audit.extend(redact_content(state, content, &tool_map, skip_text).await?);
+                audit.extend(redact_content(state, content, &tool_map).await?);
             }
         }
-    }
-    if allow_prompt_once {
-        audit_line(state, json!({"event":"allowed_prompt"}));
     }
     Ok(audit)
 }
@@ -970,7 +915,6 @@ async fn proxy(
             "requests": stats.requests,
             "redactions": stats.redactions,
             "values": stats.values,
-            "allowed": stats.allowed,
             "redact_ms_last": (stats.redact_ms_last * 100.0).round() / 100.0,
             "redact_ms_total": (stats.redact_ms_total * 100.0).round() / 100.0,
             "redact_ms_max": (stats.redact_ms_max * 100.0).round() / 100.0,
@@ -996,22 +940,13 @@ async fn proxy(
                 .body(Body::from("missing text"))
                 .unwrap();
         };
-        // The mod's `autoApprovePiiFence`, which decides how this session's tool output is redacted (`replaces_with_env`).
-        if let Some(setting) = parsed
-            .as_ref()
-            .and_then(|value| value.get("setting"))
-            .and_then(Value::as_str)
-        {
-            let setting = setting.to_string();
-            with_session(&state, |session| session.setting = Some(setting));
-        }
         return match detect_kept(&state, &text).await {
             Ok(spans) => {
                 let findings: Vec<Value> = spans
                     .iter()
                     .map(|span| {
                         let value = &text[span.start..span.end];
-                        // The name this value gets if the user chooses to replace it; it only takes effect once the mod registers it.
+                        // The name this value gets; it only takes effect once the mod registers it.
                         let env = with_session(&state, |session| {
                             session.env.name_for(value, &span.label)
                         });
@@ -1026,7 +961,7 @@ async fn proxy(
                         })
                     })
                     .collect();
-                let payload = json!({"findings": findings, "auto_approve": state.auto_approve});
+                let payload = json!({"findings": findings});
                 Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "application/json")
@@ -1039,14 +974,6 @@ async fn proxy(
                 .body(Body::from(json!({"error": err.to_string()}).to_string()))
                 .unwrap(),
         };
-    }
-    if path == "/control/allow-prompt-once" && method == Method::POST {
-        *state.allow_prompt_until.lock().unwrap() = Some(Instant::now() + ALLOW_PROMPT_TTL);
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "application/json")
-            .body(Body::from(json!({"ok": true}).to_string()))
-            .unwrap();
     }
     if path == "/control/env-values" && method == Method::POST {
         let status = match parse_env_values(&body) {
@@ -1117,11 +1044,10 @@ async fn proxy(
     let mut outgoing = body.clone();
 
     if is_messages && method == Method::POST {
-        let allow_prompt_once = take_allow_prompt(&state);
         match serde_json::from_slice::<Value>(&outgoing) {
             Ok(mut payload) => {
                 let started = std::time::Instant::now();
-                let result = redact_payload(&state, &mut payload, allow_prompt_once).await;
+                let result = redact_payload(&state, &mut payload).await;
                 let redact_ms = started.elapsed().as_secs_f64() * 1000.0;
                 match (result, redact_ms) {
                     (Ok(audit), redact_ms) => {
@@ -1135,9 +1061,6 @@ async fn proxy(
                                 let _ = writeln!(f, "{}", String::from_utf8_lossy(&redacted));
                             }
                             record_stats(&state, &audit, redact_ms);
-                        }
-                        if allow_prompt_once {
-                            record_allowed(&state);
                         }
                         outgoing = axum::body::Bytes::from(redacted);
                     }
@@ -1263,7 +1186,9 @@ async fn main() -> anyhow::Result<()> {
     let config = piifence_m1::config::load()?;
     let categories = config.category_set()?;
     let llm_filter = config.llm_filter.unwrap_or(true);
-    let auto_approve = config.auto_approve()?;
+    if config.auto_approve.is_some() {
+        eprintln!("auto_approve in config.toml is no longer used: sensitive values are always replaced with environment variables");
+    }
     let use_gitleaks = std::env::var("PIIF_GITLEAKS")
         .map(|v| v != "0" && v != "off" && v != "false")
         .unwrap_or(true);
@@ -1303,7 +1228,6 @@ async fn main() -> anyhow::Result<()> {
     )?;
     eprintln!("Detector loaded; input-only redaction (responses streamed untouched)");
     eprintln!("llm filter: {llm_filter}");
-    eprintln!("auto approve: {}", auto_approve.unwrap_or("ask"));
     eprintln!("gitleaks: {use_gitleaks}");
     if use_gitleaks {
         match piifence_m1::gitleaks::config_path() {
@@ -1344,8 +1268,6 @@ async fn main() -> anyhow::Result<()> {
         audit_body: Arc::new(Mutex::new(audit_body)),
         placeholders: Arc::new(Mutex::new(Placeholders::default())),
         stats: Arc::new(Mutex::new(Stats::default())),
-        allow_prompt_until: Arc::new(Mutex::new(None)),
-        auto_approve,
         sessions: Arc::new(Mutex::new(HashMap::new())),
         session: String::new(),
     };
@@ -1435,10 +1357,16 @@ mod tests {
             audit_body: Arc::new(Mutex::new(null())),
             placeholders: Arc::new(Mutex::new(Placeholders::default())),
             stats: Arc::new(Mutex::new(Stats::default())),
-            allow_prompt_until: Arc::new(Mutex::new(None)),
-            auto_approve: None,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            session: String::new(),
+        }
+    }
+
+    /// `fake_state` inside a `piifence claude` session.
+    fn session_state() -> AppState {
+        AppState {
             session: "0123456789abcdef0123456789abcdef".to_string(),
+            ..fake_state()
         }
     }
 
@@ -1524,7 +1452,7 @@ mod tests {
         let state = fake_state();
         let mut content = json!([{"type": "document", "title": "TOKEN notes",
             "source": {"type": "text", "media_type": "text/plain", "data": "a TOKEN b"}}]);
-        let audit = redact_content(&state, &mut content, &HashMap::new(), false)
+        let audit = redact_content(&state, &mut content, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(content[0]["source"]["data"], "a <secret_1> b");
@@ -1538,7 +1466,7 @@ mod tests {
         let mut content = json!([{"type": "document",
             "source": {"type": "base64", "media_type": "application/pdf", "data": "TOKEN"}}]);
         let before = content.clone();
-        redact_content(&state, &mut content, &HashMap::new(), false)
+        redact_content(&state, &mut content, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(content, before);
@@ -1552,7 +1480,7 @@ mod tests {
              "content": [{"type": "text", "text": "x TOKEN y"}]}]}]);
 
         let mut with_context = block.clone();
-        let audit = redact_content(&state, &mut with_context, &tool_map_with("t1"), false)
+        let audit = redact_content(&state, &mut with_context, &tool_map_with("t1"))
             .await
             .unwrap();
         assert_eq!(
@@ -1562,7 +1490,7 @@ mod tests {
         assert_eq!(audit[0]["field"], "tool_result.text");
 
         let mut without_context = block;
-        let audit = redact_content(&state, &mut without_context, &HashMap::new(), false)
+        let audit = redact_content(&state, &mut without_context, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(
@@ -1578,7 +1506,7 @@ mod tests {
         let mut content = json!([{"type": "tool_result", "tool_use_id": "t1", "content": [
             {"type": "document", "source": {"type": "text", "media_type": "text/plain",
              "data": "key TOKEN"}}]}]);
-        redact_content(&state, &mut content, &tool_map_with("t1"), false)
+        redact_content(&state, &mut content, &tool_map_with("t1"))
             .await
             .unwrap();
         assert_eq!(content[0]["content"][0]["source"]["data"], "key <secret_1>");
@@ -1586,7 +1514,7 @@ mod tests {
 
     #[tokio::test]
     async fn env_value_in_tool_output_becomes_its_name() {
-        let state = fake_state();
+        let state = session_state();
         let values = parse_env_values(
             br#"{"values":[{"name":"PIIF_SECRET_1","value":"if-ajsdlk231lj","label":"secret"}]}"#,
         )
@@ -1596,13 +1524,13 @@ mod tests {
                 session.env.register(name, value, label);
             }
         });
-        // `echo $PIIF_SECRET_1` printed the value, which detection would miss; TOKEN is still detected.
+        // `echo $PIIF_SECRET_1` printed the value, which detection would miss; TOKEN is still detected and gets the next name.
         let mut content = json!([{"type": "tool_result", "tool_use_id": "t1",
             "content": "if-ajsdlk231lj\nTOKEN"}]);
-        let audit = redact_content(&state, &mut content, &tool_map_with("t1"), false)
+        let audit = redact_content(&state, &mut content, &tool_map_with("t1"))
             .await
             .unwrap();
-        assert_eq!(content[0]["content"], "$PIIF_SECRET_1\n<secret_1>");
+        assert_eq!(content[0]["content"], "$PIIF_SECRET_1\n$PIIF_SECRET_2");
         assert_eq!(audit[0]["engine"], "env");
         assert_eq!(audit[0]["placeholder"], "$PIIF_SECRET_1");
         assert_eq!(audit[0]["new"], true);
@@ -1610,7 +1538,7 @@ mod tests {
         // Anywhere in the request, and reported as new only once.
         let mut content = json!([{"type": "tool_use", "id": "t2", "name": "Bash",
             "input": {"command": "curl -H 'X-Key: if-ajsdlk231lj' x"}}]);
-        let audit = redact_content(&state, &mut content, &HashMap::new(), false)
+        let audit = redact_content(&state, &mut content, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(
@@ -1635,24 +1563,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replace_setting_turns_detected_values_into_variables() {
-        let state = fake_state();
-        let mut content = json!([{"type": "tool_result", "tool_use_id": "t1",
+    async fn detected_values_become_variables_in_a_session() {
+        let content = json!([{"type": "tool_result", "tool_use_id": "t1",
             "content": "KEY=TOKEN"}]);
 
-        // `ask` (no setting, no config) keeps placeholders.
-        let mut asked = content.clone();
-        redact_content(&state, &mut asked, &tool_map_with("t1"), false)
+        // A session gets a variable, and the value can then be looked up.
+        let state = session_state();
+        let mut named = content.clone();
+        let audit = redact_content(&state, &mut named, &tool_map_with("t1"))
             .await
             .unwrap();
-        assert_eq!(asked[0]["content"], "KEY=<secret_1>");
-
-        // `replace` hands out a variable, and the value can then be looked up.
-        with_session(&state, |s| s.setting = Some("replace".to_string()));
-        let audit = redact_content(&state, &mut content, &tool_map_with("t1"), false)
-            .await
-            .unwrap();
-        assert_eq!(content[0]["content"], "KEY=$PIIF_SECRET_1");
+        assert_eq!(named[0]["content"], "KEY=$PIIF_SECRET_1");
         assert_eq!(audit[0]["placeholder"], "$PIIF_SECRET_1");
         let names = vec!["PIIF_SECRET_1".to_string()];
         assert_eq!(
@@ -1660,15 +1581,13 @@ mod tests {
             "TOKEN"
         );
 
-        // Any other setting means placeholders, and so does a request without a session id.
-        with_session(&state, |s| s.setting = Some("send-raw".to_string()));
-        assert!(!replaces_with_env(&state));
-        let anonymous = AppState {
-            session: String::new(),
-            ..state.clone()
-        };
-        with_session(&anonymous, |s| s.setting = Some("replace".to_string()));
-        assert!(!replaces_with_env(&anonymous));
+        // Without a session id nothing could fetch the value, so it gets a placeholder.
+        let anonymous = fake_state();
+        let mut placeholder = content.clone();
+        redact_content(&anonymous, &mut placeholder, &tool_map_with("t1"))
+            .await
+            .unwrap();
+        assert_eq!(placeholder[0]["content"], "KEY=<secret_1>");
     }
 
     #[test]
@@ -1731,7 +1650,7 @@ mod tests {
             {"type": "thinking", "thinking": "TOKEN", "signature": "TOKEN"},
             {"type": "redacted_thinking", "data": "TOKEN"}]);
         let before = content.clone();
-        let audit = redact_content(&state, &mut content, &HashMap::new(), false)
+        let audit = redact_content(&state, &mut content, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(content, before);

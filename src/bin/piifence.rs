@@ -442,7 +442,7 @@ fn user_settings_custom_headers() -> Option<String> {
         .map(str::to_string)
 }
 
-/// `pluginConfigs` for the approval mod: the user's own options for it (such as `autoApprovePiiFence` from `/config`) plus `session`, the id the mod sends on its gateway calls, and `gatewayUrl`, where those calls go. It goes as an option because the plugin engine refuses a request that carries a value read from the environment. Both keys are set: the mod loads as `piifence-approval` when installed and as `piifence-approval@inline` from `--plugin-dir`.
+/// `pluginConfigs` for the approval mod: the user's own options for it plus `session`, the id the mod sends on its gateway calls, and `gatewayUrl`, where those calls go. It goes as an option because the plugin engine refuses a request that carries a value read from the environment. Both keys are set: the mod loads as `piifence-approval` when installed and as `piifence-approval@inline` from `--plugin-dir`.
 fn approval_plugin_configs(session_id: &str, gateway_url: &str) -> serde_json::Value {
     let configs = user_settings().and_then(|settings| settings.get("pluginConfigs").cloned());
     let mut out = serde_json::Map::new();

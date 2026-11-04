@@ -44,39 +44,22 @@ piifence: redacted 1 value(s) — secret×1 (<secret_1> post…prod)
 
 ### Let the agent use a secret without seeing it
 
-A placeholder hides the value, but the agent can't use it either. piifence can instead put the value in an environment variable inside Claude Code and send only the variable's name. Commands the agent runs locally get the real value; the provider never does.
+A placeholder hides the value, but the agent can't use it either. So in a `piifence claude` session, piifence puts each sensitive value in an environment variable inside Claude Code and sends only the variable's name. Commands the agent runs locally get the real value; the provider never does. Nothing is asked: a toast shows what was replaced.
 
 ```text
 you type:       use this API key if-ajsdlk231lj12kl12j1 to call the staging API
 
-piifence asks:  piifence detected 1 sensitive value(s) in this prompt:
+toast:          piifence replaced 1 sensitive value(s) in your prompt:
                   secret if-a…12j1 → $PIIF_SECRET_1
-                [Use $PIIF_SECRET_1]  [Redact]  [Send raw]  [Block]
 
 provider sees:  use this API key $PIIF_SECRET_1 to call the staging API
 
 agent runs:     curl -H "Authorization: Bearer $PIIF_SECRET_1" https://staging.example.com/...
 ```
 
-If a command the agent runs prints the value, as `echo $PIIF_SECRET_1` would, piifence puts the variable's name back in its place before the output reaches the provider. What you see in Claude Code stays as it was. If you close the dialog, the value is replaced with a placeholder. This is on by default with `piifence claude`.
+The same happens to a secret the agent finds in a file, in command output or in `CLAUDE.md`: it reaches the provider as `$PIIF_SECRET_2`, and the agent can use it in commands like one you typed. piifence sets the variable just before a Bash command that names it runs, and the notice lists it. If a command prints a value, as `echo $PIIF_SECRET_1` would, piifence puts the variable's name back in its place before the output reaches the provider. What you see in Claude Code stays as it was.
 
-To skip the dialog and always make the same choice, set `auto_approve` in `~/.config/piifence/config.toml`:
-
-```toml
-auto_approve = "replace"
-```
-
-| Value | Your prompt | Tool output, files and `CLAUDE.md` |
-|---|---|---|
-| `ask` (default) | show the dialog | placeholder |
-| `replace` | environment variable | environment variable |
-| `redact` | placeholder | placeholder |
-| `send-raw` | sent unchanged, once per prompt | placeholder |
-| `block` | not sent | placeholder |
-
-With `replace`, a secret the agent finds in a file or in command output reaches the provider as `$PIIF_SECRET_1`, and the agent can use it in commands like one you typed. piifence sets the variable just before a Bash command that names it runs. Once the 9 variables per category are used up, values become placeholders.
-
-A toast says which choice was applied to your prompt. You can also set it per Claude Code profile as `autoApprovePiiFence` in `/config`; when that is anything but `ask`, it wins over `config.toml`, for tool output too.
+A value gets a placeholder like `<secret_3>` instead when no variable is left (9 per category per session), and for every request that does not come from `piifence claude`.
 
 ### Secrets only, no model download
 
@@ -116,8 +99,8 @@ Claude Code ──request──▶ piifence (localhost) ──redacted request�
 - Experimental. Use it as a safety net, not as your only protection.
 - Input only: the agent works with placeholders or variable names, and responses are not scanned or rewritten.
 - Environment variables are limited to 9 per category (`$PIIF_SECRET_1` to `$PIIF_SECRET_9`) per session; after that, values become placeholders.
-- The gateway keeps the values behind those variables in memory only. If it restarts during a session, the variables you created in prompts are registered again with your next prompt, but variables made from tool output are lost until the agent reads that output again.
-- With `replace`, the agent can use every secret it comes across in commands, including sending it somewhere. Use `redact` if it should only use the ones you give it.
+- The gateway keeps the values behind those variables in memory only. If it restarts during a session, the variables made from your prompts are registered again with your next prompt, but variables made from tool output are lost until the agent reads that output again.
+- The agent can use every secret it comes across in commands, including sending it somewhere.
 - macOS only, and Claude Code is the only supported agent today.
 
 ## Development

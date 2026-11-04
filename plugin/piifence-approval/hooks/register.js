@@ -1,19 +1,10 @@
-// piifence approval mod: ask before a prompt with sensitive values is sent.
+// piifence mod: replace sensitive values in prompts with environment variables.
 //
-// Choices:
-//   Use $PIIF_<CATEGORY>_<N> — replace the value with an environment variable
-//     available to local Bash commands, so the agent can use it without the
-//     provider ever seeing it.
-//   Redact — the gateway replaces the value with a placeholder.
-//   Send raw — the gateway lets this prompt through once (tool results are
-//     still scanned and redacted).
-//   Block — the prompt returns to the input.
+// A sensitive value in a prompt becomes `$PIIF_<CATEGORY>_<N>`, an environment variable available to local Bash commands, so the agent can use it without the provider ever seeing it. A toast lists what was replaced. Nothing is asked.
 //
-// Uses Claude Code's native dialog: $.ui.ask. The `autoApprovePiiFence` setting
-// (replace, redact, send-raw, block) skips the dialog and applies that choice to
-// every prompt; `ask`, the default, keeps the dialog.
+// The gateway does the same to values it finds in tool output and files. The mod fetches such a value from the gateway just before a Bash command that names it runs.
 //
-// With `replace` in effect (this setting, else config.toml's `auto_approve`), the gateway also turns values it finds in tool output and files into `$PIIF_…` variables. The mod fetches such a value from the gateway just before a Bash command that names it runs.
+// When a value cannot get a variable (more than 9 in a category, or a label with no variables), the gateway replaces it with a placeholder instead.
 
 const DEFAULT_GATEWAY = 'http://127.0.0.1:7788'
 
@@ -26,10 +17,6 @@ const placed = new Map()
 // The gateway `piifence claude` started for this session, as the `gatewayUrl` plugin option (the engine does not hand the mod the process environment).
 let gatewayBase = DEFAULT_GATEWAY
 
-function gatewayUrl() {
-  return gatewayBase
-}
-
 // The session id `piifence claude` gives this session, as the `session` plugin option; the gateway keys this session's values on it. It comes as an option, not from the environment, because the engine refuses a request that carries an environment value.
 let sessionId = ''
 
@@ -40,16 +27,16 @@ function gatewayHeaders() {
 }
 
 function post($, path, body) {
-  return $.http.fetch(gatewayUrl() + path, {
+  return $.http.fetch(gatewayBase + path, {
     method: 'POST',
     headers: gatewayHeaders(),
     body: JSON.stringify(body),
   })
 }
 
-async function scan($, text, setting) {
-  const response = await post($, '/scan', { text, setting })
-  if (!response.ok) return { findings: [], autoApprove: undefined }
+async function scan($, text) {
+  const response = await post($, '/scan', { text })
+  if (!response.ok) return []
   const parsed = JSON.parse(response.text)
   const findings = Array.isArray(parsed.findings) ? parsed.findings : []
   // The gateway can report overlapping model/gitleaks spans for the same value;
@@ -69,8 +56,7 @@ async function scan($, text, setting) {
     }
     deduped.push(finding)
   }
-  // `auto_approve` from piifence's own config file, when it sets one.
-  return { findings: deduped, autoApprove: parsed.auto_approve ?? undefined }
+  return deduped
 }
 
 // $.env.set needs the name as a string literal, so every name is unrolled (generated: 8 categories x ENV_LIMIT).
@@ -151,17 +137,10 @@ function envSetters($) {
   }
 }
 
-// The variables for a prompt's findings, named by the gateway (`env` on each finding), or null when any finding has no name: over the limit, or a label with no variables.
-function planEnvironment(findings) {
-  if (!findings.every((finding) => typeof finding.env === 'string')) return null
-  return { slots: findings.map((finding) => ({ finding, env: finding.env })) }
-}
-
 function rewriteText(text, slots) {
   let rewritten = text
-  for (const slot of [...slots].sort((a, b) => b.finding.start - a.finding.start)) {
-    rewritten =
-      rewritten.slice(0, slot.finding.start) + '$' + slot.env + rewritten.slice(slot.finding.end)
+  for (const slot of [...slots].sort((a, b) => b.start - a.start)) {
+    rewritten = rewritten.slice(0, slot.start) + '$' + slot.env + rewritten.slice(slot.end)
   }
   return rewritten
 }
@@ -174,54 +153,6 @@ async function setEnv($, name, value) {
   return true
 }
 
-// The choices the dialog offers, as the `autoApprovePiiFence` setting names them.
-// `ask` (the default) shows the dialog; any other value applies that choice to
-// every prompt without asking.
-const CHOICES = ['ask', 'replace', 'redact', 'send-raw', 'block']
-
-export function autoChoice(options) {
-  const configured = options?.autoApprovePiiFence
-  return CHOICES.includes(configured) ? configured : 'ask'
-}
-
-function describe(findings, plan) {
-  const lines = findings
-    .slice(0, 6)
-    .map((finding) => {
-      const slot = plan?.slots.find(
-        (candidate) =>
-          candidate.finding.start === finding.start && candidate.finding.end === finding.end,
-      )
-      return `  ${finding.label} ${finding.preview}${slot ? ` → $${slot.env}` : ''}`
-    })
-    .join('\n')
-  const more = findings.length > 6 ? `\n  … and ${findings.length - 6} more` : ''
-  return `${lines}${more}`
-}
-
-async function askChoice($, findings, plan) {
-  const options = []
-  if (plan) {
-    options.push(plan.slots.length === 1 ? `Use $${plan.slots[0].env}` : 'Use env vars')
-  }
-  options.push('Redact', 'Send raw', 'Block')
-  let answer
-  try {
-    answer = await $.ui.ask(
-      `piifence detected ${findings.length} sensitive value(s) in this prompt:\n${describe(findings, plan)}\n\nWhat should happen before this reaches the provider?`,
-      options,
-    )
-  } catch {
-    // Dismissed, or no interactive UI (e.g. claude -p): redact by default.
-    return 'redact'
-  }
-  if (plan && answer === options[0]) return 'replace'
-  if (answer === 'Send raw') return 'send-raw'
-  if (answer === 'Block') return 'block'
-  // Redact, or a typed custom answer: let the gateway replace spans.
-  return 'redact'
-}
-
 function tell($, text) {
   try {
     $.ui.toast(text)
@@ -230,8 +161,12 @@ function tell($, text) {
   }
 }
 
+function list(lines) {
+  const shown = lines.slice(0, 6).map((line) => `  ${line}`).join('\n')
+  return lines.length > 6 ? `${shown}\n  … and ${lines.length - 6} more` : shown
+}
+
 export function register(on, options) {
-  const auto = autoChoice(options)
   sessionId = typeof options?.session === 'string' ? options.session : ''
   gatewayBase = /^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(options?.gatewayUrl ?? '')
     ? options.gatewayUrl
@@ -249,51 +184,26 @@ export function register(on, options) {
       }
     }
 
-    let scanned
+    let findings
     try {
-      // The setting goes along so the gateway applies it to this session's tool output too.
-      scanned = await scan($, e.text, auto)
+      findings = await scan($, e.text)
     } catch {
       // Gateway unreachable: leave the prompt alone; the gateway will redact
       // when it comes back (or the request fails closed).
       return next(e)
     }
-    const { findings } = scanned
     if (findings.length === 0) return next(e)
 
-    // The Claude Code setting wins; otherwise piifence's config.toml `auto_approve`.
-    const fromConfig = autoChoice({ autoApprovePiiFence: scanned.autoApprove })
-    const source = auto !== 'ask' ? 'autoApprovePiiFence' : 'auto_approve in config.toml'
-    const configured = auto !== 'ask' ? auto : fromConfig
+    // The gateway names each finding (`env`); one without a name (over the limit, or a label with no variables) is left for the gateway to replace with a placeholder.
+    const slots = findings.filter((finding) => typeof finding.env === 'string')
+    const rest = findings.filter((finding) => typeof finding.env !== 'string')
+    const values = slots.map((slot) => ({
+      name: slot.env,
+      value: e.text.slice(slot.start, slot.end),
+      label: slot.label,
+    }))
 
-    const plan = planEnvironment(findings)
-    let choice = configured === 'ask' ? await askChoice($, findings, plan) : configured
-    // Over the variable limit, or a label with no variable: a placeholder instead.
-    if (choice === 'replace' && !plan) choice = 'redact'
-    if (configured !== 'ask') {
-      tell($, `piifence (${choice}, from ${source}): ${findings.length} sensitive value(s)\n${describe(findings, choice === 'replace' ? plan : null)}`)
-    }
-
-    if (choice === 'block') {
-      return { drop: 'piifence: prompt blocked. Remove the sensitive value and resend.' }
-    }
-
-    if (choice === 'send-raw') {
-      try {
-        const response = await post($, '/control/allow-prompt-once', {})
-        if (!response.ok) throw new Error('gateway rejected allow')
-      } catch {
-        return { drop: 'piifence: could not authorize raw send; prompt blocked.' }
-      }
-      return next(e)
-    }
-
-    if (choice === 'replace') {
-      const values = plan.slots.map((slot) => ({
-        name: slot.env,
-        value: e.text.slice(slot.finding.start, slot.finding.end),
-        label: slot.finding.label,
-      }))
+    if (values.length > 0) {
       // The gateway replaces these exact values with the variable names in everything sent to the provider, so a command that prints one (`echo $PIIF_SECRET_1`) does not leak it. Without that, the value must not go into the environment.
       try {
         const response = await post($, '/control/env-values', { values })
@@ -309,19 +219,22 @@ export function register(on, options) {
         return { drop: 'piifence: could not place the value in the environment; prompt blocked.' }
       }
       for (const { name, value, label } of values) placed.set(name, { value, label })
-      const mapping = plan.slots
-        .map((slot) => `${slot.finding.label} ${slot.finding.preview} → $${slot.env}`)
-        .join(', ')
-      const note = `piifence: sensitive values were replaced with environment variables available to local Bash commands (${mapping}). Use the variable names in commands; do not print their values.`
-      return next({
-        ...e,
-        text: rewriteText(e.text, plan.slots),
-        context: [...(e.context ?? []), note],
-      })
     }
 
-    // Redact: let the gateway replace spans.
-    return next(e)
+    const lines = [
+      ...slots.map((slot) => `${slot.label} ${slot.preview} → $${slot.env}`),
+      ...rest.map((finding) => `${finding.label} ${finding.preview} → placeholder`),
+    ]
+    tell($, `piifence replaced ${findings.length} sensitive value(s) in your prompt:\n${list(lines)}`)
+
+    if (slots.length === 0) return next(e)
+    const mapping = slots.map((slot) => `${slot.label} ${slot.preview} → $${slot.env}`).join(', ')
+    const note = `piifence: sensitive values were replaced with environment variables available to local Bash commands (${mapping}). Use the variable names in commands; do not print their values.`
+    return next({
+      ...e,
+      text: rewriteText(e.text, slots),
+      context: [...(e.context ?? []), note],
+    })
   }).catch(() => {
     // A failing hook must not turn into an unredacted prompt: the gateway still
     // redacts, so let the prompt continue.

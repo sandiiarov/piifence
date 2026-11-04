@@ -25,9 +25,6 @@ pub const ALL_CATEGORIES: [&str; 8] = [
     "secret",
 ];
 
-/// Values of `auto_approve`, as the approval mod names its choices.
-pub const AUTO_APPROVE_CHOICES: [&str; 5] = ["ask", "replace", "redact", "send-raw", "block"];
-
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct Config {
     pub categories: Option<Vec<String>>,
@@ -35,10 +32,9 @@ pub struct Config {
     /// Defaults to true; set false to make secret-only mode rules-only (fast).
     #[serde(default)]
     pub llm_filter: Option<bool>,
-    /// What the approval mod does with a prompt that holds a sensitive value,
-    /// without asking: one of AUTO_APPROVE_CHOICES. Unset (or `ask`) shows the dialog.
+    /// No longer used: sensitive values are always replaced with environment variables. Still accepted, so an old config file loads; the gateway warns when it is set.
     #[serde(default)]
-    pub auto_approve: Option<String>,
+    pub auto_approve: Option<toml::Value>,
 }
 
 fn normalize(name: &str) -> String {
@@ -107,25 +103,6 @@ impl Config {
         }
         Ok(Some(set))
     }
-
-    /// The configured `auto_approve` choice. Unknown values are an error (fail
-    /// closed), like unknown categories: a typo must not quietly mean "send raw".
-    pub fn auto_approve(&self) -> anyhow::Result<Option<&'static str>> {
-        let Some(raw) = &self.auto_approve else {
-            return Ok(None);
-        };
-        let normalized = raw.trim().to_ascii_lowercase().replace('_', "-");
-        match AUTO_APPROVE_CHOICES
-            .iter()
-            .find(|choice| **choice == normalized)
-        {
-            Some(choice) => Ok(Some(choice)),
-            None => anyhow::bail!(
-                "unknown auto_approve `{raw}`; valid values: {}",
-                AUTO_APPROVE_CHOICES.join(", ")
-            ),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -149,16 +126,9 @@ mod tests {
     }
 
     #[test]
-    fn auto_approve_reads_and_normalizes() {
-        let config: Config = toml::from_str("auto_approve = \"Send_Raw\"").unwrap();
-        assert_eq!(config.auto_approve().unwrap(), Some("send-raw"));
-        assert_eq!(Config::default().auto_approve().unwrap(), None);
-    }
-
-    #[test]
-    fn unknown_auto_approve_is_an_error() {
-        let config: Config = toml::from_str("auto_approve = \"reject\"").unwrap();
-        assert!(config.auto_approve().is_err());
+    fn old_auto_approve_still_loads() {
+        let config: Config = toml::from_str("auto_approve = \"replace\"").unwrap();
+        assert!(config.auto_approve.is_some());
     }
 
     #[test]
