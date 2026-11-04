@@ -12,48 +12,43 @@
 // Uses Claude Code's native dialog: $.ui.ask. The `autoApprovePiiFence` setting
 // (replace, redact, send-raw, block) skips the dialog and applies that choice to
 // every prompt; `ask`, the default, keeps the dialog.
+//
+// With `replace` in effect (this setting, else config.toml's `auto_approve`), the gateway also turns values it finds in tool output and files into `$PIIF_…` variables. The mod fetches such a value from the gateway just before a Bash command that names it runs.
 
 const DEFAULT_GATEWAY = 'http://127.0.0.1:7788'
-const ENV_LIMIT = 4
 
-const ENV_CATEGORY = {
-  secret: 'SECRET',
-  private_email: 'EMAIL',
-  private_person: 'PERSON',
-  private_phone: 'PHONE',
-  private_address: 'ADDRESS',
-  private_url: 'URL',
-  private_date: 'DATE',
-  account_number: 'ACCOUNT',
+// A name the gateway can hand out; it numbers 1 to 9 per category (its ENV_LIMIT).
+const ENV_NAME = /\bPIIF_(?:SECRET|EMAIL|PERSON|PHONE|ADDRESS|URL|DATE|ACCOUNT)_[1-9]\b/g
+
+// Values this mod put into the environment, by name, so it can register them again if the gateway restarts. Memory only.
+const placed = new Map()
+
+// The gateway `piifence claude` started for this session, as the `gatewayUrl` plugin option (the engine does not hand the mod the process environment).
+let gatewayBase = DEFAULT_GATEWAY
+
+function gatewayUrl() {
+  return gatewayBase
 }
 
-const envCounters = {
-  SECRET: 0,
-  EMAIL: 0,
-  PERSON: 0,
-  PHONE: 0,
-  ADDRESS: 0,
-  URL: 0,
-  DATE: 0,
-  ACCOUNT: 0,
+// The session id `piifence claude` gives this session, as the `session` plugin option; the gateway keys this session's values on it. It comes as an option, not from the environment, because the engine refuses a request that carries an environment value.
+let sessionId = ''
+
+function gatewayHeaders() {
+  const headers = { 'content-type': 'application/json' }
+  if (/^[0-9a-f]{32}$/.test(sessionId)) headers['x-piifence-session'] = sessionId
+  return headers
 }
 
-function gatewayUrl($) {
-  try {
-    const configured = $.env.get('PIIF_GATEWAY_URL')
-    if (configured) return configured.replace(/\/+$/, '')
-  } catch {
-    // env is unavailable; use the default
-  }
-  return DEFAULT_GATEWAY
-}
-
-async function scan($, text) {
-  const response = await $.http.fetch(gatewayUrl($) + '/scan', {
+function post($, path, body) {
+  return $.http.fetch(gatewayUrl() + path, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ text }),
+    headers: gatewayHeaders(),
+    body: JSON.stringify(body),
   })
+}
+
+async function scan($, text, setting) {
+  const response = await post($, '/scan', { text, setting })
   if (!response.ok) return { findings: [], autoApprove: undefined }
   const parsed = JSON.parse(response.text)
   const findings = Array.isArray(parsed.findings) ? parsed.findings : []
@@ -78,76 +73,88 @@ async function scan($, text) {
   return { findings: deduped, autoApprove: parsed.auto_approve ?? undefined }
 }
 
-// $.env.set needs the name as a string literal, so the variables are unrolled.
+// $.env.set needs the name as a string literal, so every name is unrolled (generated: 8 categories x ENV_LIMIT).
 function envSetters($) {
   return {
-    SECRET: [
-      (value) => $.env.set('PIIF_SECRET_1', value),
-      (value) => $.env.set('PIIF_SECRET_2', value),
-      (value) => $.env.set('PIIF_SECRET_3', value),
-      (value) => $.env.set('PIIF_SECRET_4', value),
-    ],
-    EMAIL: [
-      (value) => $.env.set('PIIF_EMAIL_1', value),
-      (value) => $.env.set('PIIF_EMAIL_2', value),
-      (value) => $.env.set('PIIF_EMAIL_3', value),
-      (value) => $.env.set('PIIF_EMAIL_4', value),
-    ],
-    PERSON: [
-      (value) => $.env.set('PIIF_PERSON_1', value),
-      (value) => $.env.set('PIIF_PERSON_2', value),
-      (value) => $.env.set('PIIF_PERSON_3', value),
-      (value) => $.env.set('PIIF_PERSON_4', value),
-    ],
-    PHONE: [
-      (value) => $.env.set('PIIF_PHONE_1', value),
-      (value) => $.env.set('PIIF_PHONE_2', value),
-      (value) => $.env.set('PIIF_PHONE_3', value),
-      (value) => $.env.set('PIIF_PHONE_4', value),
-    ],
-    ADDRESS: [
-      (value) => $.env.set('PIIF_ADDRESS_1', value),
-      (value) => $.env.set('PIIF_ADDRESS_2', value),
-      (value) => $.env.set('PIIF_ADDRESS_3', value),
-      (value) => $.env.set('PIIF_ADDRESS_4', value),
-    ],
-    URL: [
-      (value) => $.env.set('PIIF_URL_1', value),
-      (value) => $.env.set('PIIF_URL_2', value),
-      (value) => $.env.set('PIIF_URL_3', value),
-      (value) => $.env.set('PIIF_URL_4', value),
-    ],
-    DATE: [
-      (value) => $.env.set('PIIF_DATE_1', value),
-      (value) => $.env.set('PIIF_DATE_2', value),
-      (value) => $.env.set('PIIF_DATE_3', value),
-      (value) => $.env.set('PIIF_DATE_4', value),
-    ],
-    ACCOUNT: [
-      (value) => $.env.set('PIIF_ACCOUNT_1', value),
-      (value) => $.env.set('PIIF_ACCOUNT_2', value),
-      (value) => $.env.set('PIIF_ACCOUNT_3', value),
-      (value) => $.env.set('PIIF_ACCOUNT_4', value),
-    ],
+    PIIF_SECRET_1: (value) => $.env.set('PIIF_SECRET_1', value),
+    PIIF_SECRET_2: (value) => $.env.set('PIIF_SECRET_2', value),
+    PIIF_SECRET_3: (value) => $.env.set('PIIF_SECRET_3', value),
+    PIIF_SECRET_4: (value) => $.env.set('PIIF_SECRET_4', value),
+    PIIF_SECRET_5: (value) => $.env.set('PIIF_SECRET_5', value),
+    PIIF_SECRET_6: (value) => $.env.set('PIIF_SECRET_6', value),
+    PIIF_SECRET_7: (value) => $.env.set('PIIF_SECRET_7', value),
+    PIIF_SECRET_8: (value) => $.env.set('PIIF_SECRET_8', value),
+    PIIF_SECRET_9: (value) => $.env.set('PIIF_SECRET_9', value),
+    PIIF_EMAIL_1: (value) => $.env.set('PIIF_EMAIL_1', value),
+    PIIF_EMAIL_2: (value) => $.env.set('PIIF_EMAIL_2', value),
+    PIIF_EMAIL_3: (value) => $.env.set('PIIF_EMAIL_3', value),
+    PIIF_EMAIL_4: (value) => $.env.set('PIIF_EMAIL_4', value),
+    PIIF_EMAIL_5: (value) => $.env.set('PIIF_EMAIL_5', value),
+    PIIF_EMAIL_6: (value) => $.env.set('PIIF_EMAIL_6', value),
+    PIIF_EMAIL_7: (value) => $.env.set('PIIF_EMAIL_7', value),
+    PIIF_EMAIL_8: (value) => $.env.set('PIIF_EMAIL_8', value),
+    PIIF_EMAIL_9: (value) => $.env.set('PIIF_EMAIL_9', value),
+    PIIF_PERSON_1: (value) => $.env.set('PIIF_PERSON_1', value),
+    PIIF_PERSON_2: (value) => $.env.set('PIIF_PERSON_2', value),
+    PIIF_PERSON_3: (value) => $.env.set('PIIF_PERSON_3', value),
+    PIIF_PERSON_4: (value) => $.env.set('PIIF_PERSON_4', value),
+    PIIF_PERSON_5: (value) => $.env.set('PIIF_PERSON_5', value),
+    PIIF_PERSON_6: (value) => $.env.set('PIIF_PERSON_6', value),
+    PIIF_PERSON_7: (value) => $.env.set('PIIF_PERSON_7', value),
+    PIIF_PERSON_8: (value) => $.env.set('PIIF_PERSON_8', value),
+    PIIF_PERSON_9: (value) => $.env.set('PIIF_PERSON_9', value),
+    PIIF_PHONE_1: (value) => $.env.set('PIIF_PHONE_1', value),
+    PIIF_PHONE_2: (value) => $.env.set('PIIF_PHONE_2', value),
+    PIIF_PHONE_3: (value) => $.env.set('PIIF_PHONE_3', value),
+    PIIF_PHONE_4: (value) => $.env.set('PIIF_PHONE_4', value),
+    PIIF_PHONE_5: (value) => $.env.set('PIIF_PHONE_5', value),
+    PIIF_PHONE_6: (value) => $.env.set('PIIF_PHONE_6', value),
+    PIIF_PHONE_7: (value) => $.env.set('PIIF_PHONE_7', value),
+    PIIF_PHONE_8: (value) => $.env.set('PIIF_PHONE_8', value),
+    PIIF_PHONE_9: (value) => $.env.set('PIIF_PHONE_9', value),
+    PIIF_ADDRESS_1: (value) => $.env.set('PIIF_ADDRESS_1', value),
+    PIIF_ADDRESS_2: (value) => $.env.set('PIIF_ADDRESS_2', value),
+    PIIF_ADDRESS_3: (value) => $.env.set('PIIF_ADDRESS_3', value),
+    PIIF_ADDRESS_4: (value) => $.env.set('PIIF_ADDRESS_4', value),
+    PIIF_ADDRESS_5: (value) => $.env.set('PIIF_ADDRESS_5', value),
+    PIIF_ADDRESS_6: (value) => $.env.set('PIIF_ADDRESS_6', value),
+    PIIF_ADDRESS_7: (value) => $.env.set('PIIF_ADDRESS_7', value),
+    PIIF_ADDRESS_8: (value) => $.env.set('PIIF_ADDRESS_8', value),
+    PIIF_ADDRESS_9: (value) => $.env.set('PIIF_ADDRESS_9', value),
+    PIIF_URL_1: (value) => $.env.set('PIIF_URL_1', value),
+    PIIF_URL_2: (value) => $.env.set('PIIF_URL_2', value),
+    PIIF_URL_3: (value) => $.env.set('PIIF_URL_3', value),
+    PIIF_URL_4: (value) => $.env.set('PIIF_URL_4', value),
+    PIIF_URL_5: (value) => $.env.set('PIIF_URL_5', value),
+    PIIF_URL_6: (value) => $.env.set('PIIF_URL_6', value),
+    PIIF_URL_7: (value) => $.env.set('PIIF_URL_7', value),
+    PIIF_URL_8: (value) => $.env.set('PIIF_URL_8', value),
+    PIIF_URL_9: (value) => $.env.set('PIIF_URL_9', value),
+    PIIF_DATE_1: (value) => $.env.set('PIIF_DATE_1', value),
+    PIIF_DATE_2: (value) => $.env.set('PIIF_DATE_2', value),
+    PIIF_DATE_3: (value) => $.env.set('PIIF_DATE_3', value),
+    PIIF_DATE_4: (value) => $.env.set('PIIF_DATE_4', value),
+    PIIF_DATE_5: (value) => $.env.set('PIIF_DATE_5', value),
+    PIIF_DATE_6: (value) => $.env.set('PIIF_DATE_6', value),
+    PIIF_DATE_7: (value) => $.env.set('PIIF_DATE_7', value),
+    PIIF_DATE_8: (value) => $.env.set('PIIF_DATE_8', value),
+    PIIF_DATE_9: (value) => $.env.set('PIIF_DATE_9', value),
+    PIIF_ACCOUNT_1: (value) => $.env.set('PIIF_ACCOUNT_1', value),
+    PIIF_ACCOUNT_2: (value) => $.env.set('PIIF_ACCOUNT_2', value),
+    PIIF_ACCOUNT_3: (value) => $.env.set('PIIF_ACCOUNT_3', value),
+    PIIF_ACCOUNT_4: (value) => $.env.set('PIIF_ACCOUNT_4', value),
+    PIIF_ACCOUNT_5: (value) => $.env.set('PIIF_ACCOUNT_5', value),
+    PIIF_ACCOUNT_6: (value) => $.env.set('PIIF_ACCOUNT_6', value),
+    PIIF_ACCOUNT_7: (value) => $.env.set('PIIF_ACCOUNT_7', value),
+    PIIF_ACCOUNT_8: (value) => $.env.set('PIIF_ACCOUNT_8', value),
+    PIIF_ACCOUNT_9: (value) => $.env.set('PIIF_ACCOUNT_9', value),
   }
 }
 
+// The variables for a prompt's findings, named by the gateway (`env` on each finding), or null when any finding has no name: over the limit, or a label with no variables.
 function planEnvironment(findings) {
-  const counters = { ...envCounters }
-  const slots = []
-  for (const finding of findings) {
-    const category = ENV_CATEGORY[finding.label]
-    if (!category) return null
-    counters[category] += 1
-    if (counters[category] > ENV_LIMIT) return null
-    slots.push({
-      finding,
-      category,
-      index: counters[category],
-      env: `PIIF_${category}_${counters[category]}`,
-    })
-  }
-  return { slots, counters }
+  if (!findings.every((finding) => typeof finding.env === 'string')) return null
+  return { slots: findings.map((finding) => ({ finding, env: finding.env })) }
 }
 
 function rewriteText(text, slots) {
@@ -157,6 +164,14 @@ function rewriteText(text, slots) {
       rewritten.slice(0, slot.finding.start) + '$' + slot.env + rewritten.slice(slot.finding.end)
   }
   return rewritten
+}
+
+// Put `value` into `$name`; false when the name has no setter.
+async function setEnv($, name, value) {
+  const setter = envSetters($)[name]
+  if (!setter) return false
+  await setter(value)
+  return true
 }
 
 // The choices the dialog offers, as the `autoApprovePiiFence` setting names them.
@@ -217,11 +232,27 @@ function tell($, text) {
 
 export function register(on, options) {
   const auto = autoChoice(options)
+  sessionId = typeof options?.session === 'string' ? options.session : ''
+  gatewayBase = /^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(options?.gatewayUrl ?? '')
+    ? options.gatewayUrl
+    : DEFAULT_GATEWAY
 
   on('prompt.submit', async ($, e, next) => {
+    // After a gateway restart it no longer knows the values this mod placed; register them again so their names stay theirs. Best effort: the prompt below registers its own values strictly.
+    if (placed.size > 0) {
+      try {
+        await post($, '/control/env-values', {
+          values: [...placed].map(([name, { value, label }]) => ({ name, value, label })),
+        })
+      } catch {
+        // Gateway unreachable; the scan below fails too and leaves redaction to the gateway.
+      }
+    }
+
     let scanned
     try {
-      scanned = await scan($, e.text)
+      // The setting goes along so the gateway applies it to this session's tool output too.
+      scanned = await scan($, e.text, auto)
     } catch {
       // Gateway unreachable: leave the prompt alone; the gateway will redact
       // when it comes back (or the request fails closed).
@@ -249,9 +280,7 @@ export function register(on, options) {
 
     if (choice === 'send-raw') {
       try {
-        const response = await $.http.fetch(gatewayUrl($) + '/control/allow-prompt-once', {
-          method: 'POST',
-        })
+        const response = await post($, '/control/allow-prompt-once', {})
         if (!response.ok) throw new Error('gateway rejected allow')
       } catch {
         return { drop: 'piifence: could not authorize raw send; prompt blocked.' }
@@ -260,7 +289,6 @@ export function register(on, options) {
     }
 
     if (choice === 'replace') {
-      const setters = envSetters($)
       const values = plan.slots.map((slot) => ({
         name: slot.env,
         value: e.text.slice(slot.finding.start, slot.finding.end),
@@ -268,23 +296,19 @@ export function register(on, options) {
       }))
       // The gateway replaces these exact values with the variable names in everything sent to the provider, so a command that prints one (`echo $PIIF_SECRET_1`) does not leak it. Without that, the value must not go into the environment.
       try {
-        const response = await $.http.fetch(gatewayUrl($) + '/control/env-values', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ values }),
-        })
+        const response = await post($, '/control/env-values', { values })
         if (!response.ok) throw new Error('gateway rejected env values')
       } catch {
         return { drop: 'piifence: the gateway could not protect the environment variables; prompt blocked.' }
       }
       try {
-        for (const [i, slot] of plan.slots.entries()) {
-          await setters[slot.category][slot.index - 1](values[i].value)
+        for (const { name, value } of values) {
+          if (!(await setEnv($, name, value))) throw new Error(`no setter for ${name}`)
         }
       } catch {
         return { drop: 'piifence: could not place the value in the environment; prompt blocked.' }
       }
-      Object.assign(envCounters, plan.counters)
+      for (const { name, value, label } of values) placed.set(name, { value, label })
       const mapping = plan.slots
         .map((slot) => `${slot.finding.label} ${slot.finding.preview} → $${slot.env}`)
         .join(', ')
@@ -301,5 +325,26 @@ export function register(on, options) {
   }).catch(() => {
     // A failing hook must not turn into an unredacted prompt: the gateway still
     // redacts, so let the prompt continue.
+  })
+
+  // A value the gateway found in tool output or a file reaches the agent as `$PIIF_…`, but only the gateway holds it. Fetch the values a command names and set them just before it runs. Each run asks again, so a name the gateway gave a new value after a restart gets that value.
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const command = typeof e.command === 'string' ? e.command : ''
+    const names = [...new Set(command.match(ENV_NAME) ?? [])]
+    if (names.length === 0) return next(e)
+    try {
+      const response = await post($, '/control/env-lookup', { names })
+      if (response.ok) {
+        const { values } = JSON.parse(response.text)
+        for (const [name, value] of Object.entries(values ?? {})) {
+          if (typeof value === 'string') await setEnv($, name, value)
+        }
+      }
+    } catch {
+      // Gateway unreachable: run with what the environment already holds.
+    }
+    return next(e)
+  }).catch(() => {
+    // Setting a variable failed; the command still runs, without it.
   })
 }

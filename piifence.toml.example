@@ -17,6 +17,8 @@
 # value: "ask" (default, show the dialog), "replace" (environment variable),
 # "redact", "send-raw" or "block". The Claude Code setting autoApprovePiiFence,
 # when set to anything but "ask", wins over this. Unknown values stop the gateway.
+# Values in tool output and files follow it too when it is "replace" (they become
+# $PIIF_* variables); every other choice gives them placeholders.
 # auto_approve = "replace"
 #
 # Example — only credentials and emails:

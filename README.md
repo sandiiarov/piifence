@@ -58,7 +58,7 @@ provider sees:  use this API key $PIIF_SECRET_1 to call the staging API
 agent runs:     curl -H "Authorization: Bearer $PIIF_SECRET_1" https://staging.example.com/...
 ```
 
-Only your prompt is changed this way. If a command the agent runs prints the value, as `echo $PIIF_SECRET_1` would, piifence puts the variable's name back in its place before the output reaches the provider. Other secrets in command output, tool results and `CLAUDE.md` reach the provider as placeholders. What you see in Claude Code stays as it was. If you close the dialog, the value is replaced with a placeholder. This is on by default with `piifence claude`.
+If a command the agent runs prints the value, as `echo $PIIF_SECRET_1` would, piifence puts the variable's name back in its place before the output reaches the provider. What you see in Claude Code stays as it was. If you close the dialog, the value is replaced with a placeholder. This is on by default with `piifence claude`.
 
 To skip the dialog and always make the same choice, set `auto_approve` in `~/.config/piifence/config.toml`:
 
@@ -66,15 +66,17 @@ To skip the dialog and always make the same choice, set `auto_approve` in `~/.co
 auto_approve = "replace"
 ```
 
-| Value | What happens to every prompt with a sensitive value |
-|---|---|
-| `ask` (default) | show the dialog |
-| `replace` | use an environment variable (a placeholder once the 4 variables per category are used up) |
-| `redact` | replace it with a placeholder |
-| `send-raw` | send it unchanged, once per prompt |
-| `block` | keep the prompt from being sent |
+| Value | Your prompt | Tool output, files and `CLAUDE.md` |
+|---|---|---|
+| `ask` (default) | show the dialog | placeholder |
+| `replace` | environment variable | environment variable |
+| `redact` | placeholder | placeholder |
+| `send-raw` | sent unchanged, once per prompt | placeholder |
+| `block` | not sent | placeholder |
 
-A toast says which choice was applied. You can also set it per Claude Code profile as `autoApprovePiiFence` in `/config`; when that is anything but `ask`, it wins over `config.toml`.
+With `replace`, a secret the agent finds in a file or in command output reaches the provider as `$PIIF_SECRET_1`, and the agent can use it in commands like one you typed. piifence sets the variable just before a Bash command that names it runs. Once the 9 variables per category are used up, values become placeholders.
+
+A toast says which choice was applied to your prompt. You can also set it per Claude Code profile as `autoApprovePiiFence` in `/config`; when that is anything but `ask`, it wins over `config.toml`, for tool output too.
 
 ### Secrets only, no model download
 
@@ -113,8 +115,9 @@ Claude Code ──request──▶ piifence (localhost) ──redacted request�
 
 - Experimental. Use it as a safety net, not as your only protection.
 - Input only: the agent works with placeholders or variable names, and responses are not scanned or rewritten.
-- Environment variables are limited to 4 per category (`$PIIF_SECRET_1` to `$PIIF_SECRET_4`) per session; after that, values become placeholders.
-- The gateway keeps the values behind those variables in memory only. If it restarts during a session, a value a command prints is caught only if detection recognizes it.
+- Environment variables are limited to 9 per category (`$PIIF_SECRET_1` to `$PIIF_SECRET_9`) per session; after that, values become placeholders.
+- The gateway keeps the values behind those variables in memory only. If it restarts during a session, the variables you created in prompts are registered again with your next prompt, but variables made from tool output are lost until the agent reads that output again.
+- With `replace`, the agent can use every secret it comes across in commands, including sending it somewhere. Use `redact` if it should only use the ones you give it.
 - macOS only, and Claude Code is the only supported agent today.
 
 ## Development

@@ -151,7 +151,15 @@ fn run_claude(args: &[String]) -> ! {
         }
     }
 
-    let settings_path = match write_settings_override(&gateway_url) {
+    let session_id = match new_session_id() {
+        Ok(id) => id,
+        Err(err) => {
+            eprintln!("piifence: cannot create a session id: {err}");
+            cleanup_gateway(gateway_child);
+            std::process::exit(1);
+        }
+    };
+    let settings_path = match write_settings_override(&gateway_url, &session_id) {
         Ok(path) => path,
         Err(err) => {
             eprintln!("piifence: cannot write session settings: {err}");
@@ -400,7 +408,65 @@ fn tail_lines(path: &Path, count: usize) -> Vec<String> {
 /// Write the per-session settings override. The name is unique and the file is
 /// created with `create_new`, so a file or symlink planted at a guessable /tmp path
 /// cannot make this write land somewhere else. Mode 0600 is set at creation.
-fn write_settings_override(gateway_url: &str) -> std::io::Result<PathBuf> {
+/// A random 32-hex-digit id for this Claude Code session. The gateway keys the session's settings and `$PIIF_…` values on it, and hands values only to a caller that knows it, so it comes from the OS random source.
+fn new_session_id() -> std::io::Result<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// `ANTHROPIC_CUSTOM_HEADERS` for the session: the user's own (shell, else Claude Code settings) plus the session id header. The override replaces the user's value, so theirs is carried over.
+fn custom_headers(session_id: &str) -> String {
+    let existing = env::var("ANTHROPIC_CUSTOM_HEADERS")
+        .ok()
+        .or_else(user_settings_custom_headers)
+        .filter(|headers| !headers.trim().is_empty());
+    let ours = format!("x-piifence-session: {session_id}");
+    match existing {
+        Some(existing) => format!("{}\n{ours}", existing.trim_end()),
+        None => ours,
+    }
+}
+
+fn user_settings() -> Option<serde_json::Value> {
+    let data = fs::read_to_string(claude_settings_path()).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+fn user_settings_custom_headers() -> Option<String> {
+    user_settings()?
+        .get("env")?
+        .get("ANTHROPIC_CUSTOM_HEADERS")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// `pluginConfigs` for the approval mod: the user's own options for it (such as `autoApprovePiiFence` from `/config`) plus `session`, the id the mod sends on its gateway calls, and `gatewayUrl`, where those calls go. It goes as an option because the plugin engine refuses a request that carries a value read from the environment. Both keys are set: the mod loads as `piifence-approval` when installed and as `piifence-approval@inline` from `--plugin-dir`.
+fn approval_plugin_configs(session_id: &str, gateway_url: &str) -> serde_json::Value {
+    let configs = user_settings().and_then(|settings| settings.get("pluginConfigs").cloned());
+    let mut out = serde_json::Map::new();
+    for key in ["piifence-approval", "piifence-approval@inline"] {
+        let mut config = configs
+            .as_ref()
+            .and_then(|configs| configs.get(key))
+            .filter(|config| config.is_object())
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if !config
+            .get("options")
+            .is_some_and(serde_json::Value::is_object)
+        {
+            config["options"] = serde_json::json!({});
+        }
+        config["options"]["session"] = serde_json::Value::String(session_id.to_string());
+        config["options"]["gatewayUrl"] = serde_json::Value::String(gateway_url.to_string());
+        out.insert(key.to_string(), config);
+    }
+    serde_json::Value::Object(out)
+}
+
+fn write_settings_override(gateway_url: &str, session_id: &str) -> std::io::Result<PathBuf> {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -410,8 +476,14 @@ fn write_settings_override(gateway_url: &str) -> std::io::Result<PathBuf> {
         std::process::id()
     ));
     let content = format!(
-        "{{\"env\":{{\"ANTHROPIC_BASE_URL\":\"{}\"}}}}\n",
-        gateway_url
+        "{}\n",
+        serde_json::json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": gateway_url,
+                "ANTHROPIC_CUSTOM_HEADERS": custom_headers(session_id),
+            },
+            "pluginConfigs": approval_plugin_configs(session_id, gateway_url),
+        })
     );
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);

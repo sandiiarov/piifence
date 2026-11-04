@@ -200,8 +200,8 @@ works as a smoke test.
 `plugin/piifence-approval` is a Claude Code **mod**, loaded by `piifence claude`. Its
 `prompt.submit` hook asks the gateway for findings, then uses the mods API `$.ui.ask` —
 Claude Code's own dialog — with options **Use $PIIF_<CATEGORY>_<N> / Redact / Send raw /
-Block** (the env option is omitted when a value cannot be mapped, e.g. more than four
-values of one category in a single prompt).
+Block** (the env option is omitted when a value cannot be mapped, e.g. once the 9
+names of a category in the session are used up).
 
 - **Use $PIIF_…** — the mod sets the raw value as an environment variable in the Claude
   Code session (`$.env.set`, names are literal), rewrites the prompt span to
@@ -239,7 +239,11 @@ Gateway endpoints used by the mod:
 - `POST /control/allow-prompt-once` — one-shot flag consumed by the next
   `/v1/messages` request; only the last user message text is skipped (tool results and
   system content are still scanned/redacted).
-- `POST /control/env-values` `{values: [{name, value, label}]}` — registers values the mod is about to put into `$PIIF_…` variables. Names must match `PIIF_[A-Z]+_[0-9]+`; a malformed entry rejects the whole body with 400. Held in memory only, never logged; values under 4 characters are accepted but not tracked.
+- `POST /control/env-values` `{values: [{name, value, label}]}` — registers values the mod is about to put into `$PIIF_…` variables, and again with each prompt so they survive a gateway restart. Names must be `PIIF_<CATEGORY>_<1-9>`; a malformed entry rejects the whole body with 400. Held in memory only, never logged; values under 4 characters are accepted but not tracked.
+- `POST /control/env-lookup` `{names}` → `{values: {name: value}}` — the active values of this session for the names a Bash command uses; 403 without a session id. Audit event `env_lookup` with counts only.
+- `POST /scan` also takes `setting` (the mod's `autoApprovePiiFence`) and returns `env` per finding, the name the gateway would give it.
+
+With `replace` in effect for a session, the gateway names detected values in every request part (tool results, files, `CLAUDE.md`) `$PIIF_…` instead of `<secret_N>`, and the mod sets them just before a Bash command that names them runs. Every other choice keeps placeholders outside the prompt. Sessions are told apart by the `x-piifence-session` header that `piifence claude` sets through `ANTHROPIC_CUSTOM_HEADERS`; the gateway strips it before forwarding.
 
 No osascript or macOS dialog is involved. Mod files:
 `plugin/piifence-approval/{.claude-plugin/plugin.json,hooks/hooks.json,hooks/register.js}`;

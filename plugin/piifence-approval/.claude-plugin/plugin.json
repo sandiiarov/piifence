@@ -10,6 +10,18 @@
       "description": "What to do when a prompt holds a sensitive value: ask (show the dialog), replace (environment variable), redact, send-raw, or block.",
       "options": ["ask", "replace", "redact", "send-raw", "block"],
       "default": "ask"
+    },
+    "session": {
+      "type": "string",
+      "title": "piifence session id",
+      "description": "Set by `piifence claude` for each session; leave it empty.",
+      "default": ""
+    },
+    "gatewayUrl": {
+      "type": "string",
+      "title": "piifence gateway URL",
+      "description": "Set by `piifence claude` for each session; leave it empty to use http://127.0.0.1:7788.",
+      "default": ""
     }
   }
 }

@@ -38,11 +38,11 @@ building the placeholder/redaction layer (M2).
   `auto_approve`). `hooks/register.test.ts` covers each value and the precedence
   (`claude plugin test plugin/piifence-approval`).
 - Env replacement: the approval mod can set `PIIF_<CATEGORY>_<N>` (`$.env.set`, literal
-  names, up to 4 per category per prompt) and rewrite the prompt span to
+  names, up to 9 per category per session, numbered by the gateway) and rewrite the prompt span to
   `$PIIF_<CATEGORY>_<N>`; the guard suppresses those env references, and Bash commands
-  can expand them. Only the prompt is env-replaced: the mod must not rewrite tool
-  results, CLAUDE.md or other transcript rows (what the user sees stays as it was), so
-  everything else the provider sees gets gateway placeholders. `/scan` returns UTF-16
+  can expand them. The mod must not rewrite tool
+  results, CLAUDE.md or other transcript rows (what the user sees stays as it was); those
+  reach the provider with gateway placeholders, or as `$PIIF_…` names when the session's choice is `replace` (gateway-side only). `/scan` returns UTF-16
   code-unit offsets so JS rewriting matches Rust detection on non-ASCII text. The raw
   value stays in the Claude Code process, never the provider.
 - Validation artifacts: `tests/m1-report.txt`, `docs/m1-notes.md`, `docs/labels.md`,
@@ -118,7 +118,8 @@ building the placeholder/redaction layer (M2).
   sets a one-shot grant that lets only the last user prompt through raw (tool results
   still redacted; audit `allowed_prompt`; grant expires after 60s). `/stats.allowed`
   counts allowed prompts. No osascript/native macOS dialog is used.
-  Before setting env vars, the mod posts each value and its name to `POST /control/env-values`; the gateway keeps them in memory only and replaces every exact occurrence with `$NAME` in all provider-bound text before detection (audit engine `env`), so a command that prints one does not leak it. If that call fails, the mod blocks the prompt.
+  Env vars: the gateway owns `$PIIF_<CATEGORY>_<N>` numbering per session (9 per category); `/scan` returns each finding's name as `env`. Before setting env vars, the mod posts each value and its name to `POST /control/env-values`; the gateway keeps them in memory only and replaces every exact occurrence with `$NAME` in all provider-bound text before detection (audit engine `env`), so a command that prints one does not leak it. If that call fails, the mod blocks the prompt. When the session's choice is `replace` (`autoApprovePiiFence`, sent with `/scan`, else config.toml `auto_approve`), detected values in tool output and files get `$NAME` instead of placeholders; the mod's `tool.call` Bash hook fetches the values a command names from `POST /control/env-lookup` and sets them before it runs.
+  Sessions: `piifence claude` gives each session a random 32-hex id, sent by Claude Code as `x-piifence-session` (via `ANTHROPIC_CUSTOM_HEADERS`, merged with the user's) and by the mod (as its `session` plugin option, with `gatewayUrl`, through `--settings` `pluginConfigs`; the engine refuses requests carrying env values and does not expose the process env). The gateway keys settings and values on it, strips the header before forwarding, never uses `replace` for tool output without one, and `/control/env-lookup` answers 403 without one.
   Gateway hardening: requires `PIIF_UPSTREAM` (no default provider); binds loopback and
   rejects requests with an `Origin` header or a non-loopback `Host`; accepts POST only
   for `/v1/messages` and `/v1/messages/count_tokens` (both redacted) and refuses other
