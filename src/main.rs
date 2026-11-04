@@ -57,6 +57,7 @@ fn main() -> anyhow::Result<()> {
     let mut by_tier: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
     let mut suppressed_placeholder = 0usize;
     let mut suppressed_env = 0usize;
+    let mut suppressed_file = 0usize;
 
     for case in &corpus {
         let detection = detector.detect(&case.text)?;
@@ -97,6 +98,7 @@ fn main() -> anyhow::Result<()> {
             match reason {
                 Suppression::Placeholder => suppressed_placeholder += 1,
                 Suppression::EnvReference => suppressed_env += 1,
+                Suppression::FileReference => suppressed_file += 1,
             }
             println!(
                 "    [suppressed:{}] {:>6.3}  {:<18} {:?}  [{}]",
@@ -125,10 +127,15 @@ fn main() -> anyhow::Result<()> {
         "guards: {}",
         if use_guards {
             format!(
-                "on — suppressed {} spans (placeholder: {}, env-ref-allowlist: {})",
-                suppressed_placeholder + suppressed_env,
+                "on — suppressed {} spans (placeholder: {}, env-ref-allowlist: {}{})",
+                suppressed_placeholder + suppressed_env + suppressed_file,
                 suppressed_placeholder,
-                suppressed_env
+                suppressed_env,
+                if suppressed_file > 0 {
+                    format!(", file-reference: {suppressed_file}")
+                } else {
+                    String::new()
+                }
             )
         } else {
             "off (PIIF_GUARDS=0)".to_string()

@@ -89,7 +89,9 @@ building the placeholder/redaction layer (M2).
   guard suppresses spans fully inside pipeline-owned placeholder tokens
   (`<(private_)?[a-z_]+_\d+>`, legacy `PII_<LABEL>_<8hex>`); env-ref allowlist suppresses
   `SECRET` spans overlapping `os.environ.get(...)` / `os.environ[...]` / `os.getenv(...)` /
-  `process.env.*`. Every suppression is printed with its reason; `PIIF_GUARDS=0` disables
+  `process.env.*`; file-reference guard suppresses spans of any label but `private_url`
+  that lie (edge whitespace ignored) inside a `path/name.ext:line[:col]` reference, e.g.
+  `auth.spec.ts:42` in a system prompt. Every suppression is printed with its reason; `PIIF_GUARDS=0` disables
   the guards (13/15 baseline). Guards decide keep/drop only — they do not fix span
   boundaries, and they are policy (narrow, versioned, unit-tested), not test scaffolding.
 - Context-aware scanning: `tool_result` text is re-scanned with the originating

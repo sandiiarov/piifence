@@ -12,6 +12,11 @@
 //!    is a false positive: the code names a secret, it does not contain one.
 //!    This is the narrow fix for `neg-01`; the model flags only the
 //!    single-quoted `password = os.environ.get('DB_PASS')` form.
+//! 3. **File-reference guard** — a span that lies entirely inside a
+//!    `path/name.ext:line` reference (`auth.spec.ts:42`, `src/main.rs:10:5`) is a
+//!    false positive: the model flags example locations in system prompts as
+//!    `secret`, `private_person` or `private_date`. Every label but `private_url`,
+//!    so `host.com:8080` stays detectable as a URL.
 
 use regex::Regex;
 
@@ -19,6 +24,7 @@ use regex::Regex;
 pub enum Suppression {
     Placeholder,
     EnvReference,
+    FileReference,
 }
 
 impl Suppression {
@@ -26,6 +32,7 @@ impl Suppression {
         match self {
             Self::Placeholder => "placeholder",
             Self::EnvReference => "env-ref-allowlist",
+            Self::FileReference => "file-reference",
         }
     }
 }
@@ -33,6 +40,7 @@ impl Suppression {
 pub struct Guards {
     placeholder: Regex,
     env_ref: Regex,
+    file_ref: Regex,
 }
 
 impl Guards {
@@ -44,6 +52,10 @@ impl Guards {
             )?,
             env_ref: Regex::new(
                 r#"os\.environ\.get\(\s*['"][A-Za-z0-9_]+['"]\s*\)|os\.environ\[\s*['"][A-Za-z0-9_]+['"]\s*\]|os\.getenv\(\s*['"][A-Za-z0-9_]+['"]\s*\)|process\.env\.[A-Za-z0-9_]+|\$PIIF_[A-Za-z0-9_]+"#,
+            )?,
+            // name.ext:line[:col], optionally under a path; the extension is letters only.
+            file_ref: Regex::new(
+                r"(?:[\w.\-]+/)*[\w\-]+(?:\.[\w\-]+)*\.[A-Za-z]{1,6}:\d{1,6}(?::\d{1,4})?\b",
             )?,
         })
     }
@@ -66,6 +78,35 @@ impl Guards {
             .any(|m| start < m.end() && m.start() < end)
         {
             return Some(Suppression::EnvReference);
+        }
+        None
+    }
+
+    /// `suppress`, plus the guards that depend on the span's label.
+    pub fn suppress_labeled(
+        &self,
+        label: &str,
+        text: &str,
+        start: usize,
+        end: usize,
+    ) -> Option<Suppression> {
+        if let Some(reason) = self.suppress(text, start, end) {
+            return Some(reason);
+        }
+        // File reference: the span must lie entirely inside it, so a real secret
+        // next to a location (`key=abc123 main.rs:4`) is still redacted. The model
+        // often includes a leading space, so the span's edge whitespace is ignored.
+        let span = text.get(start..end)?;
+        let start = start + (span.len() - span.trim_start().len());
+        let end = end - (span.len() - span.trim_end().len());
+        if start < end
+            && !label.eq_ignore_ascii_case("private_url")
+            && self
+                .file_ref
+                .find_iter(text)
+                .any(|m| start >= m.start() && end <= m.end())
+        {
+            return Some(Suppression::FileReference);
         }
         None
     }
@@ -130,6 +171,57 @@ mod tests {
             g.suppress(text, start, text.len()),
             Some(Suppression::EnvReference)
         );
+    }
+
+    #[test]
+    fn file_reference_secret_is_suppressed() {
+        let g = guards();
+        for (text, needle) in [
+            (
+                "Fails at `auth.spec.ts:42`: expected 200",
+                "auth.spec.ts:42",
+            ),
+            (
+                "see src/hooks/session.ts:40 for the bug",
+                "src/hooks/session.ts:40",
+            ),
+            ("error at src/main.rs:10:5", "src/main.rs:10:5"),
+            // The model often starts the span at the space before the reference.
+            ("deploy at src/main.rs:10", " src/main.rs:10"),
+        ] {
+            let start = text.find(needle).unwrap();
+            let end = start + needle.len();
+            assert_eq!(
+                g.suppress_labeled("secret", text, start, end),
+                Some(Suppression::FileReference),
+                "{text}"
+            );
+            assert_eq!(
+                g.suppress_labeled("private_person", text, start, end),
+                Some(Suppression::FileReference),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_reference_guard_is_narrow() {
+        let g = guards();
+        // Not a secret label: host:port stays detectable.
+        let text = "connect to db.internal.com:5432";
+        let start = text.find("db.internal").unwrap();
+        assert_eq!(
+            g.suppress_labeled("private_url", text, start, text.len()),
+            None
+        );
+        // A real secret beside a location is not inside it.
+        let text = "token=ghp_abcdefghijklmnopqrstuvwxyz0123456789 main.rs:4";
+        let start = text.find("ghp_").unwrap();
+        assert_eq!(g.suppress_labeled("secret", text, start, start + 40), None);
+        // Password after a colon is not a line number.
+        let text = "login admin.user:hunter2";
+        let start = text.find("admin").unwrap();
+        assert_eq!(g.suppress_labeled("secret", text, start, text.len()), None);
     }
 
     #[test]

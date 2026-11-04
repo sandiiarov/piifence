@@ -336,7 +336,7 @@ fn apply_guards(
     let mut kept = Vec::new();
     let mut dropped = Vec::new();
     for span in spans {
-        match guards.suppress(text, span.start, span.end) {
+        match guards.suppress_labeled(&span.label, text, span.start, span.end) {
             Some(reason) => dropped.push((span, reason)),
             None => kept.push(span),
         }
