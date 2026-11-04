@@ -112,12 +112,16 @@ impl Detector {
             })?
             .into_iter()
             .map(|span| snap_to_char_boundaries(span, text))
+            .filter_map(|span| trim_whitespace(span, text))
             .collect(),
             None => Vec::new(),
         };
 
         let pre_spans = if self.use_gitleaks && self.category_enabled("secret") {
             gitleaks_spans(text)?
+                .into_iter()
+                .filter_map(|span| trim_whitespace(span, text))
+                .collect()
         } else {
             Vec::new()
         };
@@ -284,6 +288,19 @@ fn snap_to_char_boundaries(mut span: DetectedSpan, text: &str) -> DetectedSpan {
     span
 }
 
+/// Shrink a span past whitespace at its edges, or drop it if nothing else is left. The model often starts a span at the space before the value (`" alice@example.com"`), and replacing that space joins the placeholder to the previous word: `key$PIIF_SECRET_1`. `span` must already sit on char boundaries.
+fn trim_whitespace(mut span: DetectedSpan, text: &str) -> Option<DetectedSpan> {
+    let slice = text.get(span.start..span.end)?;
+    let trimmed = slice.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    span.start += slice.len() - slice.trim_start().len();
+    span.end = span.start + trimmed.len();
+    span.word = trimmed.to_string();
+    Some(span)
+}
+
 fn overlaps(a: &DetectedSpan, b: &DetectedSpan) -> bool {
     a.start < b.end && b.start < a.end
 }
@@ -394,6 +411,18 @@ mod tests {
         let merged = merge_spans(model, pre);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].label, "secret");
+    }
+
+    #[test]
+    fn edge_whitespace_is_trimmed_from_spans() {
+        let text = "Use this key sk_live_abc123\n and more";
+        let start = text.find(" sk_live").unwrap();
+        let end = text.find(" and").unwrap();
+        let trimmed = trim_whitespace(span("secret", start, end, "model"), text).unwrap();
+        assert_eq!(&text[trimmed.start..trimmed.end], "sk_live_abc123");
+        assert_eq!(trimmed.word, "sk_live_abc123");
+        // A span of only whitespace is dropped.
+        assert!(trim_whitespace(span("secret", 3, 4, "model"), text).is_none());
     }
 
     #[test]
