@@ -29,8 +29,8 @@ building the placeholder/redaction layer (M2).
   exists at `~/.claude/skills/piifence-notice` (optional install lives outside this
   repo — re-copy after plugin changes).
 - Claude Code approval mod: `plugin/piifence-approval/` (`prompt.submit` hook using
-  `$.ui.ask` for Use env var / Redact / Send raw / Block; talks to gateway `/scan` and
-  `/control/allow-prompt-once`); `piifence claude` loads it per session via
+  `$.ui.ask` for Use env var / Redact / Send raw / Block; talks to gateway `/scan`,
+  `/control/allow-prompt-once` and `/control/env-values`); `piifence claude` loads it per session via
   `--plugin-dir` unless `~/.claude/skills/piifence-approval` exists. Its `userConfig`
   field `autoApprovePiiFence` (`ask` default, `replace`, `redact`, `send-raw`, `block`)
   skips the dialog and applies that choice. Without it, the mod uses config.toml's
@@ -118,6 +118,7 @@ building the placeholder/redaction layer (M2).
   sets a one-shot grant that lets only the last user prompt through raw (tool results
   still redacted; audit `allowed_prompt`; grant expires after 60s). `/stats.allowed`
   counts allowed prompts. No osascript/native macOS dialog is used.
+  Before setting env vars, the mod posts each value and its name to `POST /control/env-values`; the gateway keeps them in memory only and replaces every exact occurrence with `$NAME` in all provider-bound text before detection (audit engine `env`), so a command that prints one does not leak it. If that call fails, the mod blocks the prompt.
   Gateway hardening: requires `PIIF_UPSTREAM` (no default provider); binds loopback and
   rejects requests with an `Origin` header or a non-loopback `Host`; accepts POST only
   for `/v1/messages` and `/v1/messages/count_tokens` (both redacted) and refuses other

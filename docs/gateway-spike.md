@@ -209,6 +209,7 @@ values of one category in a single prompt).
   mapping the variable names. The gateway sees only the env reference (guard
   `$PIIF_[A-Z0-9_]+`), so the provider never receives the value; local Bash commands can
   expand it. Env vars live for the session and are never printed by the mod.
+  Before setting them, the mod registers each value with `POST /control/env-values`; if that fails, the prompt is blocked rather than leave a variable the gateway cannot protect.
 - **Redact** — prompt continues; the gateway replaces the spans as usual.
 - **Send raw** — the mod calls `POST /control/allow-prompt-once`; the gateway lets the
   last user prompt through unmodified but still redacts tool results. Audit event
@@ -224,7 +225,7 @@ Tool results, `CLAUDE.md`, the system prompt, assistant history and other reques
 use the gateway's normal placeholder redaction: the mod does not rewrite transcript rows
 (what the user sees stays as it was), and the gateway is a separate process that cannot
 set `$.env`. A secret there is replaced with an inert
-placeholder, which is safe but not usable as a shell variable. The env variables are
+placeholder, which is safe but not usable as a shell variable. The exception is a registered env value: wherever it appears (for example the output of `echo $PIIF_SECRET_1`), the gateway replaces it with `$PIIF_SECRET_1` before detection runs, so it is caught even when detection would miss a bare value. The env variables are
 available to Bash, so an agent can use them in commands (e.g.
 `curl -H "Authorization: Bearer $PIIF_SECRET_1" ...`) without the value crossing the
 gateway.
@@ -238,6 +239,7 @@ Gateway endpoints used by the mod:
 - `POST /control/allow-prompt-once` — one-shot flag consumed by the next
   `/v1/messages` request; only the last user message text is skipped (tool results and
   system content are still scanned/redacted).
+- `POST /control/env-values` `{values: [{name, value, label}]}` — registers values the mod is about to put into `$PIIF_…` variables. Names must match `PIIF_[A-Z]+_[0-9]+`; a malformed entry rejects the whole body with 400. Held in memory only, never logged; values under 4 characters are accepted but not tracked.
 
 No osascript or macOS dialog is involved. Mod files:
 `plugin/piifence-approval/{.claude-plugin/plugin.json,hooks/hooks.json,hooks/register.js}`;

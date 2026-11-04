@@ -261,10 +261,25 @@ export function register(on, options) {
 
     if (choice === 'replace') {
       const setters = envSetters($)
+      const values = plan.slots.map((slot) => ({
+        name: slot.env,
+        value: e.text.slice(slot.finding.start, slot.finding.end),
+        label: slot.finding.label,
+      }))
+      // The gateway replaces these exact values with the variable names in everything sent to the provider, so a command that prints one (`echo $PIIF_SECRET_1`) does not leak it. Without that, the value must not go into the environment.
       try {
-        for (const slot of plan.slots) {
-          const value = e.text.slice(slot.finding.start, slot.finding.end)
-          await setters[slot.category][slot.index - 1](value)
+        const response = await $.http.fetch(gatewayUrl($) + '/control/env-values', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ values }),
+        })
+        if (!response.ok) throw new Error('gateway rejected env values')
+      } catch {
+        return { drop: 'piifence: the gateway could not protect the environment variables; prompt blocked.' }
+      }
+      try {
+        for (const [i, slot] of plan.slots.entries()) {
+          await setters[slot.category][slot.index - 1](values[i].value)
         }
       } catch {
         return { drop: 'piifence: could not place the value in the environment; prompt blocked.' }

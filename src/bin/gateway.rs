@@ -80,6 +80,8 @@ struct AppState {
     allow_prompt_until: Arc<Mutex<Option<Instant>>>,
     /// `auto_approve` from the config file, handed to the approval mod by `/scan`.
     auto_approve: Option<&'static str>,
+    /// Values the approval mod put into environment variables (see `EnvValues`).
+    env_values: Arc<Mutex<EnvValues>>,
 }
 
 /// Consume the one-shot "Send raw" approval. Returns true only if one was granted
@@ -179,6 +181,105 @@ fn next_placeholder(state: &AppState, label: &str, value: &str) -> (String, bool
         format!("<{category}_{number}>")
     };
     (token, new)
+}
+
+/// Shortest value tracked by `EnvValues`. A shorter one would be replaced inside ordinary words.
+const MIN_ENV_VALUE_CHARS: usize = 4;
+
+/// One value the approval mod put into an environment variable.
+struct EnvValue {
+    value: String,
+    name: String,
+    label: String,
+    /// Whether the value has been replaced in a request yet, so the notice reports it once.
+    seen: bool,
+}
+
+/// Values the approval mod put into environment variables (`$PIIF_SECRET_1`), registered through `/control/env-values` before the mod sets them. Commands run with the real value, so their output can contain it (`echo $PIIF_SECRET_1`); the gateway replaces every exact occurrence with `$NAME` in all provider-bound text before detection runs, so the value never leaves even when detection would miss it. Held in memory only, never logged or written to disk, and lost when the gateway stops.
+#[derive(Default)]
+struct EnvValues {
+    /// Longest value first, so a value that contains another is replaced whole.
+    entries: Vec<EnvValue>,
+}
+
+impl EnvValues {
+    /// Track `value` as `$name`. A value registered again takes the newer name: the gateway is shared by every session, and the most recent registration is the likeliest to be in use.
+    fn register(&mut self, name: &str, value: &str, label: &str) {
+        if value.chars().count() < MIN_ENV_VALUE_CHARS {
+            return;
+        }
+        match self.entries.iter_mut().find(|entry| entry.value == value) {
+            Some(entry) => {
+                entry.name = name.to_string();
+                entry.label = label.to_string();
+            }
+            None => self.entries.push(EnvValue {
+                value: value.to_string(),
+                name: name.to_string(),
+                label: label.to_string(),
+                seen: false,
+            }),
+        }
+        self.entries
+            .sort_by_key(|entry| std::cmp::Reverse(entry.value.len()));
+    }
+}
+
+fn env_name_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^PIIF_[A-Z]+_[0-9]+$").expect("env name regex"))
+}
+
+/// The `(name, value, label)` triples of a `/control/env-values` body, `{"values": [{"name", "value", "label"}]}`, or `None` if any entry is malformed. The whole body is rejected so the mod blocks the prompt rather than set a variable the gateway does not track.
+fn parse_env_values(body: &[u8]) -> Option<Vec<(String, String, String)>> {
+    let parsed: Value = serde_json::from_slice(body).ok()?;
+    parsed
+        .get("values")?
+        .as_array()?
+        .iter()
+        .map(|entry| {
+            let name = entry.get("name")?.as_str()?;
+            let value = entry.get("value")?.as_str()?;
+            let label = entry
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or("secret");
+            (env_name_re().is_match(name) && !value.is_empty())
+                .then(|| (name.to_string(), value.to_string(), label.to_string()))
+        })
+        .collect()
+}
+
+/// Replace every registered env value in `text` with `$NAME`, returning the new text and one audit entry per replacement. Offsets are into the text as it stood when that value was replaced, after any longer values.
+fn replace_env_values(state: &AppState, text: &str, field: &str) -> (String, Vec<Value>) {
+    let mut values = state.env_values.lock().unwrap();
+    if values.entries.is_empty() {
+        return (text.to_string(), Vec::new());
+    }
+    let mut out = text.to_string();
+    let mut audit = Vec::new();
+    for entry in values.entries.iter_mut() {
+        if !out.contains(&entry.value) {
+            continue;
+        }
+        let token = format!("${}", entry.name);
+        for (start, _) in out.match_indices(&entry.value) {
+            audit.push(json!({
+                "field": field,
+                "label": entry.label,
+                "score": 1.0,
+                "start": start,
+                "end": start + entry.value.len(),
+                "placeholder": token,
+                "new": !entry.seen,
+                "preview": mask_value(&entry.value),
+                "engine": "env",
+            }));
+            entry.seen = true;
+        }
+        out = out.replace(&entry.value, &token);
+    }
+    (out, audit)
 }
 
 fn record_allowed(state: &AppState) {
@@ -393,6 +494,9 @@ async fn redact_text_with_context(
     field: &str,
     context: Option<&str>,
 ) -> anyhow::Result<(String, Vec<Value>)> {
+    // Known env values go first, so detection sees `$PIIF_SECRET_1` (which the env-ref guard skips) and never the value itself. The context is shown to the model only, so it is left as is.
+    let (text, mut audit) = replace_env_values(state, text, field);
+    let text = text.as_str();
     let (input, offset) = match context {
         Some(context) if !context.is_empty() => (format!("{context}\n{text}"), context.len() + 1),
         _ => (text.to_string(), 0),
@@ -401,7 +505,7 @@ async fn redact_text_with_context(
     // Sorted, non-overlapping, so replacing right to left keeps offsets valid.
     let mut accepted = normalize_spans(kept, text, offset);
     if accepted.is_empty() {
-        return Ok((text.to_string(), Vec::new()));
+        return Ok((text.to_string(), audit));
     }
     accepted.reverse();
     let mut out = text.to_string();
@@ -413,7 +517,6 @@ async fn redact_text_with_context(
         .rev()
         .map(|span| next_placeholder(state, &span.label, &text[span.start..span.end]))
         .collect();
-    let mut audit = Vec::new();
     for (span, token) in accepted.iter().zip(tokens.iter().rev()) {
         let preview = mask_value(&text[span.start..span.end]);
         out.replace_range(span.start..span.end, &token.0);
@@ -776,6 +879,25 @@ async fn proxy(
             .body(Body::from(json!({"ok": true}).to_string()))
             .unwrap();
     }
+    if path == "/control/env-values" && method == Method::POST {
+        let status = match parse_env_values(&body) {
+            Some(values) => {
+                let mut registry = state.env_values.lock().unwrap();
+                for (name, value, label) in &values {
+                    registry.register(name, value, label);
+                }
+                StatusCode::OK
+            }
+            None => StatusCode::BAD_REQUEST,
+        };
+        return Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"ok": status == StatusCode::OK}).to_string(),
+            ))
+            .unwrap();
+    }
 
     // Every POST under /v1/messages carries conversation text. Redact the two shapes
     // that share the Messages body (`/v1/messages`, `/v1/messages/count_tokens`) and
@@ -1023,6 +1145,7 @@ async fn main() -> anyhow::Result<()> {
         stats: Arc::new(Mutex::new(Stats::default())),
         allow_prompt_until: Arc::new(Mutex::new(None)),
         auto_approve,
+        env_values: Arc::new(Mutex::new(EnvValues::default())),
     };
 
     let app = Router::new()
@@ -1112,6 +1235,7 @@ mod tests {
             stats: Arc::new(Mutex::new(Stats::default())),
             allow_prompt_until: Arc::new(Mutex::new(None)),
             auto_approve: None,
+            env_values: Arc::new(Mutex::new(EnvValues::default())),
         }
     }
 
@@ -1255,6 +1379,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(content[0]["content"][0]["source"]["data"], "key <secret_1>");
+    }
+
+    #[tokio::test]
+    async fn env_value_in_tool_output_becomes_its_name() {
+        let state = fake_state();
+        let values = parse_env_values(
+            br#"{"values":[{"name":"PIIF_SECRET_1","value":"if-ajsdlk231lj","label":"secret"}]}"#,
+        )
+        .unwrap();
+        for (name, value, label) in &values {
+            state
+                .env_values
+                .lock()
+                .unwrap()
+                .register(name, value, label);
+        }
+        // `echo $PIIF_SECRET_1` printed the value, which detection would miss; TOKEN is still detected.
+        let mut content = json!([{"type": "tool_result", "tool_use_id": "t1",
+            "content": "if-ajsdlk231lj\nTOKEN"}]);
+        let audit = redact_content(&state, &mut content, &tool_map_with("t1"), false)
+            .await
+            .unwrap();
+        assert_eq!(content[0]["content"], "$PIIF_SECRET_1\n<secret_1>");
+        assert_eq!(audit[0]["engine"], "env");
+        assert_eq!(audit[0]["placeholder"], "$PIIF_SECRET_1");
+        assert_eq!(audit[0]["new"], true);
+
+        // Anywhere in the request, and reported as new only once.
+        let mut content = json!([{"type": "tool_use", "id": "t2", "name": "Bash",
+            "input": {"command": "curl -H 'X-Key: if-ajsdlk231lj' x"}}]);
+        let audit = redact_content(&state, &mut content, &HashMap::new(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            content[0]["input"]["command"],
+            "curl -H 'X-Key: $PIIF_SECRET_1' x"
+        );
+        assert_eq!(audit[0]["new"], false);
+    }
+
+    #[test]
+    fn env_values_are_validated() {
+        assert!(parse_env_values(br#"{"values":[{"name":"HOME","value":"abcdef"}]}"#).is_none());
+        assert!(parse_env_values(br#"{"values":[{"name":"PIIF_SECRET_1","value":""}]}"#).is_none());
+        assert!(parse_env_values(b"not json").is_none());
+        // Too short to replace safely: accepted but not tracked.
+        let mut registry = EnvValues::default();
+        registry.register("PIIF_SECRET_1", "abc", "secret");
+        assert!(registry.entries.is_empty());
+        // Longest first, and a repeat takes the newer name.
+        registry.register("PIIF_SECRET_1", "abcd", "secret");
+        registry.register("PIIF_SECRET_2", "abcdefgh", "secret");
+        registry.register("PIIF_SECRET_3", "abcd", "secret");
+        let names: Vec<&str> = registry.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["PIIF_SECRET_2", "PIIF_SECRET_3"]);
     }
 
     #[tokio::test]
