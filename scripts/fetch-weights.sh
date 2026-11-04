@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Fetch the OpenAI Privacy Filter weights used by the Rust inference crate.
 # ~2.8 GB; destination is data/ by default, override with PIIF_MODEL_DIR.
+# The clone keeps its .git (a second copy of the weights); scripts/install.sh removes it from the installed copy.
 set -euo pipefail
 
 DEST="${PIIF_MODEL_DIR:-data}"

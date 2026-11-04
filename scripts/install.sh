@@ -115,6 +115,11 @@ if [ "$WITH_WEIGHTS" = 1 ]; then
     echo "==> downloading model weights (about 2.8 GB) into $DEFAULT_MODEL_DIR"
     (cd "$REPO" && PIIF_MODEL_DIR="$DEFAULT_MODEL_DIR" bash scripts/fetch-weights.sh)
   fi
+  # The clone's .git holds a second copy of the weights (Git LFS objects, about 2.7 GB) that piifence never reads.
+  if [ -d "$DEFAULT_MODEL_DIR/.git" ]; then
+    rm -rf "$DEFAULT_MODEL_DIR/.git"
+    echo "==> removed the duplicate Git LFS copy in $DEFAULT_MODEL_DIR/.git"
+  fi
 fi
 
 echo
