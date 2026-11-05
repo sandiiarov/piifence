@@ -5,8 +5,8 @@
 // The gateway does the same to values it finds in tool output and files. The mod fetches such a value from the gateway just before a Bash command that names it runs.
 //
 // When a value cannot get a variable (more than 9 in a category, or a label with no variables), the gateway replaces it with a placeholder instead.
-
-const DEFAULT_GATEWAY = 'http://127.0.0.1:7788'
+//
+// It only runs in a `piifence claude` session, which passes the session id and the gateway URL as plugin options. Without them it registers no hooks.
 
 // A name the gateway can hand out; it numbers 1 to 9 per category (its ENV_LIMIT).
 const ENV_NAME = /\bPIIF_(?:SECRET|EMAIL|PERSON|PHONE|ADDRESS|URL|DATE|ACCOUNT)_[1-9]\b/g
@@ -15,21 +15,15 @@ const ENV_NAME = /\bPIIF_(?:SECRET|EMAIL|PERSON|PHONE|ADDRESS|URL|DATE|ACCOUNT)_
 const placed = new Map()
 
 // The gateway `piifence claude` started for this session, as the `gatewayUrl` plugin option (the engine does not hand the mod the process environment).
-let gatewayBase = DEFAULT_GATEWAY
+let gatewayBase = ''
 
 // The session id `piifence claude` gives this session, as the `session` plugin option; the gateway keys this session's values on it. It comes as an option, not from the environment, because the engine refuses a request that carries an environment value.
 let sessionId = ''
 
-function gatewayHeaders() {
-  const headers = { 'content-type': 'application/json' }
-  if (/^[0-9a-f]{32}$/.test(sessionId)) headers['x-piifence-session'] = sessionId
-  return headers
-}
-
 function post($, path, body) {
   return $.http.fetch(gatewayBase + path, {
     method: 'POST',
-    headers: gatewayHeaders(),
+    headers: { 'content-type': 'application/json', 'x-piifence-session': sessionId },
     body: JSON.stringify(body),
   })
 }
@@ -167,10 +161,10 @@ function list(lines) {
 }
 
 export function register(on, options) {
-  sessionId = typeof options?.session === 'string' ? options.session : ''
-  gatewayBase = /^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(options?.gatewayUrl ?? '')
-    ? options.gatewayUrl
-    : DEFAULT_GATEWAY
+  if (!/^[0-9a-f]{32}$/.test(options?.session ?? '')) return
+  if (!/^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(options?.gatewayUrl ?? '')) return
+  sessionId = options.session
+  gatewayBase = options.gatewayUrl
 
   on('prompt.submit', async ($, e, next) => {
     // After a gateway restart it no longer knows the values this mod placed; register them again so their names stay theirs. Best effort: the prompt below registers its own values strictly.

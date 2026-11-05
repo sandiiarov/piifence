@@ -4,6 +4,8 @@ const KEY = 'if-ajsdlk231lj12kl12j1'
 const PROMPT = `use this API key ${KEY} please`
 
 const SESSION = '0123456789abcdef0123456789abcdef'
+// What `piifence claude` passes the mod.
+const OPTIONS = { options: { session: SESSION, gatewayUrl: 'http://127.0.0.1:7788' } }
 
 // Stands for the gateway and the engine: /scan finds the key and names it `env` (null for no name), env.set succeeds, and every toast and AskUserQuestion dialog is counted. Values sent to /control/env-values are recorded; `envValuesOk: false` makes that call fail. /control/env-lookup answers from `lookup`. Every gateway call is recorded with its body and session header.
 function engine(on, { env = 'PIIF_SECRET_1', envValuesOk = true, lookup = {} } = {}) {
@@ -26,7 +28,6 @@ function engine(on, { env = 'PIIF_SECRET_1', envValuesOk = true, lookup = {} } =
     ]
     return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ findings }) } }
   })
-  on('env.get', () => ({ value: undefined }))
   on('env.set', (_, e) => {
     seen.env.push(e.name)
     seen.set[e.name] = e.value
@@ -48,7 +49,7 @@ function engine(on, { env = 'PIIF_SECRET_1', envValuesOk = true, lookup = {} } =
   return seen
 }
 
-test('a sensitive value becomes an env var without asking, and a toast says so', { options: { session: SESSION } }, async ($, on) => {
+test('a sensitive value becomes an env var without asking, and a toast says so', OPTIONS, async ($, on) => {
   const seen = engine(on)
   const result = await $.prompt.submit({ text: PROMPT })
   expect(seen.asks).toBe(0)
@@ -61,7 +62,7 @@ test('a sensitive value becomes an env var without asking, and a toast says so',
   expect(seen.toasts[0]).not.toContain(KEY)
 })
 
-test('a prompt without sensitive values is left alone', { options: { session: SESSION } }, async ($, on) => {
+test('a prompt without sensitive values is left alone', OPTIONS, async ($, on) => {
   const seen = engine(on)
   const result = await $.prompt.submit({ text: 'hello' })
   expect(result.text).toBe('hello')
@@ -69,14 +70,14 @@ test('a prompt without sensitive values is left alone', { options: { session: SE
   expect(seen.env).toEqual([])
 })
 
-test('the prompt is blocked when the gateway cannot take the values', { options: { session: SESSION } }, async ($, on) => {
+test('the prompt is blocked when the gateway cannot take the values', OPTIONS, async ($, on) => {
   const seen = engine(on, { envValuesOk: false })
   const result = await $.prompt.submit({ text: PROMPT })
   expect(seen.env).toEqual([])
   expect('drop' in result).toBe(true)
 })
 
-test('a value with no variable is left to the gateway placeholder', { options: { session: SESSION } }, async ($, on) => {
+test('a value with no variable is left to the gateway placeholder', OPTIONS, async ($, on) => {
   const seen = engine(on, { env: null })
   const result = await $.prompt.submit({ text: PROMPT })
   expect(result.text).toBe(PROMPT)
@@ -85,7 +86,7 @@ test('a value with no variable is left to the gateway placeholder', { options: {
   expect(seen.toasts[0]).toContain('placeholder')
 })
 
-test('the scan carries the session id', { options: { session: SESSION } }, async ($, on) => {
+test('the scan carries the session id', OPTIONS, async ($, on) => {
   const seen = engine(on)
   await $.prompt.submit({ text: PROMPT })
   const scan = seen.calls.find((call) => call.path === '/scan')
@@ -93,7 +94,7 @@ test('the scan carries the session id', { options: { session: SESSION } }, async
   expect(scan.session).toBe(SESSION)
 })
 
-test('a placed value is registered again on the next prompt', { options: { session: SESSION } }, async ($, on) => {
+test('a placed value is registered again on the next prompt', OPTIONS, async ($, on) => {
   const seen = engine(on)
   await $.prompt.submit({ text: PROMPT })
   const before = seen.calls.length
@@ -105,7 +106,7 @@ test('a placed value is registered again on the next prompt', { options: { sessi
   expect(next.path).toBe('/scan')
 })
 
-test('a Bash command gets the values its $PIIF names hold before it runs', { options: { session: SESSION } }, async ($, on) => {
+test('a Bash command gets the values its $PIIF names hold before it runs', OPTIONS, async ($, on) => {
   const seen = engine(on, { lookup: { PIIF_SECRET_2: 'from-a-file-value' } })
   await $.tool.call({ tool: 'Bash', command: 'curl -H "X-Key: $PIIF_SECRET_2" https://x && echo $PIIF_SECRET_2' })
   const lookup = seen.calls.find((call) => call.path === '/control/env-lookup')
@@ -114,9 +115,17 @@ test('a Bash command gets the values its $PIIF names hold before it runs', { opt
   expect(seen.bash[0].env).toEqual({ PIIF_SECRET_2: 'from-a-file-value' })
 })
 
-test('a Bash command without $PIIF names asks the gateway nothing', async ($, on) => {
+test('a Bash command without $PIIF names asks the gateway nothing', OPTIONS, async ($, on) => {
   const seen = engine(on)
   await $.tool.call({ tool: 'Bash', command: 'ls -la' })
   expect(seen.calls).toEqual([])
   expect(seen.bash.length).toBe(1)
+})
+
+test('outside a piifence claude session the mod does nothing', async ($, on) => {
+  const seen = engine(on)
+  const result = await $.prompt.submit({ text: PROMPT })
+  await $.tool.call({ tool: 'Bash', command: 'echo $PIIF_SECRET_1' })
+  expect(result.text).toBe(PROMPT)
+  expect(seen.calls).toEqual([])
 })

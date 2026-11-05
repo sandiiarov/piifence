@@ -32,9 +32,6 @@ pub struct Config {
     /// Defaults to true; set false to make secret-only mode rules-only (fast).
     #[serde(default)]
     pub llm_filter: Option<bool>,
-    /// No longer used: sensitive values are always replaced with environment variables. Still accepted, so an old config file loads; the gateway warns when it is set.
-    #[serde(default)]
-    pub auto_approve: Option<toml::Value>,
 }
 
 fn normalize(name: &str) -> String {
@@ -123,12 +120,6 @@ mod tests {
     fn llm_filter_defaults_to_none_in_file() {
         let config: Config = toml::from_str("categories = [\"secret\"]").unwrap();
         assert!(config.llm_filter.is_none());
-    }
-
-    #[test]
-    fn old_auto_approve_still_loads() {
-        let config: Config = toml::from_str("auto_approve = \"replace\"").unwrap();
-        assert!(config.auto_approve.is_some());
     }
 
     #[test]

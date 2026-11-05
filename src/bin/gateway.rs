@@ -169,7 +169,7 @@ fn next_placeholder(state: &AppState, label: &str, value: &str) -> (String, bool
 /// Shortest value replaced by name. A shorter one would be replaced inside ordinary words.
 const MIN_ENV_VALUE_CHARS: usize = 4;
 
-/// Variables per category per session (`$PIIF_SECRET_1` to `$PIIF_SECRET_9`). The approval mod sets each name with a literal `$.env.set` call, so this must match its `ENV_LIMIT`.
+/// Variables per category per session (`$PIIF_SECRET_1` to `$PIIF_SECRET_9`). The env mod sets each name with a literal `$.env.set` call, so this must match its `ENV_LIMIT`.
 const ENV_LIMIT: usize = 9;
 
 /// The `PIIF_<CATEGORY>_<N>` category for a detection label, or `None` for a label with no variables.
@@ -289,7 +289,7 @@ struct Session {
     env: EnvValues,
 }
 
-/// The header carrying the session id: Claude Code sends it on every request (the wrapper sets `ANTHROPIC_CUSTOM_HEADERS`) and the approval mod on its own calls. It is stripped before forwarding.
+/// The header carrying the session id: Claude Code sends it on every request (the wrapper sets `ANTHROPIC_CUSTOM_HEADERS`) and the env mod on its own calls. It is stripped before forwarding.
 const SESSION_HEADER: &str = "x-piifence-session";
 
 /// The session id in `headers`, or `""` when it is missing or not 32 hex digits. The id is also what lets the mod fetch values, so only a well-formed one counts.
@@ -927,6 +927,17 @@ async fn proxy(
             .body(Body::from(body.to_string()))
             .unwrap();
     }
+    // The env mod's endpoints serve one `piifence claude` session; without its id there is nothing to name values for or hand them to.
+    let mod_endpoint = path == "/scan" || path.starts_with("/control/");
+    if mod_endpoint && state.session.is_empty() {
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"error": "missing x-piifence-session"}).to_string(),
+            ))
+            .unwrap();
+    }
     if path == "/scan" && method == Method::POST {
         let parsed = serde_json::from_slice::<Value>(&body).ok();
         let Some(text) = parsed
@@ -995,7 +1006,7 @@ async fn proxy(
             ))
             .unwrap();
     }
-    // The approval mod asks for the values behind the `$PIIF_…` names a Bash command uses, so it can set them just before the command runs. Values are handed out only to the session they belong to, so a request without the session id gets nothing.
+    // The env mod asks for the values behind the `$PIIF_…` names a Bash command uses, so it can set them just before the command runs. Values are handed out only to the session they belong to.
     if path == "/control/env-lookup" && method == Method::POST {
         let names: Option<Vec<String>> =
             serde_json::from_slice::<Value>(&body)
@@ -1009,7 +1020,6 @@ async fn proxy(
                     })
                 });
         let (status, values) = match names {
-            _ if state.session.is_empty() => (StatusCode::FORBIDDEN, serde_json::Map::new()),
             Some(names) => (
                 StatusCode::OK,
                 with_session(&state, |session| session.env.lookup(&names)),
@@ -1186,9 +1196,6 @@ async fn main() -> anyhow::Result<()> {
     let config = piifence_m1::config::load()?;
     let categories = config.category_set()?;
     let llm_filter = config.llm_filter.unwrap_or(true);
-    if config.auto_approve.is_some() {
-        eprintln!("auto_approve in config.toml is no longer used: sensitive values are always replaced with environment variables");
-    }
     let use_gitleaks = std::env::var("PIIF_GITLEAKS")
         .map(|v| v != "0" && v != "off" && v != "false")
         .unwrap_or(true);

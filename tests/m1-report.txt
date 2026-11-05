@@ -1,4 +1,5 @@
-    Finished `release` profile [optimized] target(s) in 0.52s
+   Compiling piifence-m1 v0.1.0 (/Users/alexs/piifence)
+    Finished `release` profile [optimized] target(s) in 4.82s
      Running `target/release/piifence-m1`
 Loading model from data
 Model config: 8 layers, 640 hidden, 128 experts (top-4)
@@ -6,97 +7,96 @@ Tokenizer loaded (199998 tokens)
 Loading weights from data/model.safetensors ...
 Loaded 140 tensors from safetensors file.
 Model loaded successfully.
-Weights loaded in 5.6s
+Weights loaded in 8.4s
 Model loaded.
-Tokenized: 15 tokens in 0.6ms
-Forward pass: 446.9ms
+Tokenized: 15 tokens in 1.1ms
+Forward pass: 1026.8ms
 Viterbi decode: 0.0ms
-Total: 447.7ms, 0 spans detected
+Total: 1028.7ms, 0 spans detected
 ✅ sec-01: got=["SECRET"] want=["SECRET"]
      1.000  SECRET             "AKIAIOSFODNN7EXAMPLE"  [gitleaks:piifence-aws-access-token]
-Tokenized: 22 tokens in 0.3ms
-Forward pass: 244.7ms
-Viterbi decode: 0.0ms
-Total: 245.1ms, 1 spans detected
+Tokenized: 22 tokens in 33.5ms
+Forward pass: 831.8ms
+Viterbi decode: 0.1ms
+Total: 865.9ms, 1 spans detected
 ✅ sec-02: got=["SECRET"] want=["SECRET"]
      1.000  SECRET             "sk-proj-abc123XYZdef456GHI789jkl012MNO345"  [gitleaks:piifence-openai-project-key]
-Tokenized: 57 tokens in 0.4ms
-Forward pass: 200.2ms
+Tokenized: 57 tokens in 18.7ms
+Forward pass: 713.2ms
 Viterbi decode: 0.1ms
-Total: 200.8ms, 1 spans detected
+Total: 732.8ms, 1 spans detected
 ✅ sec-03: got=["SECRET"] want=["SECRET"]
      1.000  SECRET             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk"  [gitleaks:jwt]
-Tokenized: 14 tokens in 0.2ms
-Forward pass: 148.4ms
+Tokenized: 14 tokens in 4.4ms
+Forward pass: 499.8ms
 Viterbi decode: 0.0ms
-Total: 148.7ms, 2 spans detected
+Total: 504.7ms, 2 spans detected
 ✅ sec-04: got=["SECRET"] want=["SECRET"]
      1.000  SECRET             "postgres://admin:hunter2@db.internal:5432/prod"  [gitleaks:piifence-url-credentials]
-Tokenized: 17 tokens in 0.1ms
-Forward pass: 174.9ms
+Tokenized: 9 tokens in 2.0ms
+Forward pass: 316.8ms
 Viterbi decode: 0.0ms
-Total: 175.2ms, 1 spans detected
+Total: 318.9ms, 0 spans detected
 ✅ sec-05: got=[] want=[]
-    [suppressed:placeholder]  0.970  SECRET             "PII_SECRET_a1b2c3d4"  [model]
-Tokenized: 15 tokens in 0.1ms
-Forward pass: 153.5ms
+Tokenized: 15 tokens in 1.2ms
+Forward pass: 220.5ms
 Viterbi decode: 0.0ms
-Total: 153.7ms, 2 spans detected
+Total: 221.8ms, 2 spans detected
 ✅ pii-01: got=["PRIVATE_EMAIL", "PRIVATE_PHONE"] want=["PRIVATE_EMAIL", "PRIVATE_PHONE"]
      1.000  PRIVATE_EMAIL      "alice@example.com"  [model]
      1.000  PRIVATE_PHONE      "+1-415-555-0199"  [model]
-Tokenized: 15 tokens in 0.1ms
-Forward pass: 188.7ms
+Tokenized: 15 tokens in 1.4ms
+Forward pass: 253.2ms
 Viterbi decode: 0.0ms
-Total: 188.9ms, 2 spans detected
+Total: 254.7ms, 2 spans detected
 ✅ pii-02: got=["PRIVATE_ADDRESS", "PRIVATE_PERSON"] want=["PRIVATE_ADDRESS", "PRIVATE_PERSON"]
      1.000  PRIVATE_PERSON     "Alice Smith"  [model]
      1.000  PRIVATE_ADDRESS    "123 Main St, Springfield IL 62704"  [model]
-Tokenized: 12 tokens in 0.1ms
-Forward pass: 160.4ms
+Tokenized: 12 tokens in 2.1ms
+Forward pass: 262.2ms
 Viterbi decode: 0.0ms
-Total: 160.6ms, 1 spans detected
+Total: 264.5ms, 1 spans detected
 ✅ pii-03: got=["PRIVATE_URL"] want=["PRIVATE_URL"]
      0.993  PRIVATE_URL        "https://internal.corp/api/v2/users"  [model]
-Tokenized: 18 tokens in 0.1ms
-Forward pass: 156.6ms
+Tokenized: 18 tokens in 1.3ms
+Forward pass: 214.8ms
 Viterbi decode: 0.0ms
-Total: 156.8ms, 2 spans detected
+Total: 216.2ms, 2 spans detected
 ✅ pii-04: got=["ACCOUNT_NUMBER", "PRIVATE_DATE"] want=["ACCOUNT_NUMBER", "PRIVATE_DATE"]
      1.000  PRIVATE_DATE       "1985-03-12"  [model]
      1.000  ACCOUNT_NUMBER     "123-45-6789"  [model]
-Tokenized: 11 tokens in 0.1ms
-Forward pass: 117.5ms
+Tokenized: 11 tokens in 1.7ms
+Forward pass: 172.8ms
 Viterbi decode: 0.0ms
-Total: 117.8ms, 2 spans detected
+Total: 174.6ms, 2 spans detected
 ✅ pii-05: got=["PRIVATE_EMAIL", "PRIVATE_EMAIL"] want=["PRIVATE_EMAIL", "PRIVATE_EMAIL"]
      1.000  PRIVATE_EMAIL      "bob@corp.io"  [model]
      1.000  PRIVATE_EMAIL      "carol@corp.io"  [model]
-Tokenized: 9 tokens in 0.1ms
-Forward pass: 160.1ms
+Tokenized: 9 tokens in 0.6ms
+Forward pass: 277.6ms
 Viterbi decode: 0.0ms
-Total: 160.3ms, 1 spans detected
+Total: 278.3ms, 1 spans detected
 ✅ neg-01: got=[] want=[]
     [suppressed:env-ref-allowlist]  0.542  SECRET             "os.environ.get('DB_PASS"  [model]
-Tokenized: 9 tokens in 0.1ms
-Forward pass: 176.4ms
+Tokenized: 9 tokens in 0.4ms
+Forward pass: 615.3ms
 Viterbi decode: 0.0ms
-Total: 176.6ms, 0 spans detected
+Total: 616.6ms, 0 spans detected
 ✅ neg-02: got=[] want=[]
-Tokenized: 11 tokens in 0.1ms
-Forward pass: 149.7ms
+Tokenized: 11 tokens in 0.5ms
+Forward pass: 1500.0ms
 Viterbi decode: 0.0ms
-Total: 149.9ms, 0 spans detected
+Total: 1500.8ms, 0 spans detected
 ✅ neg-03: got=[] want=[]
-Tokenized: 47 tokens in 0.1ms
-Forward pass: 200.7ms
-Viterbi decode: 0.1ms
-Total: 201.0ms, 0 spans detected
+Tokenized: 47 tokens in 25.3ms
+Forward pass: 807.0ms
+Viterbi decode: 0.3ms
+Total: 832.7ms, 0 spans detected
 ✅ neg-04: got=[] want=[]
-Tokenized: 12 tokens in 0.1ms
-Forward pass: 196.4ms
+Tokenized: 12 tokens in 0.6ms
+Forward pass: 578.5ms
 Viterbi decode: 0.0ms
-Total: 196.6ms, 0 spans detected
+Total: 579.2ms, 0 spans detected
 ✅ neg-05: got=[] want=[]
 
 --- per-tier ---
@@ -105,5 +105,5 @@ pii        5/5
 secret     5/5
 
 gitleaks pre-pass: on (`gitleaks.toml`)
-guards: on — suppressed 2 spans (placeholder: 1, env-ref-allowlist: 1)
+guards: on — suppressed 1 spans (placeholder: 0, env-ref-allowlist: 1)
 15/15 passed

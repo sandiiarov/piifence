@@ -103,7 +103,7 @@ Design constraints from the docs (quote these when you update them):
 - `docs/gateway-spike.md:324-325` (Limitations): "Placeholder counters are per process (no persistence); numbers are not stable across restarts (irrelevant without rehydration, but do not treat them as ids)."
 - "No vault, no rehydration" (`src/bin/gateway.rs:17`). The gateway must never be able to map a placeholder back to its value. This plan keeps that: it stores a keyed hash of each value, not the value, and it has no placeholder→value lookup.
 - `docs/labels.md:32` proposes `<PF_SECRET_{8 hex of sha256(category + value)}>`. Do NOT implement that. An unkeyed 8-hex hash of a short value such as an email or phone number can be reversed by trying candidate values, which would leak the value to the provider. The keyed per-process hash below avoids this.
-- The placeholder format `<secret_N>` / `<{category}_N>` must not change: `src/guards.rs` recognises it, and the approval plugin `plugin/piifence-approval/hooks/register.js` relies on it.
+- The placeholder format `<secret_N>` / `<{category}_N>` must not change: `src/guards.rs` recognises it, and the approval plugin `plugin/piifence-env/hooks/register.js` relies on it.
 
 Conventions: doc comments (`///`) on new items, explaining why rather than what; `HashMap` from `std::collections` (already imported at `gateway.rs:25`). Unit tests live in a `#[cfg(test)] mod tests` at the bottom of the file; see `src/detect.rs:279` onward for the style (plain `#[test]` functions with descriptive snake_case names, `assert_eq!`).
 

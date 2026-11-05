@@ -2,11 +2,8 @@
 //!
 //! Two suppression rules, both narrow and evidence-backed by `docs/prior-art.md`:
 //!
-//! 1. **Placeholder skip guard** — never redact a token we (or a previous
-//!    pipeline version) already produced. Two shapes are recognized:
-//!    the final `<private_email_1>` / `<secret_1>` scheme and the legacy
-//!    `PII_<LABEL>_<8hex>` / `PF_<LABEL>_<8hex>` placeholders used by the M1
-//!    corpus (`sec-05`).
+//! 1. **Placeholder skip guard** — never redact a placeholder the gateway already
+//!    produced (`<private_email_1>`, `<secret_1>`; corpus case `sec-05`).
 //! 2. **Env-ref allowlist** — a `SECRET` span that overlaps an environment
 //!    variable *reference* (`os.environ.get('DB_PASS')`, `process.env.X`, ...)
 //!    is a false positive: the code names a secret, it does not contain one.
@@ -46,10 +43,8 @@ pub struct Guards {
 impl Guards {
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self {
-            // Final scheme: <private_email_1>, <secret_1>; legacy: PII_SECRET_a1b2c3d4.
-            placeholder: Regex::new(
-                r"<(?:private_)?[a-z_]+_\d+>|\b(?:PII|PF)_[A-Z][A-Z0-9_]*_[0-9a-f]{8}\b",
-            )?,
+            // <private_email_1>, <secret_1>
+            placeholder: Regex::new(r"<(?:private_)?[a-z_]+_\d+>")?,
             env_ref: Regex::new(
                 r#"os\.environ\.get\(\s*['"][A-Za-z0-9_]+['"]\s*\)|os\.environ\[\s*['"][A-Za-z0-9_]+['"]\s*\]|os\.getenv\(\s*['"][A-Za-z0-9_]+['"]\s*\)|process\.env\.[A-Za-z0-9_]+|\$PIIF_[A-Za-z0-9_]+"#,
             )?,
@@ -118,14 +113,6 @@ mod tests {
 
     fn guards() -> Guards {
         Guards::new().unwrap()
-    }
-
-    #[test]
-    fn legacy_placeholder_is_shielded() {
-        let text = "OPENAI_API_KEY=<PII_SECRET_a1b2c3d4>";
-        let g = guards();
-        assert_eq!(g.suppress(text, 16, 35), Some(Suppression::Placeholder));
-        assert_eq!(g.suppress(text, 0, 15), None);
     }
 
     #[test]

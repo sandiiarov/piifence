@@ -196,7 +196,7 @@ Existing `Placeholders` tests, `src/bin/gateway.rs:905-910` (pattern for the tes
     }
 ```
 
-Constraints to keep (`AGENTS.md:102-104`, `116-117`): `/stats` exposes "redaction counts and recent placeholder metadata only — including a masked first4+last4 `preview` for notice verification, never the raw value"; the notice plugin "must stay metadata-only, silent when the gateway is absent, and never read raw values". The approval mod (`plugin/piifence-approval`) does not read `/stats`; the launcher reads only `/health`.
+Constraints to keep (`AGENTS.md:102-104`, `116-117`): `/stats` exposes "redaction counts and recent placeholder metadata only — including a masked first4+last4 `preview` for notice verification, never the raw value"; the notice plugin "must stay metadata-only, silent when the gateway is absent, and never read raw values". The approval mod (`plugin/piifence-env`) does not read `/stats`; the launcher reads only `/health`.
 
 ## Commands you will need
 
@@ -219,7 +219,7 @@ Constraints to keep (`AGENTS.md:102-104`, `116-117`): `/stats` exposes "redactio
 - `plans/README.md` (status row)
 
 **Out of scope** (do NOT touch, even though they look related):
-- `plugin/piifence-approval/` — it does not use `/stats`.
+- `plugin/piifence-env/` — it does not use `/stats`.
 - The audit log format beyond adding one boolean field (`new`) to each span entry.
 - `src/detect.rs` — the detection cache is unrelated; the counting fix is in the gateway.
 - `/tmp` state-file location (tracked separately in `plans/README.md`).

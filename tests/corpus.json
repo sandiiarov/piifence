@@ -34,7 +34,7 @@
   {
     "id": "sec-05",
     "tier": "secret",
-    "text": "OPENAI_API_KEY=<PII_SECRET_a1b2c3d4>",
+    "text": "OPENAI_API_KEY=<secret_1>",
     "expect": []
   },
   {

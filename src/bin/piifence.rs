@@ -77,14 +77,13 @@ fn run_claude(args: &[String]) -> ! {
     match running_gateway_upstream(port) {
         // Reuse only a gateway that forwards to the same place this launch would.
         // Reusing another one would send this session's credentials elsewhere.
-        Some(Some(running)) if running == upstream => {
+        Some(running) if running == upstream => {
             eprintln!("piifence: using existing gateway on {gateway_url} (upstream {upstream})");
         }
         Some(running) => {
             eprintln!(
-                "piifence: a gateway on {gateway_url} forwards to {}, but this launch wants {upstream}. \
-                 Stop that gateway or set PIIF_PORT to a free port.",
-                running.as_deref().unwrap_or("an unknown upstream (older gateway build)")
+                "piifence: a gateway on {gateway_url} forwards to {running:?}, but this launch wants {upstream}. \
+                 Stop that gateway or set PIIF_PORT to a free port."
             );
             std::process::exit(1);
         }
@@ -173,10 +172,7 @@ fn run_claude(args: &[String]) -> ! {
     cmd.arg("--settings").arg(&settings_path);
     // Notices: if the plugin is not installed globally, load it for this session
     // only via --plugin-dir (never copies into the user's config automatically).
-    for (name, purpose) in [
-        ("piifence-notice", "notice"),
-        ("piifence-approval", "approval"),
-    ] {
+    for (name, purpose) in [("piifence-notice", "notice"), ("piifence-env", "env")] {
         if plugin_installed(name) {
             continue;
         }
@@ -320,18 +316,23 @@ fn health_response(port: u16) -> Option<String> {
 }
 
 /// A healthy gateway on `port`: None when nothing healthy answers. Otherwise the
-/// upstream it reports (None inside for a gateway too old to report one).
-fn running_gateway_upstream(port: u16) -> Option<Option<String>> {
+/// upstream it reports (empty when it reports none).
+fn running_gateway_upstream(port: u16) -> Option<String> {
     let response = health_response(port)?;
     if !response.starts_with("HTTP/1.1 200") {
         return None;
     }
-    Some(response.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.trim()
-            .eq_ignore_ascii_case("x-piifence-upstream")
-            .then(|| value.trim().to_string())
-    }))
+    Some(
+        response
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("x-piifence-upstream")
+                    .then(|| value.trim().to_string())
+            })
+            .unwrap_or_default(),
+    )
 }
 
 fn wait_healthy(port: u16, child: &mut Child) -> bool {
@@ -442,11 +443,11 @@ fn user_settings_custom_headers() -> Option<String> {
         .map(str::to_string)
 }
 
-/// `pluginConfigs` for the approval mod: the user's own options for it plus `session`, the id the mod sends on its gateway calls, and `gatewayUrl`, where those calls go. It goes as an option because the plugin engine refuses a request that carries a value read from the environment. Both keys are set: the mod loads as `piifence-approval` when installed and as `piifence-approval@inline` from `--plugin-dir`.
-fn approval_plugin_configs(session_id: &str, gateway_url: &str) -> serde_json::Value {
+/// `pluginConfigs` for the env mod: the user's own options for it plus `session`, the id the mod sends on its gateway calls, and `gatewayUrl`, where those calls go. It goes as an option because the plugin engine refuses a request that carries a value read from the environment. Both keys are set: the mod loads as `piifence-env` when installed and as `piifence-env@inline` from `--plugin-dir`.
+fn env_plugin_configs(session_id: &str, gateway_url: &str) -> serde_json::Value {
     let configs = user_settings().and_then(|settings| settings.get("pluginConfigs").cloned());
     let mut out = serde_json::Map::new();
-    for key in ["piifence-approval", "piifence-approval@inline"] {
+    for key in ["piifence-env", "piifence-env@inline"] {
         let mut config = configs
             .as_ref()
             .and_then(|configs| configs.get(key))
@@ -482,7 +483,7 @@ fn write_settings_override(gateway_url: &str, session_id: &str) -> std::io::Resu
                 "ANTHROPIC_BASE_URL": gateway_url,
                 "ANTHROPIC_CUSTOM_HEADERS": custom_headers(session_id),
             },
-            "pluginConfigs": approval_plugin_configs(session_id, gateway_url),
+            "pluginConfigs": env_plugin_configs(session_id, gateway_url),
         })
     );
     let mut options = fs::OpenOptions::new();
@@ -503,11 +504,11 @@ fn plugin_installed(name: &str) -> bool {
 }
 
 /// Locate a plugin shipped with this checkout: PIIF_PLUGIN_DIR applies to the
-/// notice plugin, PIIF_APPROVAL_PLUGIN_DIR to the approval mod; otherwise walk
+/// notice plugin, PIIF_ENV_PLUGIN_DIR to the env mod; otherwise walk
 /// up from the real binary looking for plugin/<name>.
 fn plugin_dir(name: &str) -> Option<PathBuf> {
     let override_var = match name {
-        "piifence-approval" => "PIIF_APPROVAL_PLUGIN_DIR",
+        "piifence-env" => "PIIF_ENV_PLUGIN_DIR",
         _ => "PIIF_PLUGIN_DIR",
     };
     if let Ok(dir) = env::var(override_var) {

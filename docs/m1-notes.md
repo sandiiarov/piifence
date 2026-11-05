@@ -30,20 +30,9 @@ change the model — they veto its output and record every veto in the report:
 
 ### `sec-05` — placeholder round-trip
 
-The model still emits `SECRET` at 0.970 over `PII_SECRET_a1b2c3d4`. The
-placeholder guard suppresses any span that lies entirely inside a
-pipeline-owned placeholder token: the legacy `PII_<LABEL>_<8hex>` /
-`PF_<LABEL>_<8hex>` shape used by this corpus, and the M2 scheme
-`<(private_)?[a-z_]+_\d+>` (`<private_email_1>`, `<secret_1>`, ...).
+`sec-05` holds a gateway placeholder (`OPENAI_API_KEY=<secret_1>`) and must stay clean. The placeholder guard suppresses any span that lies entirely inside a numbered placeholder, `<(private_)?[a-z_]+_\d+>` (`<private_email_1>`, `<secret_1>`, ...).
 
-Why this shape matters (probe results, full table in `docs/prior-art.md`):
-the model re-redacts hash-style placeholders — `<PF_*_8hex>`, `SECRETGATE_hmac`,
-`__RDX_KEY_*`, `<private_email_a1b2c3d4>` — but ignores model-native angle
-tokens with numeric ids: `<private_email_1>`, `<private_person_1>`,
-`<secret_1>`, `<account_number_1>`, `[EMAIL_1]`, `[REDACTED]`.
-
-M2 follow-up: generate placeholders in the numbered form, keep the legacy shape
-in the guard during migration, and add a corpus case for the final format.
+Why this shape (probe results, full table in `docs/prior-art.md`): the model re-redacts hash-style placeholders — `<PF_*_8hex>`, `SECRETGATE_hmac`, `__RDX_KEY_*`, `<private_email_a1b2c3d4>` — but ignores model-native angle tokens with numeric ids: `<private_email_1>`, `<private_person_1>`, `<secret_1>`, `<account_number_1>`, `[EMAIL_1]`, `[REDACTED]`. The model does not flag `sec-05` at all; the guard is the backstop.
 
 ### `neg-01` — false positive on an env-var reference
 
@@ -123,8 +112,7 @@ behavior. The model-only observation remains above as the reason the rule exists
   mandatory `pii-05`), person+address, date+account, standalone URL.
 - `neg-02` … `neg-05` clean; gitleaks adds no findings on them.
 - `sec-02` (sk-proj token) and `sec-03` (JWT) detect at ~1.000.
-- Guard unit tests (`cargo test --release`) cover legacy and numbered
-  placeholders, env-ref variants, and that real secrets/PII are not suppressed.
+- Guard unit tests (`cargo test --release`) cover numbered placeholders, env-ref variants, and that real secrets/PII are not suppressed.
 
 ## Deviations from the original spec
 

@@ -60,8 +60,8 @@ def main():
         emit({})
 
     # `values` counts each distinct value once; the per-span counter grows every turn
-    # because the history is re-sent. The fallback keeps an older gateway working.
-    total = int(stats.get("values", stats.get("redactions", 0)))
+    # because the history is re-sent.
+    total = int(stats.get("values", 0))
     previous = int(load_state().get("values", 0))
 
     if hook == "SessionStart":

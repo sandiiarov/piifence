@@ -1,0 +1,4 @@
+{
+  "description": "piifence env-variable hooks module",
+  "modules": ["./register.js"]
+}

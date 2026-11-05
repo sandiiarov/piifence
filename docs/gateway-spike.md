@@ -197,7 +197,7 @@ works as a smoke test.
 
 ## Prompt replacement mod
 
-`plugin/piifence-approval` is a Claude Code **mod**, loaded by `piifence claude`. Its `prompt.submit` hook asks the gateway for findings and replaces each one with an environment variable, without asking; a toast (`$.ui.toast`) lists what was replaced, with masked previews.
+`plugin/piifence-env` is a Claude Code **mod**, loaded by `piifence claude`. Its `prompt.submit` hook asks the gateway for findings and replaces each one with an environment variable, without asking; a toast (`$.ui.toast`) lists what was replaced, with masked previews.
 
 - The mod sets the raw value as an environment variable in the Claude Code session (`$.env.set`, names are literal), rewrites the prompt span to `$PIIF_SECRET_1` (or the category equivalent), and adds a Claude-only context note mapping the variable names. The gateway sees only the env reference (guard `$PIIF_[A-Z0-9_]+`), so the provider never receives the value; local Bash commands can expand it. Env vars live for the session and are never printed by the mod.
 - Before setting them, the mod registers each value with `POST /control/env-values`; if that fails, the prompt is blocked rather than leave a variable the gateway cannot protect.
@@ -212,13 +212,13 @@ Gateway endpoints used by the mod:
 
 - `POST /scan` `{text}` → `{findings: [{label, preview, start, end, engine, score, env}]}`; `env` is the name the gateway would give the value (it takes effect once the mod registers it). Detection only, masked previews.
 - `POST /control/env-values` `{values: [{name, value, label}]}` — registers values the mod is about to put into `$PIIF_…` variables, and again with each prompt so they survive a gateway restart. Names must be `PIIF_<CATEGORY>_<1-9>`; a malformed entry rejects the whole body with 400. Held in memory only, never logged; values under 4 characters are accepted but not tracked.
-- `POST /control/env-lookup` `{names}` → `{values: {name: value}}` — the active values of this session for the names a Bash command uses; 403 without a session id. Audit event `env_lookup` with counts only.
+- `POST /control/env-lookup` `{names}` → `{values: {name: value}}` — the active values of this session for the names a Bash command uses. Audit event `env_lookup` with counts only.
 
-Sessions are told apart by the `x-piifence-session` header that `piifence claude` sets through `ANTHROPIC_CUSTOM_HEADERS`; the gateway strips it before forwarding.
+Sessions are told apart by the `x-piifence-session` header that `piifence claude` sets through `ANTHROPIC_CUSTOM_HEADERS`; the gateway strips it before forwarding. All three endpoints answer 403 without it, and the mod registers no hooks unless `piifence claude` passed it the session id and gateway URL.
 
-No osascript or macOS dialog is involved. Mod files:
-`plugin/piifence-approval/{.claude-plugin/plugin.json,hooks/hooks.json,hooks/register.js}`;
-validate with `claude plugin validate plugin/piifence-approval`.
+Mod files:
+`plugin/piifence-env/{.claude-plugin/plugin.json,hooks/hooks.json,hooks/register.js}`;
+validate with `claude plugin validate plugin/piifence-env`.
 
 ## Categories configuration
 

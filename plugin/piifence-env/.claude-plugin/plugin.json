@@ -1,5 +1,5 @@
 {
-  "name": "piifence-approval",
+  "name": "piifence-env",
   "version": "0.1.0",
   "description": "Replace sensitive values with environment variables before they reach the provider.",
   "author": {

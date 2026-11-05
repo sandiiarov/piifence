@@ -1,4 +1,0 @@
-{
-  "description": "piifence prompt approval hooks module",
-  "modules": ["./register.js"]
-}

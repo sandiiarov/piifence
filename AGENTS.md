@@ -28,7 +28,7 @@ building the placeholder/redaction layer (M2).
   `piifence claude` auto-loads it per session via `--plugin-dir` unless a global copy
   exists at `~/.claude/skills/piifence-notice` (optional install lives outside this
   repo — re-copy after plugin changes).
-- Claude Code approval mod: `plugin/piifence-approval/` (no dialog: its `prompt.submit` hook replaces every finding with `$PIIF_<CATEGORY>_<N>` and shows a toast listing them; talks to gateway `/scan`, `/control/env-values` and `/control/env-lookup`); `piifence claude` loads it per session via `--plugin-dir` unless `~/.claude/skills/piifence-approval` exists. There are no choices or settings: `auto_approve` in config.toml is still parsed but ignored with a startup warning. `hooks/register.test.ts` covers it (`command claude plugin test plugin/piifence-approval`).
+- Claude Code env mod: `plugin/piifence-env/` (its `prompt.submit` hook replaces every finding with `$PIIF_<CATEGORY>_<N>` and shows a toast listing them; talks to gateway `/scan`, `/control/env-values` and `/control/env-lookup`); `piifence claude` loads it per session via `--plugin-dir` unless `~/.claude/skills/piifence-env` exists. It has no settings; it registers no hooks unless `piifence claude` passed it a session id and gateway URL. `hooks/register.test.ts` covers it (`command claude plugin test plugin/piifence-env`).
 - Env replacement: the mod sets `PIIF_<CATEGORY>_<N>` (`$.env.set`, literal names, up to 9 per category per session, numbered by the gateway) and rewrites the prompt span to `$PIIF_<CATEGORY>_<N>`; the guard suppresses those env references, and Bash commands can expand them. The mod must not rewrite tool results, CLAUDE.md or other transcript rows (what the user sees stays as it was); in a session the gateway names values there `$PIIF_…` itself, and gives placeholders only past the limit or without a session id. `/scan` returns UTF-16
   code-unit offsets so JS rewriting matches Rust detection on non-ASCII text. The raw
   value stays in the Claude Code process, never the provider.
@@ -74,7 +74,7 @@ building the placeholder/redaction layer (M2).
   `redact_ms_last/max/total` in addition to counts.
 - Wrapper guards: `src/guards.rs` vetoes model output before replacement. Placeholder
   guard suppresses spans fully inside pipeline-owned placeholder tokens
-  (`<(private_)?[a-z_]+_\d+>`, legacy `PII_<LABEL>_<8hex>`); env-ref allowlist suppresses
+  (`<(private_)?[a-z_]+_\d+>`); env-ref allowlist suppresses
   `SECRET` spans overlapping `os.environ.get(...)` / `os.environ[...]` / `os.getenv(...)` /
   `process.env.*`; file-reference guard suppresses spans of any label but `private_url`
   that lie (edge whitespace ignored) inside a `path/name.ext:line[:col]` reference, e.g.
@@ -100,9 +100,9 @@ building the placeholder/redaction layer (M2).
   recent first sightings only — including a masked first4+last4 `preview` for notice
   verification, never the raw value. The notice reports only values redacted for
   the first time.
-  Prompt replacement is handled by the approval mod, not the gateway: `POST /scan` returns findings (detection only; UTF-16 code-unit offsets). There is no raw-send path. No osascript/native macOS dialog is used.
+  Prompt replacement is handled by the env mod, not the gateway: `POST /scan` returns findings (detection only; UTF-16 code-unit offsets). `/scan` and `/control/*` answer 403 without a session id.
   Env vars: the gateway owns `$PIIF_<CATEGORY>_<N>` numbering per session (9 per category); `/scan` returns each finding's name as `env`. Before setting env vars, the mod posts each value and its name to `POST /control/env-values`; the gateway keeps them in memory only and replaces every exact occurrence with `$NAME` in all provider-bound text before detection (audit engine `env`), so a command that prints one does not leak it. If that call fails, the mod blocks the prompt. In a session, detected values in tool output and files get `$NAME` instead of placeholders; the mod's `tool.call` Bash hook fetches the values a command names from `POST /control/env-lookup` and sets them before it runs.
-  Sessions: `piifence claude` gives each session a random 32-hex id, sent by Claude Code as `x-piifence-session` (via `ANTHROPIC_CUSTOM_HEADERS`, merged with the user's) and by the mod (as its `session` plugin option, with `gatewayUrl`, through `--settings` `pluginConfigs`; the engine refuses requests carrying env values and does not expose the process env). The gateway keys values on it, strips the header before forwarding, gives placeholders without one, and `/control/env-lookup` answers 403 without one.
+  Sessions: `piifence claude` gives each session a random 32-hex id, sent by Claude Code as `x-piifence-session` (via `ANTHROPIC_CUSTOM_HEADERS`, merged with the user's) and by the mod (as its `session` plugin option, with `gatewayUrl`, through `--settings` `pluginConfigs`; the engine refuses requests carrying env values and does not expose the process env). The gateway keys values on it, strips the header before forwarding, and gives placeholders without one.
   Gateway hardening: requires `PIIF_UPSTREAM` (no default provider); binds loopback and
   rejects requests with an `Origin` header or a non-loopback `Host`; accepts POST only
   for `/v1/messages` and `/v1/messages/count_tokens` (both redacted) and refuses other

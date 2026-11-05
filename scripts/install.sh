@@ -14,7 +14,7 @@
 #   bin/piifence                  wrapper that sets the env vars below, then runs the launcher
 #   libexec/piifence/             real piifence and piifence-gateway binaries
 #   share/piifence/gitleaks.toml  gitleaks rules
-#   share/piifence/plugin/        Claude Code notice and approval plugins
+#   share/piifence/plugin/        Claude Code notice plugin and env mod
 #
 # The wrapper honours PIIF_MODEL_DIR if you set it; otherwise it uses
 # $PREFIX/share/piifence/data, or ~/.local/share/piifence/data by default.
@@ -94,15 +94,15 @@ SHARE="$PREFIX/share/piifence"
 mkdir -p "$PREFIX/bin" "$LIBEXEC" "$SHARE/plugin"
 cp "$REPO/target/release/piifence" "$REPO/target/release/piifence-gateway" "$LIBEXEC/"
 cp "$REPO/gitleaks.toml" "$SHARE/gitleaks.toml"
-rm -rf "$SHARE/plugin/piifence-notice" "$SHARE/plugin/piifence-approval"
-cp -R "$REPO/plugin/piifence-notice" "$REPO/plugin/piifence-approval" "$SHARE/plugin/"
+rm -rf "$SHARE/plugin/piifence-notice" "$SHARE/plugin/piifence-env"
+cp -R "$REPO/plugin/piifence-notice" "$REPO/plugin/piifence-env" "$SHARE/plugin/"
 
 # Wrapper: point the launcher at the installed files. Existing PIIF_* values win.
 cat > "$PREFIX/bin/piifence" <<EOF
 #!/usr/bin/env bash
 export PIIF_GITLEAKS_CONFIG="\${PIIF_GITLEAKS_CONFIG:-$SHARE/gitleaks.toml}"
 export PIIF_PLUGIN_DIR="\${PIIF_PLUGIN_DIR:-$SHARE/plugin/piifence-notice}"
-export PIIF_APPROVAL_PLUGIN_DIR="\${PIIF_APPROVAL_PLUGIN_DIR:-$SHARE/plugin/piifence-approval}"
+export PIIF_ENV_PLUGIN_DIR="\${PIIF_ENV_PLUGIN_DIR:-$SHARE/plugin/piifence-env}"
 export PIIF_MODEL_DIR="\${PIIF_MODEL_DIR:-$DEFAULT_MODEL_DIR}"
 exec "$LIBEXEC/piifence" "\$@"
 EOF
