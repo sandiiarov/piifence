@@ -56,6 +56,7 @@ piifence: redacted 1 value(s) — secret×1 ($PIIF_SECRET_2 post…prod)
 - **In your prompt.** piifence puts the value in an environment variable inside Claude Code, rewrites your prompt to use the variable's name, and tells the agent the variable is there. Commands the agent runs locally get the real value; the provider never does.
 - **In files, command output and `CLAUDE.md`.** The value reaches the provider as `$PIIF_SECRET_2`. When the agent runs a Bash command that names that variable, piifence sets it just before the command runs.
 - **Printed back.** If a command prints a value, as `echo $PIIF_SECRET_1` would, piifence puts the variable's name back in its place before the output reaches the provider.
+- **What the agent is told.** With your first prompt of the session, piifence sends the agent a short note: `$PIIF_*` names stand for real values kept on your machine, it can use them in Bash commands, and a value it sees as a name was not exposed. Without the note, an agent that sees `$PIIF_SECRET_1` in command output tends to warn you that a secret leaked.
 
 What you see in Claude Code stays as it was: only what goes to the provider is changed.
 
@@ -86,7 +87,7 @@ Secrets are found by [gitleaks](https://github.com/gitleaks/gitleaks) rules plus
 flowchart LR
     you([You]) --> cc
     subgraph cc [Claude Code]
-        mod["piifence-env mod<br/>prompt values → $PIIF_*<br/>sets $PIIF_* before Bash runs"]
+        mod["piifence-env mod<br/>prompt values → $PIIF_*<br/>explains $PIIF_* to the agent<br/>sets $PIIF_* before Bash runs"]
     end
     cc -- request --> gw["piifence gateway (localhost)<br/>detects values in every part of the request<br/>names them $PIIF_* (or a placeholder)"]
     gw -- redacted request --> provider([Provider])
@@ -97,7 +98,7 @@ flowchart LR
 `piifence claude` starts two pieces and connects them with a random per-session id:
 
 - **The gateway**, a proxy on `127.0.0.1:7788`. It runs detection on every outgoing request (prompt, tool output, files, system prompt) and replaces each value with its `$PIIF_*` name. It keeps the values in memory and hands them only to the session they belong to.
-- **The `piifence-env` mod**, loaded into Claude Code for that session. It rewrites your prompt, shows the toast, and fetches values from the gateway when a Bash command needs them.
+- **The `piifence-env` mod**, loaded into Claude Code for that session. It rewrites your prompt, shows the toast, explains `$PIIF_*` names to the agent with the first prompt, and fetches values from the gateway when a Bash command needs them.
 
 A secret the agent finds in a file goes through these steps:
 
@@ -130,6 +131,7 @@ Properties:
 - Environment variables are limited to 9 per category (`$PIIF_SECRET_1` to `$PIIF_SECRET_9`) per session; after that, values become placeholders.
 - The gateway keeps the values behind those variables in memory only. If it restarts during a session, the variables made from your prompts are registered again with your next prompt, but variables made from tool output are lost until the agent reads that output again.
 - The agent can use every secret it comes across in commands, including sending it somewhere.
+- The note that explains `$PIIF_*` names goes with your first prompt. If the session starts with a `!` command, the agent sees names in its output before it has been told what they are.
 - macOS only, and Claude Code is the only supported agent today.
 
 ## Development

@@ -155,6 +155,21 @@ function tell($, text) {
   }
 }
 
+// What `$PIIF_…` names are, attached to the session's first prompt. Without it the agent meets a name in tool output with no idea what it is: it guesses something redacted its output, warns that a secret leaked, and does not know it can use the name. (A system prompt section would be the natural place, but an organization's policy plugin may skip user plugins' `prompt.compose` hooks.)
+export const VARIABLES_NOTE = [
+  '# piifence environment variables',
+  '',
+  'This session runs through piifence, which keeps secrets and personal data from reaching you. Before anything is sent to you (the user\'s prompts, command output, file contents), piifence replaces each sensitive value with an environment variable name such as `$PIIF_SECRET_1` or `$PIIF_EMAIL_2`. The real value stays on the user\'s machine.',
+  '',
+  '- Use the name in Bash commands, quoted, where you would use the value: `curl -H "Authorization: Bearer $PIIF_SECRET_1" …`. piifence sets the variable just before the command runs, so it expands to the real value.',
+  '- A value you see as a `$PIIF_…` name was not exposed to you or the provider. Do not warn that it leaked or suggest rotating it on that account.',
+  '- Do not try to print, decode or otherwise reveal the values; whatever a command prints comes back to you as the name again.',
+  '- A placeholder such as `<secret_3>` stands for a value piifence could not give a name; it cannot be used in commands.',
+].join('\n')
+
+// Whether this session's agent has been sent VARIABLES_NOTE. Module state, so a reload of the mod sends it again.
+let explained = false
+
 function list(lines) {
   const shown = lines.slice(0, 6).map((line) => `  ${line}`).join('\n')
   return lines.length > 6 ? `${shown}\n  … and ${lines.length - 6} more` : shown
@@ -165,8 +180,16 @@ export function register(on, options) {
   if (!/^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(options?.gatewayUrl ?? '')) return
   sessionId = options.session
   gatewayBase = options.gatewayUrl
+  explained = false
 
-  on('prompt.submit', async ($, e, next) => {
+  on('prompt.submit', async ($, e, nextHook) => {
+    // Every way this prompt goes on attaches VARIABLES_NOTE the first time.
+    const next = (prompt) => {
+      if (explained) return nextHook(prompt)
+      explained = true
+      return nextHook({ ...prompt, context: [...(prompt.context ?? []), VARIABLES_NOTE] })
+    }
+
     // After a gateway restart it no longer knows the values this mod placed; register them again so their names stay theirs. Best effort: the prompt below registers its own values strictly.
     if (placed.size > 0) {
       try {

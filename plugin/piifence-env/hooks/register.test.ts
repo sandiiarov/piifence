@@ -129,3 +129,14 @@ test('outside a piifence claude session the mod does nothing', async ($, on) => 
   expect(result.text).toBe(PROMPT)
   expect(seen.calls).toEqual([])
 })
+
+test('the first prompt carries the note on $PIIF names, later ones do not', OPTIONS, async ($, on) => {
+  engine(on)
+  const first = await $.prompt.submit({ text: 'hello' })
+  const second = await $.prompt.submit({ text: PROMPT })
+  expect(first.text).toBe('hello')
+  expect(first.context.some((note) => note.includes('# piifence environment variables'))).toBe(true)
+  expect((second.context ?? []).some((note) => note.includes('# piifence environment variables'))).toBe(false)
+  // The prompt's own mapping note still goes along.
+  expect(second.context.some((note) => note.includes('→ $PIIF_SECRET_1'))).toBe(true)
+})
