@@ -45,18 +45,20 @@ impl Detector {
     /// config.json, model.safetensors, tokenizer.json (and optionally
     /// viterbi_calibration.json).
     pub fn load(model_dir: &Path, use_gitleaks: bool, use_guards: bool) -> anyhow::Result<Self> {
-        Self::load_with_categories(model_dir, use_gitleaks, use_guards, None, true)
+        Self::load_with_categories(model_dir, use_gitleaks, use_guards, None, true, Vec::new())
     }
 
     /// Restrict detection/redaction to the given normalized categories.
     /// `None` means all categories (the default). When only `secret` is enabled,
     /// the model is not loaded at all — gitleaks is the whole detector.
+    /// `allow` holds the user's regexes for values never redacted (`Config::allow_patterns`).
     pub fn load_with_categories(
         model_dir: &Path,
         use_gitleaks: bool,
         use_guards: bool,
         categories: Option<HashSet<String>>,
         use_llm_filter: bool,
+        allow: Vec<regex::Regex>,
     ) -> anyhow::Result<Self> {
         let needs_model = needs_model(&categories, use_llm_filter);
         let engine = if needs_model {
@@ -67,7 +69,7 @@ impl Detector {
         };
         Ok(Self {
             engine,
-            guards: Guards::new()?,
+            guards: Guards::with_allowlist(allow)?,
             use_gitleaks,
             use_guards,
             categories,
@@ -127,8 +129,14 @@ impl Detector {
         };
 
         let (model_kept, suppressed, pre_kept) = if self.use_guards {
-            let (model_kept, mut suppressed) = apply_guards(model_spans, text, &self.guards);
-            let (pre_kept, pre_suppressed) = apply_guards(pre_spans, text, &self.guards);
+            let (model_kept, mut suppressed) = apply_guards(model_spans, |span| {
+                self.guards
+                    .suppress_model(&span.label, text, span.start, span.end)
+            });
+            let (pre_kept, pre_suppressed) = apply_guards(pre_spans, |span| {
+                self.guards
+                    .suppress_labeled(&span.label, text, span.start, span.end)
+            });
             suppressed.extend(pre_suppressed);
             (model_kept, suppressed, pre_kept)
         } else {
@@ -347,13 +355,12 @@ fn merge_spans(mut model: Vec<DetectedSpan>, pre_pass: Vec<DetectedSpan>) -> Vec
 
 fn apply_guards(
     spans: Vec<DetectedSpan>,
-    text: &str,
-    guards: &Guards,
+    suppress: impl Fn(&DetectedSpan) -> Option<Suppression>,
 ) -> (Vec<DetectedSpan>, Vec<(DetectedSpan, Suppression)>) {
     let mut kept = Vec::new();
     let mut dropped = Vec::new();
     for span in spans {
-        match guards.suppress_labeled(&span.label, text, span.start, span.end) {
+        match suppress(&span) {
             Some(reason) => dropped.push((span, reason)),
             None => kept.push(span),
         }

@@ -169,9 +169,6 @@ fn next_placeholder(state: &AppState, label: &str, value: &str) -> (String, bool
 /// Shortest value replaced by name. A shorter one would be replaced inside ordinary words.
 const MIN_ENV_VALUE_CHARS: usize = 4;
 
-/// Variables per category per session (`$PIIF_SECRET_1` to `$PIIF_SECRET_9`). The env mod sets each name with a literal `$.env.set` call, so this must match its `ENV_LIMIT`.
-const ENV_LIMIT: usize = 9;
-
 /// The `PIIF_<CATEGORY>_<N>` category for a detection label, or `None` for a label with no variables.
 fn env_category(label: &str) -> Option<&'static str> {
     Some(match label.to_ascii_lowercase().as_str() {
@@ -192,13 +189,11 @@ struct EnvValue {
     value: String,
     name: String,
     label: String,
-    /// The variable holds (or is handed out with) this value, so every exact copy of it is replaced by the name. An inactive entry is a name `/scan` proposed for a prompt value the user has not chosen to replace yet.
-    active: bool,
     /// Whether the value has been replaced in a request yet, so the notice reports it once.
     seen: bool,
 }
 
-/// One session's values with `$PIIF_…` names. The gateway owns the numbering, so a prompt value and a value found in a file never share a name. Commands run with the real value, so their output can contain it (`echo $PIIF_SECRET_1`); the gateway replaces every exact copy of an active value with `$NAME` in all provider-bound text before detection runs, so it never leaves even when detection would miss it. Held in memory only, never logged or written to disk, and lost when the gateway stops.
+/// One session's values with `$PIIF_…` names. The gateway owns the numbering, so a prompt value and a value found in a file never share a name. Commands run with the real value, so their output can contain it (`echo $PIIF_SECRET_1`); the gateway replaces every copy of a named value with `$NAME` in all provider-bound text before detection runs, so it never leaves even when detection would miss it. Held in memory only, never logged or written to disk, and lost when the gateway stops.
 #[derive(Default)]
 struct EnvValues {
     /// Longest value first, so a value that contains another is replaced whole.
@@ -208,7 +203,7 @@ struct EnvValues {
 }
 
 impl EnvValues {
-    /// The name for `value`: the one it already has, else the next free one in its category (inactive until used or registered). `None` past `ENV_LIMIT`, for a label with no variables, or for a value too short to replace safely.
+    /// The name for `value`: the one it already has, else the next number in its category. `None` for a label with no variables, or for a value too short to replace safely.
     fn name_for(&mut self, value: &str, label: &str) -> Option<String> {
         if let Some(entry) = self.entries.iter().find(|entry| entry.value == value) {
             return Some(entry.name.clone());
@@ -218,53 +213,15 @@ impl EnvValues {
             return None;
         }
         let counter = self.counters.entry(category).or_insert(0);
-        if *counter >= ENV_LIMIT {
-            return None;
-        }
         *counter += 1;
         let name = format!("PIIF_{category}_{counter}");
         self.insert(EnvValue {
             value: value.to_string(),
             name: name.clone(),
             label: label.to_string(),
-            active: false,
             seen: false,
         });
         Some(name)
-    }
-
-    /// Mark `value`'s name active, so every copy of the value is replaced by it.
-    fn activate(&mut self, value: &str) {
-        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.value == value) {
-            entry.active = true;
-        }
-    }
-
-    /// Record that the mod put `value` into `$name`. This wins over what the gateway had: after a gateway restart the mod re-registers its values, and a name the gateway gave a different value since then is dropped from that value.
-    fn register(&mut self, name: &str, value: &str, label: &str) {
-        if value.chars().count() < MIN_ENV_VALUE_CHARS {
-            return;
-        }
-        self.entries
-            .retain(|entry| entry.value == value || entry.name != name);
-        if let Some((category, number)) = parse_env_name(name) {
-            let counter = self.counters.entry(category).or_insert(0);
-            *counter = (*counter).max(number);
-        }
-        match self.entries.iter_mut().find(|entry| entry.value == value) {
-            Some(entry) => {
-                entry.name = name.to_string();
-                entry.label = label.to_string();
-                entry.active = true;
-            }
-            None => self.insert(EnvValue {
-                value: value.to_string(),
-                name: name.to_string(),
-                label: label.to_string(),
-                active: true,
-                seen: false,
-            }),
-        }
     }
 
     fn insert(&mut self, entry: EnvValue) {
@@ -273,11 +230,10 @@ impl EnvValues {
             .sort_by_key(|entry| std::cmp::Reverse(entry.value.len()));
     }
 
-    /// The values of the active entries named in `names`.
-    fn lookup(&self, names: &[String]) -> serde_json::Map<String, Value> {
+    /// Every name and its value, for `piifence env`.
+    fn all(&self) -> serde_json::Map<String, Value> {
         self.entries
             .iter()
-            .filter(|entry| entry.active && names.contains(&entry.name))
             .map(|entry| (entry.name.clone(), Value::String(entry.value.clone())))
             .collect()
     }
@@ -289,10 +245,10 @@ struct Session {
     env: EnvValues,
 }
 
-/// The header carrying the session id: Claude Code sends it on every request (the wrapper sets `ANTHROPIC_CUSTOM_HEADERS`) and the env mod on its own calls. It is stripped before forwarding.
+/// The header carrying the session id: Claude Code sends it on every request (the wrapper sets `ANTHROPIC_CUSTOM_HEADERS`), and `piifence env` on its call for the values. It is stripped before forwarding.
 const SESSION_HEADER: &str = "x-piifence-session";
 
-/// The session id in `headers`, or `""` when it is missing or not 32 hex digits. The id is also what lets the mod fetch values, so only a well-formed one counts.
+/// The session id in `headers`, or `""` when it is missing or not 32 hex digits. The id is also what lets `piifence env` fetch values, so only a well-formed one counts.
 fn session_id(headers: &HeaderMap) -> String {
     headers
         .get(SESSION_HEADER)
@@ -313,56 +269,43 @@ fn replaces_with_env(state: &AppState) -> bool {
     !state.session.is_empty()
 }
 
-fn env_name_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^PIIF_([A-Z]+)_([0-9]+)$").expect("env name regex"))
-}
+/// Below this many characters a known value is replaced only as a whole token: not where a letter or digit of the text runs into its own first or last letter or digit. A short value turns up inside other strings by chance (`2024` in `2024-10-30`); a long one does not, so it is replaced wherever it appears, which keeps a real secret covered inside a longer string.
+const WHOLE_TOKEN_BELOW: usize = 16;
 
-/// The category and number of a `PIIF_<CATEGORY>_<N>` name the gateway could have given out.
-fn parse_env_name(name: &str) -> Option<(&'static str, usize)> {
-    let caps = env_name_re().captures(name)?;
-    let category = [
-        "SECRET", "EMAIL", "PERSON", "PHONE", "ADDRESS", "URL", "DATE", "ACCOUNT",
-    ]
-    .into_iter()
-    .find(|category| *category == &caps[1])?;
-    let number: usize = caps[2].parse().ok()?;
-    (1..=ENV_LIMIT)
-        .contains(&number)
-        .then_some((category, number))
-}
-
-/// The `(name, value, label)` triples of a `/control/env-values` body, `{"values": [{"name", "value", "label"}]}`, or `None` if any entry is malformed. The whole body is rejected so the mod blocks the prompt rather than set a variable the gateway does not track.
-fn parse_env_values(body: &[u8]) -> Option<Vec<(String, String, String)>> {
-    let parsed: Value = serde_json::from_slice(body).ok()?;
-    parsed
-        .get("values")?
-        .as_array()?
-        .iter()
-        .map(|entry| {
-            let name = entry.get("name")?.as_str()?;
-            let value = entry.get("value")?.as_str()?;
-            let label = entry
-                .get("label")
-                .and_then(Value::as_str)
-                .unwrap_or("secret");
-            (parse_env_name(name).is_some() && !value.is_empty())
-                .then(|| (name.to_string(), value.to_string(), label.to_string()))
+/// Where `value` is in `text`, by the rule of `WHOLE_TOKEN_BELOW`.
+fn env_value_matches(text: &str, value: &str) -> Vec<usize> {
+    let whole_token = value.chars().count() < WHOLE_TOKEN_BELOW;
+    let joins = |outside: Option<char>, edge: Option<char>| matches!((outside, edge), (Some(o), Some(e)) if o.is_alphanumeric() && e.is_alphanumeric());
+    text.match_indices(value)
+        .map(|(start, _)| start)
+        .filter(|&start| {
+            !whole_token
+                || !(joins(text[..start].chars().next_back(), value.chars().next())
+                    || joins(
+                        text[start + value.len()..].chars().next(),
+                        value.chars().next_back(),
+                    ))
         })
         .collect()
 }
 
-/// Replace every active env value in `text` with `$NAME`, returning the new text and one audit entry per replacement. Offsets are into the text as it stood when that value was replaced, after any longer values.
+/// Replace every named value in `text` with `$NAME`, returning the new text and one audit entry per replacement. Offsets are into the text as it stood when that value was replaced, after any longer values.
 fn replace_env_values(state: &AppState, text: &str, field: &str) -> (String, Vec<Value>) {
     with_session(state, |session| {
         let mut out = text.to_string();
         let mut audit = Vec::new();
         for entry in session.env.entries.iter_mut() {
-            if !entry.active || !out.contains(&entry.value) {
+            if !out.contains(&entry.value) {
+                continue;
+            }
+            let starts = env_value_matches(&out, &entry.value);
+            if starts.is_empty() {
                 continue;
             }
             let token = format!("${}", entry.name);
-            for (start, _) in out.match_indices(&entry.value) {
+            let mut replaced = String::with_capacity(out.len());
+            let mut copied = 0;
+            for start in starts {
                 audit.push(json!({
                     "field": field,
                     "label": entry.label,
@@ -375,19 +318,22 @@ fn replace_env_values(state: &AppState, text: &str, field: &str) -> (String, Vec
                     "engine": "env",
                 }));
                 entry.seen = true;
+                replaced.push_str(&out[copied..start]);
+                replaced.push_str(&token);
+                copied = start + entry.value.len();
             }
-            out = out.replace(&entry.value, &token);
+            replaced.push_str(&out[copied..]);
+            out = replaced;
         }
         (out, audit)
     })
 }
 
-/// The replacement for one detected value: `$NAME` when this session replaces values with variables and one is free, else the placeholder. Returns the token and whether the value is new to the notice.
+/// The replacement for one detected value: `$NAME` in a session (when its label has variables and it is long enough), else the placeholder. Returns the token and whether the value is new to the notice.
 fn token_for(state: &AppState, replace: bool, label: &str, value: &str) -> (String, bool) {
     if replace {
         let named = with_session(state, |session| {
             let name = session.env.name_for(value, label)?;
-            session.env.activate(value);
             let entry = session
                 .env
                 .entries
@@ -927,9 +873,8 @@ async fn proxy(
             .body(Body::from(body.to_string()))
             .unwrap();
     }
-    // The env mod's endpoints serve one `piifence claude` session; without its id there is nothing to name values for or hand them to.
-    let mod_endpoint = path == "/scan" || path.starts_with("/control/");
-    if mod_endpoint && state.session.is_empty() {
+    // The control endpoint serves one `piifence claude` session; without its id there is nothing to hand out.
+    if path.starts_with("/control/") && state.session.is_empty() {
         return Response::builder()
             .status(StatusCode::FORBIDDEN)
             .header("content-type", "application/json")
@@ -938,100 +883,11 @@ async fn proxy(
             ))
             .unwrap();
     }
-    if path == "/scan" && method == Method::POST {
-        let parsed = serde_json::from_slice::<Value>(&body).ok();
-        let Some(text) = parsed
-            .as_ref()
-            .and_then(|value| value.get("text"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-        else {
-            return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Body::from("missing text"))
-                .unwrap();
-        };
-        return match detect_kept(&state, &text).await {
-            Ok(spans) => {
-                let findings: Vec<Value> = spans
-                    .iter()
-                    .map(|span| {
-                        let value = &text[span.start..span.end];
-                        // The name this value gets; it only takes effect once the mod registers it.
-                        let env = with_session(&state, |session| {
-                            session.env.name_for(value, &span.label)
-                        });
-                        json!({
-                            "label": span.label,
-                            "score": (span.score * 1000.0).round() / 1000.0,
-                            "start": text[..span.start].encode_utf16().count(),
-                            "end": text[..span.end].encode_utf16().count(),
-                            "preview": mask_value(value),
-                            "engine": span.source.split(':').next().unwrap_or(""),
-                            "env": env,
-                        })
-                    })
-                    .collect();
-                let payload = json!({"findings": findings});
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .unwrap()
-            }
-            Err(err) => Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .header("content-type", "application/json")
-                .body(Body::from(json!({"error": err.to_string()}).to_string()))
-                .unwrap(),
-        };
-    }
-    if path == "/control/env-values" && method == Method::POST {
-        let status = match parse_env_values(&body) {
-            Some(values) => {
-                with_session(&state, |session| {
-                    for (name, value, label) in &values {
-                        session.env.register(name, value, label);
-                    }
-                });
-                StatusCode::OK
-            }
-            None => StatusCode::BAD_REQUEST,
-        };
+    // `piifence env` runs before every Bash command (Claude Code sources the line the session-start hook wrote) and exports these, so commands get the real values behind the `$PIIF_…` names. Values go only to the session they belong to.
+    if path == "/control/env" && method == Method::GET {
+        let values = with_session(&state, |session| session.env.all());
         return Response::builder()
-            .status(status)
-            .header("content-type", "application/json")
-            .body(Body::from(
-                json!({"ok": status == StatusCode::OK}).to_string(),
-            ))
-            .unwrap();
-    }
-    // The env mod asks for the values behind the `$PIIF_…` names a Bash command uses, so it can set them just before the command runs. Values are handed out only to the session they belong to.
-    if path == "/control/env-lookup" && method == Method::POST {
-        let names: Option<Vec<String>> =
-            serde_json::from_slice::<Value>(&body)
-                .ok()
-                .and_then(|value| {
-                    value.get("names")?.as_array().map(|names| {
-                        names
-                            .iter()
-                            .filter_map(|name| name.as_str().map(str::to_string))
-                            .collect()
-                    })
-                });
-        let (status, values) = match names {
-            Some(names) => (
-                StatusCode::OK,
-                with_session(&state, |session| session.env.lookup(&names)),
-            ),
-            None => (StatusCode::BAD_REQUEST, serde_json::Map::new()),
-        };
-        audit_line(
-            &state,
-            json!({"event": "env_lookup", "status": status.as_u16(), "found": values.len()}),
-        );
-        return Response::builder()
-            .status(status)
+            .status(StatusCode::OK)
             .header("content-type", "application/json")
             .body(Body::from(json!({"values": values}).to_string()))
             .unwrap();
@@ -1196,6 +1052,7 @@ async fn main() -> anyhow::Result<()> {
     let config = piifence_m1::config::load()?;
     let categories = config.category_set()?;
     let llm_filter = config.llm_filter.unwrap_or(true);
+    let allow = config.allow_patterns()?;
     let use_gitleaks = std::env::var("PIIF_GITLEAKS")
         .map(|v| v != "0" && v != "off" && v != "false")
         .unwrap_or(true);
@@ -1232,6 +1089,7 @@ async fn main() -> anyhow::Result<()> {
         true,
         categories.clone(),
         llm_filter,
+        allow,
     )?;
     eprintln!("Detector loaded; input-only redaction (responses streamed untouched)");
     eprintln!("llm filter: {llm_filter}");
@@ -1522,14 +1380,9 @@ mod tests {
     #[tokio::test]
     async fn env_value_in_tool_output_becomes_its_name() {
         let state = session_state();
-        let values = parse_env_values(
-            br#"{"values":[{"name":"PIIF_SECRET_1","value":"if-ajsdlk231lj","label":"secret"}]}"#,
-        )
-        .unwrap();
+        // The value was named in an earlier request.
         with_session(&state, |session| {
-            for (name, value, label) in &values {
-                session.env.register(name, value, label);
-            }
+            session.env.name_for("if-ajsdlk231lj", "secret")
         });
         // `echo $PIIF_SECRET_1` printed the value, which detection would miss; TOKEN is still detected and gets the next name.
         let mut content = json!([{"type": "tool_result", "tool_use_id": "t1",
@@ -1561,12 +1414,31 @@ mod tests {
         };
         let (out, _) = replace_env_values(&other, "if-ajsdlk231lj", "text");
         assert_eq!(out, "if-ajsdlk231lj");
-        let names = vec!["PIIF_SECRET_1".to_string()];
-        assert!(with_session(&other, |s| s.env.lookup(&names)).is_empty());
+        assert!(with_session(&other, |s| s.env.all()).is_empty());
         assert_eq!(
-            with_session(&state, |s| s.env.lookup(&names))["PIIF_SECRET_1"],
+            with_session(&state, |s| s.env.all())["PIIF_SECRET_1"],
             "if-ajsdlk231lj"
         );
+    }
+
+    #[test]
+    fn short_values_are_replaced_only_as_whole_tokens() {
+        // Short: not inside a longer run of letters and digits, but next to punctuation.
+        assert_eq!(env_value_matches("885,1150p", "1150"), Vec::<usize>::new());
+        assert_eq!(
+            env_value_matches("pw hunter2x", "hunter2"),
+            Vec::<usize>::new()
+        );
+        assert_eq!(env_value_matches("PW=hunter2;", "hunter2"), vec![3]);
+        assert_eq!(
+            env_value_matches("'hunter2' hunter2", "hunter2"),
+            vec![1, 10]
+        );
+        // A value whose edge is punctuation may touch a letter there.
+        assert_eq!(env_value_matches("a:pw!b", ":pw!"), vec![1]);
+        // Long: replaced wherever it appears.
+        let long = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        assert_eq!(env_value_matches(&format!("x{long}y"), long), vec![1]);
     }
 
     #[tokio::test]
@@ -1582,9 +1454,8 @@ mod tests {
             .unwrap();
         assert_eq!(named[0]["content"], "KEY=$PIIF_SECRET_1");
         assert_eq!(audit[0]["placeholder"], "$PIIF_SECRET_1");
-        let names = vec!["PIIF_SECRET_1".to_string()];
         assert_eq!(
-            with_session(&state, |s| s.env.lookup(&names))["PIIF_SECRET_1"],
+            with_session(&state, |s| s.env.all())["PIIF_SECRET_1"],
             "TOKEN"
         );
 
@@ -1598,19 +1469,10 @@ mod tests {
     }
 
     #[test]
-    fn env_values_are_validated() {
-        assert!(parse_env_values(br#"{"values":[{"name":"HOME","value":"abcdef"}]}"#).is_none());
-        assert!(
-            parse_env_values(br#"{"values":[{"name":"PIIF_SECRET_10","value":"abcdef"}]}"#)
-                .is_none()
-        );
-        assert!(parse_env_values(br#"{"values":[{"name":"PIIF_SECRET_1","value":""}]}"#).is_none());
-        assert!(parse_env_values(b"not json").is_none());
+    fn env_names_count_up_with_no_limit() {
         let mut env = EnvValues::default();
-        // Too short to replace safely: no name, and registering it is a no-op.
+        // Too short to replace safely: no name.
         assert_eq!(env.name_for("abc", "secret"), None);
-        env.register("PIIF_SECRET_1", "abc", "secret");
-        assert!(env.entries.is_empty());
         // Names count up per category, and the same value keeps its name.
         assert_eq!(
             env.name_for("abcd", "secret").as_deref(),
@@ -1624,30 +1486,13 @@ mod tests {
             env.name_for("abcd", "secret").as_deref(),
             Some("PIIF_SECRET_1")
         );
-        // A proposed name is inactive until used: nothing is replaced or handed out.
-        assert!(env.lookup(&["PIIF_SECRET_1".to_string()]).is_empty());
-        // The mod's registration wins and moves the counter past it.
-        env.register("PIIF_SECRET_1", "efgh", "secret");
-        env.register("PIIF_SECRET_5", "ijklmn", "secret");
-        assert_eq!(
-            env.name_for("opqr", "secret").as_deref(),
-            Some("PIIF_SECRET_6")
-        );
-        // The value that lost its name gets a new one.
-        assert_eq!(
-            env.name_for("abcd", "secret").as_deref(),
-            Some("PIIF_SECRET_7")
-        );
-        // No more than ENV_LIMIT per category.
-        assert_eq!(
-            env.name_for("stuv", "secret").as_deref(),
-            Some("PIIF_SECRET_8")
-        );
-        assert_eq!(
-            env.name_for("wxyz", "secret").as_deref(),
-            Some("PIIF_SECRET_9")
-        );
-        assert_eq!(env.name_for("0123", "secret"), None);
+        for n in 2..=120 {
+            assert_eq!(
+                env.name_for(&format!("value-{n}"), "secret"),
+                Some(format!("PIIF_SECRET_{n}"))
+            );
+        }
+        assert_eq!(env.all().len(), 121);
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@
 //!
 //! File format:
 //!   categories = ["secret", "private_email"]
+//!   allow = ['^PROJ-\d+$']   # values never redacted, matched against each detected value
 //!
 //! Unknown category names are an error (fail closed): a typo must not silently
 //! disable redaction for a category the user meant to protect.
@@ -32,6 +33,9 @@ pub struct Config {
     /// Defaults to true; set false to make secret-only mode rules-only (fast).
     #[serde(default)]
     pub llm_filter: Option<bool>,
+    /// Regexes for values that are never redacted, matched against each detected value (trimmed). Unanchored, so `'^…$'` for a whole value.
+    #[serde(default)]
+    pub allow: Vec<String>,
 }
 
 fn normalize(name: &str) -> String {
@@ -83,6 +87,17 @@ pub fn load() -> anyhow::Result<Config> {
 }
 
 impl Config {
+    /// The `allow` regexes, compiled. An invalid one is an error (fail closed), not skipped.
+    pub fn allow_patterns(&self) -> anyhow::Result<Vec<regex::Regex>> {
+        self.allow
+            .iter()
+            .map(|p| {
+                regex::Regex::new(p)
+                    .map_err(|e| anyhow::anyhow!("invalid `allow` pattern `{p}`: {e}"))
+            })
+            .collect()
+    }
+
     pub fn category_set(&self) -> anyhow::Result<Option<HashSet<String>>> {
         let Some(raw) = &self.categories else {
             return Ok(None);
@@ -120,6 +135,14 @@ mod tests {
     fn llm_filter_defaults_to_none_in_file() {
         let config: Config = toml::from_str("categories = [\"secret\"]").unwrap();
         assert!(config.llm_filter.is_none());
+    }
+
+    #[test]
+    fn allow_patterns_compile_or_fail() {
+        let config: Config = toml::from_str("allow = ['^PROJ-\\d+$']").unwrap();
+        assert!(config.allow_patterns().unwrap()[0].is_match("PROJ-12"));
+        let config: Config = toml::from_str("allow = ['(']").unwrap();
+        assert!(config.allow_patterns().is_err());
     }
 
     #[test]

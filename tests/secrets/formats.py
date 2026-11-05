@@ -193,6 +193,12 @@ def _pw_dollar_space(rng):
     return pw, [pw], None
 
 
+def _uuid_with_keyword(rng):
+    h = expand("{h:32}", rng)
+    tok = f"{h[:8]}-{h[8:12]}-4{h[13:16]}-a{h[17:20]}-{h[20:32]}"
+    return tok, [tok], "API_KEY=" + tok
+
+
 def _bare_hex(rng):
     tok = expand("{h:32}", rng)
     return tok, [tok], tok
@@ -347,6 +353,8 @@ FORMATS = [
     # generic-api-key only allows [\w.=-]; the piifence assignment rule also accepts + and /.
     F("base64_40_with_keyword", "generic", "{b64:40}", var="CLIENT_SECRET", rules=("piifence-password-assignment",)),
     F("hex32_bare_no_keyword", "generic", build=_bare_hex),
+    # An id-shaped secret: the keyword before it keeps it redacted (Heroku keys are UUIDs).
+    F("uuid_with_keyword", "generic", build=_uuid_with_keyword, rules=("piifence-password-assignment",)),
 ]
 
 BY_ID = {f.id: f for f in FORMATS}

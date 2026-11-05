@@ -13,6 +13,11 @@
 # misses model-only secrets (e.g. some URL-embedded credentials).
 # llm_filter = true
 #
+# Values that are never redacted, as regexes matched against each detected
+# value. Use this for your own ids the detector mistakes for secrets. Anchor
+# with ^…$ to match a whole value. An invalid pattern stops the gateway.
+# allow = ['^PROJ-\d+$', '^build-[0-9a-f]{12}$']
+#
 # Example — only credentials and emails:
 # categories = ["secret", "private_email"]
 #

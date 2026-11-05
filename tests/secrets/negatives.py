@@ -15,6 +15,13 @@ def _uuid(rng):
     return f"{h[:8]}-{h[8:12]}-4{h[13:16]}-a{h[17:20]}-{h[20:32]}"
 
 
+CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+
+def _ulid(rng):
+    return "0" + rng.choice("1234567") + "".join(rng.choice(CROCKFORD) for _ in range(24))
+
+
 def _git_log(rng):
     msgs = ["Fix flaky checkout test", "Bump axum to 0.8", "Add retry to uploader", "Refactor config loader",
             "Document the release process"]
@@ -61,6 +68,23 @@ NEGATIVES = [
     ("code_rust_macro", lambda r: "colon_token: Token![:],"),
     ("code_path", lambda r: "paren_token: token::Paren,"),
     ("json_object_value", lambda r: '"secret": {"categories": ["secret"]}'),
+    # Claude Code's own ids and paths: the session UUID is in every scripts path.
+    ("claude_session_path", lambda r: f"cd ~/.claude/projects/-Users-me-app/{_uuid(r)}/scripts && python3 check.py"),
+    ("claude_transcript_path", lambda r: f"read ~/.claude/projects/-Users-me-app/{_uuid(r)}.jsonl"),
+    ("tool_use_id", lambda r: '"tool_use_id": "toolu_01' + E("{b62:22}", r) + '"'),
+    ("sed_range", lambda r: "sed -n '" + E("{d:3}", r) + "," + E("{d:4}", r) + "p' session.jsonl"),
+    # Other ids and hashes.
+    ("guid_upper_braces", lambda r: "CLSID {" + _uuid(r).upper() + "}"),
+    ("mongo_object_id", lambda r: 'db.users.find({_id: ObjectId("' + E("{h:24}", r) + '")})'),
+    ("ulid", lambda r: "event " + _ulid(r) + " was delivered"),
+    ("aws_instance_id", lambda r: "instance i-0" + E("{h:16}", r) + " stopped"),
+    ("sha256_checksum", lambda r: 'checksum = "sha256:' + E("{h:64}", r) + '"'),
+    ("hashed_css", lambda r: "dist/assets/app." + E("{h:8}", r) + ".css"),
+    ("hex_fixture", lambda r: 'const HEX: &str = "0123456789abcdef";'),
+    # Stand-ins for a value.
+    ("masked_bullets", lambda r: "token: ••••••••"),
+    ("template_literal", lambda r: 'value = "sk-{b62:20}"'),
+    ("example_name", lambda r: 'name = "piifence-example"'),
 ]
 
 

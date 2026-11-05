@@ -55,9 +55,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut failures = 0usize;
     let mut by_tier: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
-    let mut suppressed_placeholder = 0usize;
-    let mut suppressed_env = 0usize;
-    let mut suppressed_file = 0usize;
+    let mut suppressed: std::collections::BTreeMap<Suppression, usize> = Default::default();
 
     for case in &corpus {
         let detection = detector.detect(&case.text)?;
@@ -95,11 +93,7 @@ fn main() -> anyhow::Result<()> {
             );
         }
         for (span, reason) in &detection.suppressed {
-            match reason {
-                Suppression::Placeholder => suppressed_placeholder += 1,
-                Suppression::EnvReference => suppressed_env += 1,
-                Suppression::FileReference => suppressed_file += 1,
-            }
+            *suppressed.entry(*reason).or_default() += 1;
             println!(
                 "    [suppressed:{}] {:>6.3}  {:<18} {:?}  [{}]",
                 reason.as_str(),
@@ -126,16 +120,24 @@ fn main() -> anyhow::Result<()> {
     println!(
         "guards: {}",
         if use_guards {
+            // Placeholder and env-ref always show; the other guards only when they fired.
+            let count = |reason| suppressed.get(&reason).copied().unwrap_or(0);
+            let mut parts = vec![
+                format!("placeholder: {}", count(Suppression::Placeholder)),
+                format!("env-ref-allowlist: {}", count(Suppression::EnvReference)),
+            ];
+            parts.extend(
+                suppressed
+                    .iter()
+                    .filter(|(reason, _)| {
+                        !matches!(reason, Suppression::Placeholder | Suppression::EnvReference)
+                    })
+                    .map(|(reason, n)| format!("{}: {n}", reason.as_str())),
+            );
             format!(
-                "on — suppressed {} spans (placeholder: {}, env-ref-allowlist: {}{})",
-                suppressed_placeholder + suppressed_env + suppressed_file,
-                suppressed_placeholder,
-                suppressed_env,
-                if suppressed_file > 0 {
-                    format!(", file-reference: {suppressed_file}")
-                } else {
-                    String::new()
-                }
+                "on — suppressed {} spans ({})",
+                suppressed.values().sum::<usize>(),
+                parts.join(", ")
             )
         } else {
             "off (PIIF_GUARDS=0)".to_string()
