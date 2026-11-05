@@ -195,31 +195,17 @@ Notes: do not pass `--settings` to `piifence claude` (it owns that flag); Ctrl-C
 leave the gateway running (next invocation reuses it); `piifence claude --version`
 works as a smoke test.
 
-## Prompt replacement mod
+## Environment variables
 
-`plugin/piifence-env` is a Claude Code **mod**, loaded by `piifence claude`. Its `prompt.submit` hook asks the gateway for findings and replaces each one with an environment variable, without asking; a toast (`$.ui.toast`) lists what was replaced, with masked previews.
+In a session (a request with the `x-piifence-session` header that `piifence claude` sets through `ANTHROPIC_CUSTOM_HEADERS`; the gateway strips it before forwarding) every detected value becomes `$PIIF_<CATEGORY>_<N>` instead of `<secret_N>`, in the prompt as much as in tool results, files and the system prompt. Names are numbered per session with no limit, and a value keeps its name. A named value is also replaced wherever it appears (for example the output of `echo $PIIF_SECRET_1`) before detection runs, so it is caught even when detection would miss a bare value; a value under 16 characters only as a whole token, so a false positive does not spread inside other strings. Requests without a session id get placeholders. Nothing rewrites the transcript: what the user sees stays as it was.
 
-- The mod sets the raw value as an environment variable in the Claude Code session (`$.env.set`, names are literal), rewrites the prompt span to `$PIIF_SECRET_1` (or the category equivalent), and adds a Claude-only context note mapping the variable names. The gateway sees only the env reference (guard `$PIIF_[A-Z0-9_]+`), so the provider never receives the value; local Bash commands can expand it. Env vars live for the session and are never printed by the mod.
-- Before setting them, the mod registers each value with `POST /control/env-values`; if that fails, the prompt is blocked rather than leave a variable the gateway cannot protect.
-- A finding the gateway gives no name (once the 9 names of a category in the session are used up, or a label with no variables) is left in the prompt for the gateway to replace with a placeholder; the toast says so.
-- The session's first prompt also carries a fixed context note (`VARIABLES_NOTE`) telling the agent what `$PIIF_…` names are, that it can use them in Bash and that they were not exposed; without it the agent took names in tool output for leaked secrets. It is not a system-prompt section because an organization's policy plugin may skip user plugins' `prompt.compose` hooks.
-- An unreachable gateway → the prompt continues and the gateway redacts when it is back (or the request fails closed). Hook errors are caught.
+Commands get the real values through Claude Code's `CLAUDE_ENV_FILE`, which Claude Code sources before every Bash command:
 
-`/scan` returns offsets in UTF-16 code units (what a JS `String.prototype.slice` uses), so prompts containing non-ASCII punctuation rewrite cleanly instead of splitting the value.
+- `piifence claude` puts a `SessionStart` hook in its `--settings` override: `piifence session-start <session> <port>`.
+- The hook appends `eval "$(piifence env <session> <port>)"` to `CLAUDE_ENV_FILE` (once per file) and returns a fixed note (`VARIABLES_NOTE`) as `additionalContext`, telling the agent what `$PIIF_…` names are, that it can use them in Bash and that they were not exposed; without it the agent took names in tool output for leaked secrets. It runs again after `/clear` and compaction. It is not a system-prompt section because an organization's policy plugin may skip user plugins' `prompt.compose` hooks.
+- `piifence env` asks `GET /control/env` and prints `export NAME='value'` for each name (single-quoted; names must be `PIIF_<CATEGORY>_<N>`). It prints nothing when the gateway does not answer within 2 s, so the command still runs, without the values.
 
-The mod does not rewrite tool results, `CLAUDE.md`, the system prompt, assistant history or other transcript rows (what the user sees stays as it was). The gateway handles those: in a session it names each detected value `$PIIF_…` instead of `<secret_N>`, and the mod's `tool.call` Bash hook fetches the values a command names (`POST /control/env-lookup`) and sets them just before it runs. A registered env value is also replaced with its name wherever it appears (for example the output of `echo $PIIF_SECRET_1`) before detection runs, so it is caught even when detection would miss a bare value. Requests without a session id get placeholders.
-
-Gateway endpoints used by the mod:
-
-- `POST /scan` `{text}` → `{findings: [{label, preview, start, end, engine, score, env}]}`; `env` is the name the gateway would give the value (it takes effect once the mod registers it). Detection only, masked previews.
-- `POST /control/env-values` `{values: [{name, value, label}]}` — registers values the mod is about to put into `$PIIF_…` variables, and again with each prompt so they survive a gateway restart. Names must be `PIIF_<CATEGORY>_<1-9>`; a malformed entry rejects the whole body with 400. Held in memory only, never logged; values under 4 characters are accepted but not tracked.
-- `POST /control/env-lookup` `{names}` → `{values: {name: value}}` — the active values of this session for the names a Bash command uses. Audit event `env_lookup` with counts only.
-
-Sessions are told apart by the `x-piifence-session` header that `piifence claude` sets through `ANTHROPIC_CUSTOM_HEADERS`; the gateway strips it before forwarding. All three endpoints answer 403 without it, and the mod registers no hooks unless `piifence claude` passed it the session id and gateway URL.
-
-Mod files:
-`plugin/piifence-env/{.claude-plugin/plugin.json,hooks/hooks.json,hooks/register.js}`;
-validate with `claude plugin validate plugin/piifence-env`.
+`GET /control/env` → `{values: {name: value}}`, all of this session's values; 403 without a session id. Held in memory only, never logged.
 
 ## Categories configuration
 

@@ -28,10 +28,7 @@ building the placeholder/redaction layer (M2).
   `piifence claude` auto-loads it per session via `--plugin-dir` unless a global copy
   exists at `~/.claude/skills/piifence-notice` (optional install lives outside this
   repo — re-copy after plugin changes).
-- Claude Code env mod: `plugin/piifence-env/` (its `prompt.submit` hook replaces every finding with `$PIIF_<CATEGORY>_<N>` and shows a toast listing them; talks to gateway `/scan`, `/control/env-values` and `/control/env-lookup`); `piifence claude` loads it per session via `--plugin-dir` unless `~/.claude/skills/piifence-env` exists. It has no settings; it registers no hooks unless `piifence claude` passed it a session id and gateway URL. The session's first `prompt.submit` also carries `VARIABLES_NOTE` (what `$PIIF_*` names are, use them, they were not exposed) as context. It is a prompt note, not a `prompt.compose` system-prompt section, because an organization's policy plugin (`cc-plugin-sec-default`) skips user plugins' `prompt.compose` hooks; do not work around that. `hooks/register.test.ts` covers it (`command claude plugin test plugin/piifence-env`).
-- Env replacement: the mod sets `PIIF_<CATEGORY>_<N>` (`$.env.set`, literal names, up to 9 per category per session, numbered by the gateway) and rewrites the prompt span to `$PIIF_<CATEGORY>_<N>`; the guard suppresses those env references, and Bash commands can expand them. The mod must not rewrite tool results, CLAUDE.md or other transcript rows (what the user sees stays as it was); in a session the gateway names values there `$PIIF_…` itself, and gives placeholders only past the limit or without a session id. `/scan` returns UTF-16
-  code-unit offsets so JS rewriting matches Rust detection on non-ASCII text. The raw
-  value stays in the Claude Code process, never the provider.
+- Env variables: in a session the gateway names every detected value `$PIIF_<CATEGORY>_<N>` (no limit; numbered per session) wherever it appears, prompt included; the guard suppresses those env references. There is no Claude Code mod. `piifence claude` adds a `SessionStart` hook to its `--settings` override: `piifence session-start <session> <port>` returns `VARIABLES_NOTE` (what `$PIIF_*` names are, use them, they were not exposed) as `additionalContext`, and appends `eval "$(piifence env <session> <port>)"` to `CLAUDE_ENV_FILE`, which Claude Code sources before every Bash command. `piifence env` prints `export NAME='value'` lines from `GET /control/env`, and nothing if the gateway does not answer. The note is hook context, not a system-prompt section: an organization's policy plugin (`cc-plugin-sec-default`) skips user plugins' `prompt.compose` hooks; do not work around that. Nothing rewrites transcript rows (what the user sees stays as it was). The raw value stays on the machine, never the provider.
 - Validation artifacts: `tests/m1-report.txt`, `docs/m1-notes.md`, `docs/labels.md`,
   `docs/prior-art.md`, `docs/gateway-spike.md`, `docs/model-options.md`.
 - Model weights live in `data/` (untracked, ~2.8 GB, fetched on demand).
@@ -78,7 +75,16 @@ building the placeholder/redaction layer (M2).
   `SECRET` spans overlapping `os.environ.get(...)` / `os.environ[...]` / `os.getenv(...)` /
   `process.env.*`; file-reference guard suppresses spans of any label but `private_url`
   that lie (edge whitespace ignored) inside a `path/name.ext:line[:col]` reference, e.g.
-  `auth.spec.ts:42` in a system prompt. Every suppression is printed with its reason; `PIIF_GUARDS=0` disables
+  `auth.spec.ts:42` in a system prompt. The user's `allow` regexes (`config.toml`) suppress
+  matching values from any engine. The shape guard (model spans only, `suppress_model`) drops a
+  span that is wholly an identifier, hash, path or code (UUIDs, git SHAs, digests, `toolu_…`,
+  AWS ids, ULIDs, pod names, `~/.claude/…` paths, `Token![:]`), or for the `secret` label a
+  number, range, version, time or IP (`885,1150p`), unless a secret keyword ends right before it
+  (`API_KEY=<uuid>`); stand-in secrets (`sk-...`, `YOUR_API_KEY`, `***`, `••••`, `{b62:20}`) are dropped
+  even after a keyword. It costs one suite case, a bare 32-hex secret with no keyword
+  (`hex32_bare_no_keyword`). Gitleaks matches are never shape-checked. In the gateway a known
+  value shorter than 16 characters is replaced only as a whole token (`WHOLE_TOKEN_BELOW`), so a
+  false positive cannot spread inside other strings. Every suppression is printed with its reason; `PIIF_GUARDS=0` disables
   the guards (13/15 baseline). Guards decide keep/drop only — they do not fix span
   boundaries, and they are policy (narrow, versioned, unit-tested), not test scaffolding.
 - Context-aware scanning: `tool_result` text is re-scanned with the originating
@@ -100,9 +106,9 @@ building the placeholder/redaction layer (M2).
   recent first sightings only — including a masked first4+last4 `preview` for notice
   verification, never the raw value. The notice reports only values redacted for
   the first time.
-  Prompt replacement is handled by the env mod, not the gateway: `POST /scan` returns findings (detection only; UTF-16 code-unit offsets). `/scan` and `/control/*` answer 403 without a session id.
-  Env vars: the gateway owns `$PIIF_<CATEGORY>_<N>` numbering per session (9 per category); `/scan` returns each finding's name as `env`. Before setting env vars, the mod posts each value and its name to `POST /control/env-values`; the gateway keeps them in memory only and replaces every exact occurrence with `$NAME` in all provider-bound text before detection (audit engine `env`), so a command that prints one does not leak it. If that call fails, the mod blocks the prompt. In a session, detected values in tool output and files get `$NAME` instead of placeholders; the mod's `tool.call` Bash hook fetches the values a command names from `POST /control/env-lookup` and sets them before it runs.
-  Sessions: `piifence claude` gives each session a random 32-hex id, sent by Claude Code as `x-piifence-session` (via `ANTHROPIC_CUSTOM_HEADERS`, merged with the user's) and by the mod (as its `session` plugin option, with `gatewayUrl`, through `--settings` `pluginConfigs`; the engine refuses requests carrying env values and does not expose the process env). The gateway keys values on it, strips the header before forwarding, and gives placeholders without one.
+  `/control/*` answers 403 without a session id.
+  Env vars: the gateway owns `$PIIF_<CATEGORY>_<N>` numbering per session, keeps the values in memory only, and replaces every occurrence with `$NAME` in all provider-bound text before detection (audit engine `env`), so a command that prints one does not leak it; a value under 16 characters only as a whole token (`WHOLE_TOKEN_BELOW`). `GET /control/env` returns all of the session's names and values, for `piifence env`.
+  Sessions: `piifence claude` gives each session a random 32-hex id, sent by Claude Code as `x-piifence-session` (via `ANTHROPIC_CUSTOM_HEADERS`, merged with the user's) and by `piifence env` (the id is an argument of the hook command and of the line it writes). The gateway keys values on it, strips the header before forwarding, and gives placeholders without one.
   Gateway hardening: requires `PIIF_UPSTREAM` (no default provider); binds loopback and
   rejects requests with an `Origin` header or a non-loopback `Host`; accepts POST only
   for `/v1/messages` and `/v1/messages/count_tokens` (both redacted) and refuses other

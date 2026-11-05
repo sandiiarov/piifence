@@ -8,6 +8,12 @@
 //! with a temporary `--settings` override, runs Claude Code, then tears the
 //! gateway down if this process started it. The user's settings file is never
 //! modified.
+//!
+//! The override also adds a `SessionStart` hook, `piifence session-start`. It
+//! tells the agent what `$PIIF_…` names are, and adds a line to Claude Code's
+//! `CLAUDE_ENV_FILE`, which Claude Code sources before every Bash command. That
+//! line runs `piifence env`, which exports this session's values from the
+//! gateway, so a command that names `$PIIF_SECRET_1` gets the real value.
 
 use std::env;
 use std::fs;
@@ -25,6 +31,9 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("claude") => run_claude(&args[1..]),
+        // Run by Claude Code, not by people: the hook and the line it writes.
+        Some("session-start") => session_start(&args[1..]),
+        Some("env") => print_env(&args[1..]),
         Some("-h") | Some("--help") | Some("help") | None => {
             usage();
             std::process::exit(0);
@@ -158,7 +167,7 @@ fn run_claude(args: &[String]) -> ! {
             std::process::exit(1);
         }
     };
-    let settings_path = match write_settings_override(&gateway_url, &session_id) {
+    let settings_path = match write_settings_override(&gateway_url, port, &session_id) {
         Ok(path) => path,
         Err(err) => {
             eprintln!("piifence: cannot write session settings: {err}");
@@ -172,20 +181,18 @@ fn run_claude(args: &[String]) -> ! {
     cmd.arg("--settings").arg(&settings_path);
     // Notices: if the plugin is not installed globally, load it for this session
     // only via --plugin-dir (never copies into the user's config automatically).
-    for (name, purpose) in [("piifence-notice", "notice"), ("piifence-env", "env")] {
-        if plugin_installed(name) {
-            continue;
-        }
-        if let Some(dir) = plugin_dir(name) {
-            eprintln!(
-                "piifence: loading {purpose} plugin for this session from {}",
-                dir.display()
-            );
-            cmd.arg("--plugin-dir").arg(dir);
-        } else if name == "piifence-notice" {
-            eprintln!(
+    if !plugin_installed("piifence-notice") {
+        match notice_plugin_dir() {
+            Some(dir) => {
+                eprintln!(
+                    "piifence: loading notice plugin for this session from {}",
+                    dir.display()
+                );
+                cmd.arg("--plugin-dir").arg(dir);
+            }
+            None => eprintln!(
                 "piifence: notice plugin not found; redaction still works, but no in-UI notice"
-            );
+            ),
         }
     }
     cmd.args(args).env("PIIF_GATEWAY_URL", &gateway_url);
@@ -293,19 +300,21 @@ fn gateway_binary() -> PathBuf {
     PathBuf::from("piifence-gateway")
 }
 
-/// Raw HTTP response from `/health` on the loopback port, or None if nothing answers.
-fn health_response(port: u16) -> Option<String> {
+/// Raw HTTP response to `GET path` on the loopback port, with `headers` (`Name: value` lines), or None if nothing answers in time.
+fn http_get(port: u16, path: &str, headers: &str, timeout: Duration) -> Option<String> {
     let addr = format!("127.0.0.1:{port}");
     let mut stream = TcpStream::connect_timeout(
         &addr.parse().expect("valid loopback addr"),
         Duration::from_millis(300),
     )
     .ok()?;
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_read_timeout(Some(timeout));
     stream
         .write_all(
-            format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
-                .as_bytes(),
+            format!(
+                "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{headers}Connection: close\r\n\r\n"
+            )
+            .as_bytes(),
         )
         .ok()?;
     // The gateway closes the connection after the response (Connection: close),
@@ -313,6 +322,10 @@ fn health_response(port: u16) -> Option<String> {
     let mut buf = Vec::new();
     let _ = stream.read_to_end(&mut buf);
     Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+fn health_response(port: u16) -> Option<String> {
+    http_get(port, "/health", "", Duration::from_millis(500))
 }
 
 /// A healthy gateway on `port`: None when nothing healthy answers. Otherwise the
@@ -443,31 +456,25 @@ fn user_settings_custom_headers() -> Option<String> {
         .map(str::to_string)
 }
 
-/// `pluginConfigs` for the env mod: the user's own options for it plus `session`, the id the mod sends on its gateway calls, and `gatewayUrl`, where those calls go. It goes as an option because the plugin engine refuses a request that carries a value read from the environment. Both keys are set: the mod loads as `piifence-env` when installed and as `piifence-env@inline` from `--plugin-dir`.
-fn env_plugin_configs(session_id: &str, gateway_url: &str) -> serde_json::Value {
-    let configs = user_settings().and_then(|settings| settings.get("pluginConfigs").cloned());
-    let mut out = serde_json::Map::new();
-    for key in ["piifence-env", "piifence-env@inline"] {
-        let mut config = configs
-            .as_ref()
-            .and_then(|configs| configs.get(key))
-            .filter(|config| config.is_object())
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
-        if !config
-            .get("options")
-            .is_some_and(serde_json::Value::is_object)
-        {
-            config["options"] = serde_json::json!({});
-        }
-        config["options"]["session"] = serde_json::Value::String(session_id.to_string());
-        config["options"]["gatewayUrl"] = serde_json::Value::String(gateway_url.to_string());
-        out.insert(key.to_string(), config);
-    }
-    serde_json::Value::Object(out)
+/// The `SessionStart` hook that sets the session up: `piifence session-start <session> <port>`, by this binary's real path.
+fn session_start_hook(port: u16, session_id: &str) -> serde_json::Value {
+    let exe = env::current_exe()
+        .ok()
+        .and_then(|path| fs::canonicalize(path).ok())
+        .unwrap_or_else(|| PathBuf::from("piifence"));
+    serde_json::json!({
+        "SessionStart": [{"hooks": [{
+            "type": "command",
+            "command": format!("{} session-start {session_id} {port}", shell_quote(&exe.to_string_lossy())),
+        }]}]
+    })
 }
 
-fn write_settings_override(gateway_url: &str, session_id: &str) -> std::io::Result<PathBuf> {
+fn write_settings_override(
+    gateway_url: &str,
+    port: u16,
+    session_id: &str,
+) -> std::io::Result<PathBuf> {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -483,7 +490,7 @@ fn write_settings_override(gateway_url: &str, session_id: &str) -> std::io::Resu
                 "ANTHROPIC_BASE_URL": gateway_url,
                 "ANTHROPIC_CUSTOM_HEADERS": custom_headers(session_id),
             },
-            "pluginConfigs": env_plugin_configs(session_id, gateway_url),
+            "hooks": session_start_hook(port, session_id),
         })
     );
     let mut options = fs::OpenOptions::new();
@@ -503,15 +510,10 @@ fn plugin_installed(name: &str) -> bool {
     Path::new(&home).join(".claude/skills").join(name).exists()
 }
 
-/// Locate a plugin shipped with this checkout: PIIF_PLUGIN_DIR applies to the
-/// notice plugin, PIIF_ENV_PLUGIN_DIR to the env mod; otherwise walk
-/// up from the real binary looking for plugin/<name>.
-fn plugin_dir(name: &str) -> Option<PathBuf> {
-    let override_var = match name {
-        "piifence-env" => "PIIF_ENV_PLUGIN_DIR",
-        _ => "PIIF_PLUGIN_DIR",
-    };
-    if let Ok(dir) = env::var(override_var) {
+/// Locate the notice plugin shipped with this checkout: PIIF_PLUGIN_DIR, else walk
+/// up from the real binary looking for plugin/piifence-notice.
+fn notice_plugin_dir() -> Option<PathBuf> {
+    if let Ok(dir) = env::var("PIIF_PLUGIN_DIR") {
         let path = PathBuf::from(dir);
         return path.exists().then_some(path);
     }
@@ -520,10 +522,162 @@ fn plugin_dir(name: &str) -> Option<PathBuf> {
         .and_then(|path| fs::canonicalize(path).ok())?;
     let mut dir = exe.parent()?.to_path_buf();
     loop {
-        let candidate = dir.join("plugin").join(name);
+        let candidate = dir.join("plugin").join("piifence-notice");
         if candidate.join(".claude-plugin/plugin.json").exists() {
             return Some(candidate);
         }
         dir = dir.parent()?.to_path_buf();
+    }
+}
+
+/// What `$PIIF_…` names are, given to the agent when the session starts (and again after `/clear` or a compaction, which start it again). Without it the agent meets a name in tool output with no idea what it is: it warns that a secret leaked, or decides the variable holds its own name, and does not know it can use it.
+const VARIABLES_NOTE: &str = "# piifence environment variables
+
+This session runs through piifence, which keeps secrets and personal data from reaching you. Before anything is sent to you (the user's prompts, command output, file contents), piifence replaces each sensitive value with an environment variable name such as `$PIIF_SECRET_1` or `$PIIF_EMAIL_2`. The real value stays on the user's machine.
+
+- Use the name in Bash commands, quoted, where you would use the value: `curl -H \"Authorization: Bearer $PIIF_SECRET_1\" …`. piifence sets the variables before each command runs, so the name expands to the real value.
+- Files, environment variables and command output on the user's machine hold the real value; only what is sent to you shows the name. A value you see as a `$PIIF_…` name was not exposed to you or the provider: do not warn that it leaked or suggest rotating it on that account.
+- When a command prints a value, you see its name again: `echo $PIIF_SECRET_1` shows you `$PIIF_SECRET_1` although the variable holds the real value. Do not conclude from that that the variable is wrong or holds its own name, and do not try to print, decode or otherwise reveal the values.
+- A placeholder such as `<secret_3>` stands for a value piifence could not give a name; it cannot be used in commands.";
+
+/// `<session> <port>` from a hook's or `env`'s arguments, if both are well-formed.
+fn session_args(args: &[String]) -> Option<(&str, u16)> {
+    let [session, port] = args else { return None };
+    let well_formed = session.len() == 32 && session.bytes().all(|b| b.is_ascii_hexdigit());
+    well_formed.then_some((session.as_str(), port.parse().ok()?))
+}
+
+/// `piifence session-start <session> <port>`, the `SessionStart` hook. Adds the line that runs `piifence env` to `CLAUDE_ENV_FILE` (once per file), and answers with VARIABLES_NOTE as context for the agent. It never fails the hook: without the line, commands just run without the values.
+fn session_start(args: &[String]) -> ! {
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let Some((session, port)) = session_args(args) else {
+        eprintln!("piifence session-start: expected <session> <port>");
+        std::process::exit(0);
+    };
+    let exe = env::current_exe()
+        .ok()
+        .and_then(|path| fs::canonicalize(path).ok())
+        .unwrap_or_else(|| PathBuf::from("piifence"));
+    let line = format!(
+        "eval \"$({} env {session} {port})\"\n",
+        shell_quote(&exe.to_string_lossy())
+    );
+    match env::var("CLAUDE_ENV_FILE") {
+        Ok(path) if !path.is_empty() => {
+            let present = fs::read_to_string(&path).is_ok_and(|text| text.contains(&line));
+            let written = present
+                || fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .and_then(|mut file| file.write_all(line.as_bytes()))
+                    .is_ok();
+            if !written {
+                eprintln!(
+                    "piifence: cannot write {path}; Bash commands will not get $PIIF_* values"
+                );
+            }
+        }
+        _ => eprintln!(
+            "piifence: CLAUDE_ENV_FILE is not set; Bash commands will not get $PIIF_* values"
+        ),
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": VARIABLES_NOTE,
+            }
+        })
+    );
+    std::process::exit(0);
+}
+
+/// `piifence env <session> <port>`: this session's values from the gateway as `export NAME='value'` lines, for the `eval` Claude Code runs before every Bash command. Prints nothing when the gateway does not answer, so the command still runs.
+fn print_env(args: &[String]) -> ! {
+    let Some((session, port)) = session_args(args) else {
+        std::process::exit(0);
+    };
+    let response = http_get(
+        port,
+        "/control/env",
+        &format!("x-piifence-session: {session}\r\n"),
+        Duration::from_secs(2),
+    );
+    let values = response
+        .filter(|response| response.starts_with("HTTP/1.1 200"))
+        .and_then(|response| {
+            let (_, body) = response.split_once("\r\n\r\n")?;
+            serde_json::from_str::<serde_json::Value>(body).ok()
+        });
+    if let Some(values) = values.as_ref().and_then(|v| v.get("values")?.as_object()) {
+        print!("{}", export_lines(values));
+    }
+    std::process::exit(0);
+}
+
+/// `export NAME='value'` for each `PIIF_<CATEGORY>_<N>` name; anything else is skipped, as is a value with a NUL byte, which a shell variable cannot hold.
+fn export_lines(values: &serde_json::Map<String, serde_json::Value>) -> String {
+    values
+        .iter()
+        .filter(|(name, _)| {
+            name.strip_prefix("PIIF_")
+                .and_then(|rest| rest.rsplit_once('_'))
+                .is_some_and(|(category, number)| {
+                    !category.is_empty()
+                        && category.bytes().all(|b| b.is_ascii_uppercase())
+                        && !number.is_empty()
+                        && number.bytes().all(|b| b.is_ascii_digit())
+                })
+        })
+        .filter_map(|(name, value)| {
+            let value = value.as_str().filter(|value| !value.contains('\0'))?;
+            Some(format!("export {name}={}\n", shell_quote(value)))
+        })
+        .collect()
+}
+
+/// `value` in single quotes for a POSIX shell, with each `'` written as `'\''`.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_lines_quote_values_and_skip_other_names() {
+        let values = serde_json::json!({
+            "PIIF_SECRET_1": "it's $HOME `x`",
+            "PIIF_EMAIL_12": "a@b.io",
+            "PATH": "/tmp/evil",
+            "PIIF_SECRET_2": "nul\u{0}byte",
+            "PIIF_SECRET_X": "nope",
+        });
+        let out = export_lines(values.as_object().unwrap());
+        assert_eq!(
+            out,
+            "export PIIF_EMAIL_12='a@b.io'\nexport PIIF_SECRET_1='it'\\''s $HOME `x`'\n"
+        );
+    }
+
+    #[test]
+    fn session_args_are_checked() {
+        let ok = vec![
+            "0123456789abcdef0123456789abcdef".to_string(),
+            "7788".to_string(),
+        ];
+        assert_eq!(
+            session_args(&ok),
+            Some(("0123456789abcdef0123456789abcdef", 7788))
+        );
+        assert_eq!(
+            session_args(&["x; rm -rf /".to_string(), "7788".to_string()]),
+            None
+        );
+        assert_eq!(session_args(&ok[..1]), None);
     }
 }
