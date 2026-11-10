@@ -1,8 +1,25 @@
-# piifence
+<div align="center">
+
+# 🔒 piifence
 
 **Keep your secrets out of your coding agent's prompts.**
 
-Coding agents send a lot to the model provider: your prompts, file contents, `.env` files, command output, logs. piifence is a small local proxy that sits between Claude Code and the provider. It finds secrets (API keys, tokens, passwords, private keys, credentials in connection strings) in every outgoing request and swaps each one for an environment variable name before the request leaves your machine. The real value stays on your machine, and commands the agent runs locally still get it.
+A small local proxy between Claude Code and the model provider. It finds API keys, tokens, passwords and private keys in every outgoing request and swaps each one for an environment variable name before the request leaves your machine.
+
+![macOS](https://img.shields.io/badge/platform-macOS%20(Apple%20Silicon)-lightgrey)
+![Claude Code](https://img.shields.io/badge/agent-Claude%20Code-d97757)
+![Runs locally](https://img.shields.io/badge/detection-100%25%20local-2ea44f)
+![Status](https://img.shields.io/badge/status-experimental-orange)
+
+[Install](#-install) · [Use](#-use) · [What it catches](#-what-it-catches) · [How it works](#-how-it-works) · [Configure](#-configure) · [Troubleshooting](#-troubleshooting) · [Limitations](#-limitations)
+
+</div>
+
+---
+
+## ✨ What it does
+
+Coding agents send a lot to the model provider: your prompts, file contents, `.env` files, command output and logs. piifence replaces every secret in that traffic with a name. The provider only ever sees the name, and the real value stays on your machine. Commands the agent runs locally still get the real value, so the agent can still do its job.
 
 ```text
 you type:       deploy with DATABASE_URL=postgres://admin:hunter2@db.internal/prod
@@ -12,19 +29,26 @@ provider sees:  deploy with DATABASE_URL=$PIIF_SECRET_1
 agent runs:     psql "$PIIF_SECRET_1" -c 'select 1'      # gets the real URL locally
 ```
 
-piifence looks for secrets only. Names, emails and other personal data are sent as they are.
+After each turn, Claude Code shows what was replaced. The notice has a masked preview and never the value itself:
 
-## Install
+```text
+piifence: replaced 1 secret(s) — DATABASE_CREDENTIAL×1 ($PIIF_SECRET_1 post…prod)
+```
 
-macOS only (the detector uses Apple's Accelerate framework). Needs [Homebrew](https://brew.sh); the installer adds Rust, git and gitleaks if they are missing.
+> [!NOTE]
+> piifence looks for **secrets only**. Names, emails and other personal data are sent as they are.
+
+## 📦 Install
+
+You need macOS on Apple Silicon and [Homebrew](https://brew.sh). The installer adds Rust, git and gitleaks if they are missing.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sandiiarov/piifence/main/scripts/install.sh | bash
 ```
 
-This builds piifence, installs it to `~/.local/bin`, and downloads the secret model (about 128 MB) to `~/.local/share/piifence/model`.
+The installer builds piifence, puts the `piifence` command in `~/.local/bin`, and downloads the secret model (about 128 MB, checked against pinned SHA-256 hashes) to `~/.local/share/piifence/model`. To install from a checkout instead, run `scripts/install.sh`.
 
-## Use
+## 🚀 Use
 
 Start Claude Code through piifence and tell it where your provider is:
 
@@ -32,46 +56,51 @@ Start Claude Code through piifence and tell it where your provider is:
 PIIF_UPSTREAM=https://api.anthropic.com piifence claude
 ```
 
-If you already set `ANTHROPIC_BASE_URL` in your shell or Claude Code settings, just run `piifence claude`. Every argument after `claude` goes to Claude Code as usual.
+If `ANTHROPIC_BASE_URL` is already set in your shell or in your Claude Code settings, run `piifence claude` without `PIIF_UPSTREAM`. Every argument after `claude` goes to Claude Code as usual, so `piifence claude -c` continues your last conversation.
 
-There is nothing to configure: every secret found is replaced. After each turn Claude Code lists the secrets found anywhere in the request, including your prompt, tool output and files, with a masked preview and never the value itself:
+There is nothing to switch on. Every secret found is replaced.
 
-```text
-piifence: replaced 1 secret(s) — DATABASE_CREDENTIAL×1 ($PIIF_SECRET_1 post…prod)
-```
+### How the agent works with a secret it can't see
 
-### How the agent uses a secret it can't see
-
-- **Anywhere in the request.** Your prompt, files, command output and `CLAUDE.md` reach the provider with each secret replaced by a name such as `$PIIF_SECRET_1`. What you see in Claude Code stays as it was: only what goes to the provider is changed.
-- **In commands.** Before every Bash command, Claude Code exports the session's `$PIIF_SECRET_*` variables with their real values, so `curl -H "Authorization: Bearer $PIIF_SECRET_1" …` works. The provider never gets the value.
-- **Printed back.** If a command prints a value, as `echo $PIIF_SECRET_1` would, piifence puts the variable's name back in its place before the output reaches the provider.
-- **What the agent is told.** When the session starts, the agent gets a short note: `$PIIF_*` names stand for real values kept on your machine, it can use them in Bash commands, and a value it sees as a name was not exposed. Without the note, an agent that sees `$PIIF_SECRET_1` in command output tends to warn you that a secret leaked.
-
-The gateway only serves `piifence claude` sessions: a messages request without the session id that `piifence claude` adds is refused.
-
-### Values it leaves alone
-
-The model sometimes calls a random-looking string a secret. piifence drops what the model finds when the whole value is an identifier, a hash, a path, a number or a plain word: UUIDs (including Claude Code's session ids in `~/.claude/projects/…`), git SHAs, image digests, `toolu_…` ids, AWS resource ids, `sed -n '885,1150p'` ranges, versions and timestamps. It also drops stand-in secrets such as `sk-...`, `YOUR_API_KEY` and `***`, anything under 4 characters, and any span with no letter or digit, such as a lone `{`. A value of one of those shapes is still replaced when a secret keyword comes right before it, as in `API_KEY=886dcfc3-…`. Known secret formats found by gitleaks are always replaced.
-
-If piifence still replaces a value of yours that is not a secret, list a regex for it in `~/.config/piifence/config.toml` (see `piifence.toml.example`):
-
-```toml
-allow = ['^PROJ-\d+$', '^build-[0-9a-f]{12}$']
-```
-
-## What it catches
-
-Three detectors run on every piece of text, and a value any of them finds is replaced:
-
-| Detector | Finds |
+| Where | What happens |
 |---|---|
-| [gitleaks](https://github.com/gitleaks/gitleaks) rules | known formats: AWS, GitHub, OpenAI, Anthropic, Stripe, Slack and many more, private keys, JWTs, passwords assigned in config files, credentials in URLs; also base64-encoded copies of these |
-| [cbx-secrets-detector-32M](https://huggingface.co/CobuildX-AI/cbx-secrets-detector-32M) | secrets with no known format, from context: an API key, access token, password, database or cloud credential, private or encryption key, or another secret. A 32M-parameter model that runs locally on the CPU |
-| key rule | a quoted random-looking value whose key, or the key of the block around it, names a secret: `"api_key": "…"`, `password: '…'`, the `default` of an HCL `variable "API_KEY"` |
+| **Your prompt, files, command output, `CLAUDE.md`** | They reach the provider with each secret replaced by a name such as `$PIIF_SECRET_1`. What you see in Claude Code doesn't change: only what goes to the provider does. |
+| **Bash commands** | Before every command, Claude Code exports the session's `$PIIF_SECRET_*` variables with their real values, so `curl -H "Authorization: Bearer $PIIF_SECRET_1" …` works. |
+| **Output that prints a value** | If a command prints a value, as `echo $PIIF_SECRET_1` would, piifence puts the name back before the output reaches the provider. |
+| **The agent's instructions** | When the session starts, the agent gets a short note: `$PIIF_*` names stand for real values kept on your machine, and a value it sees only as a name was not exposed. Without the note, an agent that sees `$PIIF_SECRET_1` in output tends to warn you that a secret leaked. |
 
-The model reads tool output the way a shell transcript shows it: `$ <command>` before Bash output, `$ cat <path>` before a file, and `VAR=` before the output of `echo $VAR`, so a bare value printed by a command is read with its name.
+> [!IMPORTANT]
+> The gateway serves only `piifence claude` sessions. Plain `claude` pointed at the gateway is refused, because its requests lack the session id that `piifence claude` adds.
 
-## How it works
+## 🔍 What it catches
+
+Three detectors read every piece of text. A value that any of them finds is replaced.
+
+| Detector | What it finds |
+|---|---|
+| 🧩 **[gitleaks](https://github.com/gitleaks/gitleaks) rules** | Known formats: AWS, GitHub, OpenAI, Anthropic, Stripe, Slack and many more, private keys, JWTs, passwords in config files, credentials in URLs, and base64-encoded copies of these. |
+| 🧠 **[cbx-secrets-detector-32M](https://huggingface.co/CobuildX-AI/cbx-secrets-detector-32M)** | Secrets with no known format, recognised from context: API keys, access tokens, passwords, database and cloud credentials, private and encryption keys. It is a 32M-parameter model that runs on your CPU. |
+| 🔑 **Key rule** | A quoted random-looking value whose key, or the key of the block around it, names a secret: `"api_key": "…"`, `password: '…'`, or the `default` of an HCL `variable "API_KEY"`. |
+
+The model reads tool output the way a terminal shows it: `$ <command>` before Bash output, `$ cat <path>` before a file, and `VAR=` before the output of `echo $VAR`. So a bare value that a command prints is read together with its name.
+
+<details>
+<summary><b>Values piifence leaves alone</b></summary>
+
+The model sometimes calls a random-looking string a secret. piifence drops a model finding when the whole value is one of these:
+
+- **Identifiers:** UUIDs (including Claude Code's session ids in `~/.claude/projects/…`), `toolu_…` ids, AWS resource ids.
+- **Hashes:** git SHAs, image digests.
+- **Paths, numbers and versions:** file paths, `sed -n '885,1150p'` ranges, versions, timestamps.
+- **Plain words.**
+- **Stand-ins:** `sk-...`, `YOUR_API_KEY`, `***`.
+- **Fragments:** anything under 4 characters, and anything with no letter or digit, such as a lone `{`.
+
+A value of one of these shapes is still replaced when a secret keyword comes right before it, as in `API_KEY=886dcfc3-…`. Known formats that gitleaks finds are always replaced.
+
+</details>
+
+## 🔬 How it works
 
 ```mermaid
 flowchart LR
@@ -87,10 +116,33 @@ flowchart LR
 
 `piifence claude` starts the gateway, gives the session a random id, and launches Claude Code with a temporary settings file and the notice plugin:
 
-- **The gateway**, a proxy on `127.0.0.1:7788`. It runs detection on every outgoing request (prompt, tool output, files, system prompt) and replaces each secret with its `$PIIF_SECRET_*` name. It keeps the values in memory and hands them only to the session they belong to.
-- **A `SessionStart` hook.** It gives the agent the note about `$PIIF_*` names, and adds one line to the file Claude Code sources before every Bash command (`CLAUDE_ENV_FILE`). That line runs `piifence env`, which fetches the session's values from the gateway and exports them.
+- **The gateway** is a proxy on `127.0.0.1:7788`. It scans every outgoing request (prompt, tool output, files, system prompt) and replaces each secret with its `$PIIF_SECRET_*` name. It keeps the values in memory and hands them only to the session they belong to.
+- **A `SessionStart` hook** gives the agent the note about `$PIIF_*` names. It also adds one line to the file that Claude Code loads before every Bash command (`CLAUDE_ENV_FILE`). That line runs `piifence env`, which fetches the session's values from the gateway and exports them.
 
-Inside the gateway, each piece of text goes through these steps:
+Here is what happens when the agent finds a secret in a file and then uses it:
+
+```mermaid
+sequenceDiagram
+    participant A as Agent (Claude Code)
+    participant G as piifence gateway
+    participant P as Provider
+    A->>G: tool output with GITHUB_TOKEN=ghp_…
+    G->>P: GITHUB_TOKEN=$PIIF_SECRET_1
+    P-->>A: run curl -H "Authorization: Bearer $PIIF_SECRET_1" …
+    A->>G: before the command: piifence env (this session)
+    G-->>A: export PIIF_SECRET_1='ghp_…'
+    A->>A: run the command with the real value
+```
+
+### Guarantees
+
+- 🏠 **Everything stays local.** Detection runs on your machine. Nothing is sent anywhere except the redacted request.
+- 🔁 **Names are stable.** The same value gets the same name on every turn, so the conversation stays consistent and prompt caching keeps working.
+- 🙈 **No raw values are stored.** Values live only in the gateway's memory and in the environment of the commands the agent runs. Logs and the notice hold only kinds, counts and masked previews.
+- 🚫 **It fails closed.** If a request can't be fully scanned, it is blocked, not sent. If the gateway can't start, Claude Code isn't launched.
+
+<details>
+<summary><b>Inside the gateway: the steps for each piece of text</b></summary>
 
 ```mermaid
 flowchart TD
@@ -107,41 +159,87 @@ flowchart TD
     union --> name["replace each with $PIIF_SECRET_N"]
 ```
 
-A secret the agent finds in a file goes through these steps:
+- **Each text is scanned once.** Claude Code sends the whole conversation on every turn. The gateway records what it found in each piece of text in `~/.cache/piifence/detections.jsonl`, so a resumed session doesn't scan its history again. The file holds a hash of each text with the positions and kinds found in it, never the text or the values. A new piifence build, model, allow list or gitleaks version starts an empty cache.
+- **Long text is scanned in pieces.** The model reads text in windows of 3,000 bytes, each with 500 more bytes of lookahead, so a value on a window edge is still seen whole. On an M4 CPU it reads about 19 KB of new text per second.
+- **If the gateway doesn't answer before a command,** `piifence env` prints an error and the command runs without the values.
 
-```mermaid
-sequenceDiagram
-    participant A as Agent (Claude Code)
-    participant G as piifence gateway
-    participant P as Provider
-    A->>G: tool output with GITHUB_TOKEN=ghp_…
-    G->>P: GITHUB_TOKEN=$PIIF_SECRET_1
-    P-->>A: run curl -H "Authorization: Bearer $PIIF_SECRET_1" …
-    A->>G: before the command: piifence env (this session)
-    G-->>A: export PIIF_SECRET_1='ghp_…'
-    A->>A: run the command with the real value
+</details>
+
+## 🔧 Configure
+
+piifence works with no configuration. There is one optional setting: if piifence keeps replacing a value of yours that isn't a secret, list a regex for it in `~/.config/piifence/config.toml`:
+
+```toml
+# Values matching any of these are never replaced.
+allow = ['^PROJ-\d+$', '^build-[0-9a-f]{12}$']
 ```
 
-Properties:
+`allow` is the only key. An unknown key or an invalid regex stops the gateway from starting, so a typo can't quietly change what gets replaced. See [`piifence.toml.example`](piifence.toml.example).
 
-- **Everything stays local.** Detection runs on your machine; nothing is sent anywhere except the redacted request.
-- **Stable names.** The same value gets the same name on every turn, so the conversation stays consistent and prompt caching keeps working.
-- **No raw values stored.** Values live only in the gateway's memory and in the environment of the commands the agent runs. Logs and the notice hold only kinds, counts and masked previews.
-- **Each text is scanned once.** Claude Code sends the whole conversation on every turn. The gateway remembers what it found in each piece of text in `~/.cache/piifence/detections.jsonl` (set `PIIF_CACHE_DIR` to move it), so a resumed session does not scan its history again. The file holds a hash of each text with the positions and kinds found in it, never the text or the values. A new piifence build, model, allow list or gitleaks version starts from an empty cache.
-- **Long text is scanned in pieces.** The model reads text in windows of 3,000 bytes, each with 500 more bytes of lookahead, so a value on a window edge is still seen whole. On an M4 CPU it reads about 19 KB of new text per second.
-- **Fails closed.** If a request cannot be scanned, it is blocked, not sent. If the gateway cannot start, Claude Code is not launched. If the gateway does not answer before a command, `piifence env` prints an error and the command runs without the values.
+<details>
+<summary><b>Environment variables</b></summary>
 
-## Limitations
+| Variable | Default | What it does |
+|---|---|---|
+| `PIIF_UPSTREAM` | `ANTHROPIC_BASE_URL` from your shell, then from Claude Code settings | The provider the gateway forwards to. |
+| `PIIF_PORT` | `7788` | The gateway's port on `127.0.0.1`. |
+| `PIIF_CONFIG` | `~/.config/piifence/config.toml` | The config file. |
+| `PIIF_DATA_DIR` | `~/.local/share/piifence` | Where the model and the notice plugin are installed. |
+| `PIIF_CACHE_DIR` | `~/.cache/piifence` | Where the detection cache is kept. |
+| `PIIF_GATEWAY_LOG` | `$TMPDIR/piifence-gateway.log` | The gateway's own log. |
+| `PIIF_AUDIT_LOG` | `/tmp/piifence-audit.log` | One line per replacement: kind, position, name and masked preview. |
+| `PIIF_AUDIT_BODY` | unset | Set to `1` to also log each rewritten request body. |
+| `PIIF_PREFIX` | `~/.local` | Install prefix, read by `install.sh`. |
 
-- Experimental. Use it as a safety net, not as your only protection.
-- Secrets only: personal data such as names, emails and phone numbers is sent as it is.
-- Input only: the agent works with variable names, and responses are not scanned or rewritten.
-- The gateway keeps the values behind the variables in memory only. If it restarts during a session, values get names again as they are found in the next requests, possibly with different numbers.
-- The agent can use every secret it comes across in commands, including sending it somewhere.
-- A secret that looks like an id, such as 32 hex characters with no keyword like `key` or `token` before it, is sent as is.
-- macOS only, and Claude Code is the only supported agent today.
+A value that is set but can't be parsed, such as `PIIF_PORT=abc`, is an error.
 
-## Development
+</details>
+
+## 🩺 Troubleshooting
+
+<details>
+<summary><b>Upgrading</b></summary>
+
+1. Quit every `piifence claude` session. `piifence claude` reuses a gateway that is already running, so an old gateway keeps serving until it stops.
+2. Run the install command again.
+3. Check that no old gateway is left with `pgrep -fl piifence-gateway`, and stop any you find with `pkill -f piifence-gateway`.
+
+</details>
+
+<details>
+<summary><b>The gateway doesn't start</b></summary>
+
+`piifence claude` prints the error and the path of the gateway log. Common causes:
+
+- **A config error**, such as `unknown field` or `invalid allow pattern`. Older versions had settings like `categories` and `auto_approve`, and those are now errors. Keep only `allow` in `~/.config/piifence/config.toml`, or delete the file.
+- **`no upstream configured`**: set `PIIF_UPSTREAM`, or `ANTHROPIC_BASE_URL` in your shell or Claude Code settings.
+- **`a gateway on … forwards to …`**: another session's gateway is using the port with a different provider. Quit that session, or set `PIIF_PORT` to a free port.
+
+</details>
+
+<details>
+<summary><b>Uninstalling</b></summary>
+
+```bash
+pkill -f piifence-gateway
+rm -rf ~/.local/bin/piifence ~/.local/libexec/piifence ~/.local/share/piifence ~/.cache/piifence ~/.config/piifence
+```
+
+piifence never edits `~/.claude/settings.json`, so there's nothing to undo in Claude Code.
+
+</details>
+
+## 🚧 Limitations
+
+- **It's experimental.** Use it as a safety net, not as your only protection.
+- **It covers secrets only.** Personal data such as names, emails and phone numbers is sent as it is.
+- **It rewrites input only.** The agent works with variable names, and responses aren't scanned or rewritten.
+- **Values live in memory only.** If the gateway restarts during a session, values get names again as they are found, possibly with different numbers.
+- **The agent can use every secret it comes across** in commands, including sending it somewhere.
+- **Secrets that look like ids get through.** For example, 32 hex characters with no keyword such as `key` or `token` before them are sent as they are.
+- **It runs on macOS only, with Claude Code only.**
+
+## 🧑‍💻 Development
 
 ```bash
 cargo build --release
@@ -149,8 +247,13 @@ scripts/fetch-weights.sh /tmp/piifence-model
 PIIF_MODEL_DIR=/tmp/piifence-model scripts/check.sh    # every check, including the secret suite
 ```
 
-`CLAUDE.md` describes the architecture and contracts. `tests/secrets/README.md` covers the end-to-end suite, and `docs/model-options.md` the model benchmarks behind the choice of model.
+| Doc | What's in it |
+|---|---|
+| [`CLAUDE.md`](CLAUDE.md) | Architecture, module ownership and contracts. |
+| [`tests/secrets/README.md`](tests/secrets/README.md) | The end-to-end secret suite: 943 cases through the real gateway. |
+| [`docs/model-options.md`](docs/model-options.md) | Why piifence uses cbx-secrets-detector-32M, with the benchmarks. |
+| [`plugin/piifence-notice/README.md`](plugin/piifence-notice/README.md) | The plugin that shows what was replaced. |
 
-## License
+## 📄 License
 
-No license yet: the code is all rights reserved until one is added.
+There is no license yet. The code is all rights reserved until one is added.
