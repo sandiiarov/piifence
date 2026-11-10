@@ -1,0 +1,25 @@
+{
+  "description": "piifence redaction notices: show what the gateway redacted, never the raw values",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/notice.py\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/notice.py\""
+          }
+        ]
+      }
+    ]
+  }
+}

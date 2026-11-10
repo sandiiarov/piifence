@@ -1,0 +1,27 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  check:
+    # candle is built with Apple's Accelerate BLAS, so this must be macOS.
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      PIIF_MODEL_DIR: /tmp/piifence-model
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: brew install gitleaks
+      - run: scripts/fetch-weights.sh "$PIIF_MODEL_DIR"
+      - run: scripts/check.sh

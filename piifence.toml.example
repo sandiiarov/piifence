@@ -1,0 +1,5 @@
+# piifence configuration. Copy to ~/.config/piifence/config.toml, or point PIIF_CONFIG at it.
+# No file means no exceptions. An unknown key or an invalid pattern stops the gateway.
+
+# Values that are never redacted, as regexes matched against each detected value. Use this for your own ids the detector mistakes for secrets. Anchor with ^…$ to match a whole value.
+allow = ['^PROJ-\d+$', '^build-[0-9a-f]{12}$']

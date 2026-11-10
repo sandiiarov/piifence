@@ -1,0 +1,59 @@
+# piifence
+
+## Purpose
+
+Local redaction gateway for Claude Code that keeps **secrets** (API keys, tokens, passwords, private keys, credentials) out of what is sent to the model provider. Secrets only: personal data is out of scope and is forwarded unchanged. One pipeline, no modes or switches: the secret model, gitleaks and the key rule always run, followed by the guards.
+
+## Ownership
+
+- Library (`src/lib.rs`):
+  - `src/model.rs`: cbx-secrets-detector-32M (ModernBERT, 12 secret labels, BIO tags) on candle with Accelerate. `SecretModel::load(dir)` reads `MODEL_FILES` (`config.json`, `model.safetensors`, `tokenizer.json`, `secrets_config.json`); `predict` errors on text over the model's position limit. Span rules (edge trimming, per-label `min_len` in characters) follow the model's Python reference `cbx_secrets.py` exactly; `bench/models/parity.py` checks that.
+  - `src/keyrule.rs`: a quoted random-looking value is a secret when its own key or the key of the block around it is secret-named. Blocks are tracked by indentation (pretty-printed JSON, YAML, TOML, HCL).
+  - `src/gitleaks.rs`: runs `gitleaks stdin` with `gitleaks.toml` (the default rules plus about twenty `piifence-*` rules), which is built into the binary (`include_str!`) and written to the cache dir at startup. `locate` returns every copy of a plain finding's secret, and for a decoded (base64) finding every encoded run on its line; a finding it cannot place is an error.
+  - `src/guards.rs`: `suppress` (every engine: env references such as `$PIIF_SECRET_1` or `os.environ[...]`, `path/file.ext:line` references, the user's `allow` list) and `suppress_model` (model spans also: no letter or digit, stand-ins such as `sk-...` or `***`, under 4 characters, code, and identifiers, hashes, paths, numbers or plain words unless a secret keyword comes right before or on the two lines above).
+  - `src/detect.rs`: `Detector::load(model_dir, allow, cache_dir)` and `detect(text)`: the model in 3,000-byte windows with 500 bytes of lookahead, a second model pass on a copy where long tokens glued to non-ASCII text are set apart (`isolate`), the key rule and gitleaks; guards; overlapping spans unioned. `DetectedSpan.source` is `model:<LABEL>`, `keyrule` or `gitleaks:<rule>`.
+  - `src/cache.rs`: final detections per text, keyed by SHA-256 of a fingerprint (format, binary stamp, allow list, model files, gitleaks version) plus the text, kept in memory and appended to `<cache dir>/detections.jsonl` (dir 0700, file 0600, compacted past 32 MB). Entries hold offsets, sources and suppression reasons only, never text or values. An unreadable line or a failed write is an error.
+  - `src/config.rs`: `$PIIF_CONFIG`, else `~/.config/piifence/config.toml`; one key, `allow` (regexes). No file means no exceptions; an unknown key or invalid pattern is an error. `piifence.toml.example` is the tracked example.
+- Gateway (`src/bin/gateway.rs`, binary `piifence-gateway`): see the contract below.
+- Launcher (`src/bin/piifence.rs`, binary `piifence`): `piifence claude`, `piifence session-start`, `piifence env`.
+- Notice plugin: `plugin/piifence-notice/` (hooks plus `scripts/notice.py`), loaded by `piifence claude` with `--plugin-dir`.
+- Installer and scripts: `scripts/install.sh` (macOS; binaries in `$PREFIX/libexec/piifence`, model and plugin in `$PREFIX/share/piifence`, a wrapper in `$PREFIX/bin/piifence` that sets `PIIF_DATA_DIR`), `scripts/fetch-weights.sh <dir>` (pinned revision, SHA-256 checked), `scripts/check.sh`.
+- Tests: `tests/secrets/` (end-to-end suite), unit tests in each module. Bench: `bench/models/`, `examples/model_spans.rs`, `examples/guard_filter.rs`. Results: `docs/model-options.md`.
+
+## Local Contracts
+
+- **No fallbacks.** A missing file, an unset required variable, an unparsable value, a failed write or a finding that cannot be placed is an error, never a silent default or a degraded mode. Defaults are allowed only for optional settings with one documented value (`PIIF_PORT` 7788, `PIIF_DATA_DIR` `~/.local/share/piifence`, `PIIF_CACHE_DIR` `~/.cache/piifence`, the audit log path), and a set value that does not parse is an error.
+- Build: `cargo build --release` (Apple Silicon, candle with Accelerate, CPU).
+- Gateway:
+  - Env: `PIIF_UPSTREAM` and `PIIF_MODEL_DIR` required; `PIIF_PORT`, `PIIF_AUDIT_LOG` (`/tmp/piifence-audit.log`), `PIIF_AUDIT_BODY=1` (also log rewritten bodies), `PIIF_CACHE_DIR`. gitleaks must be on PATH.
+  - **Input only, the only mode.** It redacts `POST /v1/messages` and `/v1/messages/count_tokens` and streams the upstream response back byte for byte (no buffering, no SSE parsing, no replacing names back). Other `POST /v1/messages/*` shapes are refused. Fails closed: a request that cannot be fully scanned is answered 502 and not forwarded.
+  - Every content block type that can carry text is routed through `redact_block`; a new block type is added there and nowhere else. Thinking blocks and images are never touched.
+  - Model context: a `tool_result` is scanned with its tool call in front as a shell transcript (`tool_result_context`): `$ <command>\n` for Bash, `VAR=` for `echo $VAR`, `$ cat <path>\n` for Read, `Tool call: <name> <input JSON>\nTool output:\n` for other tools. Bash-mode output (`<bash-input>` / `<bash-stdout>` tags) gets the same shell context. Only spans inside the text itself are replaced.
+  - Sessions: `piifence claude` gives each session a random 32-hex id, which Claude Code sends as `x-piifence-session` (via `ANTHROPIC_CUSTOM_HEADERS`, merged with the user's). A messages request or `/control/*` call without a valid id gets 403. The header is stripped before forwarding.
+  - Names: every secret becomes `$PIIF_SECRET_<N>`, numbered once per value per session, so history is rewritten identically every turn. Values live in memory only. Before detection, every known value of the session is replaced with its name in all provider-bound text (audit engine `env`); a value under 16 characters only as a whole token (`WHOLE_TOKEN_BELOW`). `GET /control/env` returns the session's names and values, for `piifence env`.
+  - Hardening: binds loopback; rejects requests with an `Origin` header or a non-loopback `Host`; 64 MB body limit; audit logs created 0600; tool input in the model context is cut to 800 bytes on a char boundary.
+  - Audit log and `/stats` hold metadata only: field, kind (model label, gitleaks rule or `keyrule`), engine, offsets, name, and a masked first4+last4 `preview`. `/stats` has counters, `by_kind`, `redact_ms_*`, and `recent` first sightings only.
+- Launcher:
+  - `piifence claude` resolves the upstream from `PIIF_UPSTREAM`, else the shell's `ANTHROPIC_BASE_URL`, else Claude Code settings `env.ANTHROPIC_BASE_URL` (no default provider; a value pointing at our own gateway is ignored). It reuses a running gateway only when its `/health` reports the same upstream. It starts `piifence-gateway` from next to its own real path with `PIIF_MODEL_DIR=$PIIF_DATA_DIR/model`, and refuses to launch Claude Code if the gateway does not become healthy. It passes `--settings` (a 0600 `create_new` temp file with `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS` and the `SessionStart` hook) and `--plugin-dir $PIIF_DATA_DIR/plugin/piifence-notice`, rejects a user `--settings`, and never edits `~/.claude/settings.json`.
+  - `piifence session-start <session> <port>` returns `VARIABLES_NOTE` as `additionalContext` and appends `eval "$(piifence env <session> <port>)"` to `CLAUDE_ENV_FILE`; it exits non-zero when that is impossible. `piifence env` prints `export PIIF_SECRET_<N>='…'` lines and exits non-zero with an error if the gateway does not answer.
+  - The note is hook context, not a system-prompt section: an organization's policy plugin (`cc-plugin-sec-default`) skips user plugins' `prompt.compose` hooks; do not work around that. Nothing rewrites transcript rows: only provider-bound input is redacted.
+- Notice plugin: metadata only, never raw values. `PIIF_GATEWAY_URL` is required; a gateway that does not answer is an error the hook reports. It reports only values replaced for the first time.
+- Never commit a Claude Code test settings file, an auth token or model weights.
+
+## Work Guidance
+
+- Keep the dependency list to what `Cargo.toml` has; justify additions.
+- A guard needs a failing suite case or unit test, a `Suppression` reason, and a unit test. Guards decide keep or drop only; they do not move span boundaries.
+- Probe the model on a string with `cargo run --release --example model_spans <model dir>` (JSONL `{"text": …}` on stdin, byte spans out).
+
+## Verification
+
+- `scripts/check.sh` runs every check; CI (`.github/workflows/ci.yml`) fetches the model and runs it on every push to main and every pull request. It needs `PIIF_MODEL_DIR` unless given `--no-suite`. A new check is added to the script, not to the workflow.
+- `cargo fmt --check`, `cargo clippy --release --all-targets -- -D warnings`, `cargo test --release`.
+- `python3 -I tests/secrets/run.py --model-dir <model>` runs the end-to-end secret suite (formats × Claude Code request locations, plus negatives) through the real gateway, one session per case. It must exit 0. Known gaps are listed in `tests/secrets/expectations.json`; a change that fixes one must remove its entry. Baseline 2026-11-09: 940/943, 0 false positives, 3 known leaks. `--check-generators` checks each generated format against the gitleaks rules it lists; `--self-test` checks the checks. `tests/secrets/stats_check.py` checks `/stats` and the notice.
+- `bench/models/` compares secret models on the suite cases without the gateway (`setup.sh` downloads pinned models into `$PIIF_BENCH_DIR`, default `~/.cache/piifence/bench`; `shootout.py` scores engines; `speed.py` times the Python references; `parity.py` checks the Rust port against `cbx_secrets.py`). Not part of `scripts/check.sh`.
+- End-to-end: `piifence claude --version` (smoke) and a real `piifence claude -p ...` run; verify the upstream-visible request has `$PIIF_SECRET_*` names, the Stop notice lists the replacement, raw values appear in no log, and the gateway process is gone after exit.
+
+## Child DOX Index
+
+- (none)
