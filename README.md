@@ -66,7 +66,7 @@ There is nothing to switch on. Every secret found is replaced.
 |---|---|
 | **Your prompt, files, command output, `CLAUDE.md`** | They reach the provider with each secret replaced by a name such as `$PIIF_SECRET_1`. What you see in Claude Code doesn't change: only what goes to the provider does. |
 | **Bash commands** | Before every command, Claude Code exports the session's `$PIIF_SECRET_*` variables with their real values, so `curl -H "Authorization: Bearer $PIIF_SECRET_1" …` works, and so does any script the command starts. |
-| **Files the agent writes, edits and other tool calls** | No shell expands a name in a file's contents or in an MCP tool's arguments. So before any tool other than Bash runs, piifence puts the real value in place of each name in the tool's input. A file the agent writes holds the value, an edit matches a file that holds one, and a Slack or GitHub tool gets the real id or token. Your permission prompts still apply, and they show the real value. |
+| **Files the agent writes, edits and other tool calls** | No shell expands a name in a file's contents or in an MCP tool's arguments. So before any tool other than Bash runs, piifence puts the real value in place of each name in the tool's input. A file the agent writes holds the value, an edit matches a file that holds one, and a Slack or GitHub tool gets the real id or token. The value stays on your machine: Claude Code keeps the tool call in the conversation as the agent wrote it, with the name, and if the value comes back in a later tool result, the gateway replaces it with its name again. Your permission prompts still apply, and they show the real value. |
 | **Output that prints a value** | If a command prints a value, as `echo $PIIF_SECRET_1` would, piifence puts the name back before the output reaches the provider. |
 | **The agent's instructions** | When the session starts, the agent gets a short note: `$PIIF_*` names stand for real values kept on your machine, and a value it sees only as a name was not exposed. Without the note, an agent that sees `$PIIF_SECRET_1` in output tends to warn you that a secret leaked. |
 
@@ -140,7 +140,8 @@ sequenceDiagram
 
 - 🏠 **Everything stays local.** Detection runs on your machine. Nothing is sent anywhere except the redacted request.
 - 🔁 **Names are stable.** The same value gets the same name on every turn, so the conversation stays consistent and prompt caching keeps working.
-- 🙈 **No raw values are stored.** Values live only in the gateway's memory and in the environment of the commands the agent runs. Logs and the notice hold only kinds, counts and masked previews.
+- 🙈 **No raw values are stored by piifence.** Values live only in the gateway's memory, in the environment of the commands the agent runs, and in the tool inputs the `PreToolUse` hook fills in on your machine. Logs and the notice hold only kinds, counts and masked previews.
+- 🛡️ **A value put back never goes out.** Before detection, the gateway replaces every value it has named in the session with its name, everywhere in the request. So a value that comes back in a file the agent reads, or in command output, leaves your machine as its name.
 - 🚫 **It fails closed.** If a request can't be fully scanned, it is blocked, not sent. If the gateway can't start, Claude Code isn't launched.
 
 <details>
