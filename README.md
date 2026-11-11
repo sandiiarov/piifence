@@ -65,7 +65,8 @@ There is nothing to switch on. Every secret found is replaced.
 | Where | What happens |
 |---|---|
 | **Your prompt, files, command output, `CLAUDE.md`** | They reach the provider with each secret replaced by a name such as `$PIIF_SECRET_1`. What you see in Claude Code doesn't change: only what goes to the provider does. |
-| **Bash commands** | Before every command, Claude Code exports the session's `$PIIF_SECRET_*` variables with their real values, so `curl -H "Authorization: Bearer $PIIF_SECRET_1" …` works. |
+| **Bash commands** | Before every command, Claude Code exports the session's `$PIIF_SECRET_*` variables with their real values, so `curl -H "Authorization: Bearer $PIIF_SECRET_1" …` works, and so does any script the command starts. |
+| **Files the agent writes, edits and other tool calls** | No shell expands a name in a file's contents or in an MCP tool's arguments. So before any tool other than Bash runs, piifence puts the real value in place of each name in the tool's input. A file the agent writes holds the value, an edit matches a file that holds one, and a Slack or GitHub tool gets the real id or token. Your permission prompts still apply, and they show the real value. |
 | **Output that prints a value** | If a command prints a value, as `echo $PIIF_SECRET_1` would, piifence puts the name back before the output reaches the provider. |
 | **The agent's instructions** | When the session starts, the agent gets a short note: `$PIIF_*` names stand for real values kept on your machine, and a value it sees only as a name was not exposed. Without the note, an agent that sees `$PIIF_SECRET_1` in output tends to warn you that a secret leaked. |
 
@@ -118,6 +119,7 @@ flowchart LR
 
 - **The gateway** is a proxy on `127.0.0.1:7788`. It scans every outgoing request (prompt, tool output, files, system prompt) and replaces each secret with its `$PIIF_SECRET_*` name. It keeps the values in memory and hands them only to the session they belong to.
 - **A `SessionStart` hook** gives the agent the note about `$PIIF_*` names. It also adds one line to the file that Claude Code loads before every Bash command (`CLAUDE_ENV_FILE`). That line runs `piifence env`, which fetches the session's values from the gateway and exports them.
+- **A `PreToolUse` hook** runs `piifence restore` before every other tool call. When the tool's input holds a `$PIIF_SECRET_*` name, it fetches the session's values and puts each value in place of its name. If the gateway doesn't answer or a name is unknown, the hook blocks the call instead of letting the tool run with a name where a value belongs.
 
 Here is what happens when the agent finds a secret in a file and then uses it:
 

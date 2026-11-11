@@ -5,7 +5,7 @@
 //!
 //! It starts the gateway if it is not already healthy (upstream derived from the user's current Claude Code settings), points this Claude Code session at it with a temporary `--settings` override, runs Claude Code, then tears the gateway down if this process started it. The user's settings file is never modified.
 //!
-//! The override also adds a `SessionStart` hook, `piifence session-start`. It tells the agent what `$PIIF_SECRET_<N>` names are, and adds a line to Claude Code's `CLAUDE_ENV_FILE`, which Claude Code sources before every Bash command. That line runs `piifence env`, which exports this session's values from the gateway, so a command that names `$PIIF_SECRET_1` gets the real value.
+//! The override also adds two hooks. `SessionStart` runs `piifence session-start`: it tells the agent what `$PIIF_SECRET_<N>` names are, and adds a line to Claude Code's `CLAUDE_ENV_FILE`, which Claude Code sources before every Bash command. That line runs `piifence env`, which exports this session's values from the gateway, so a command that names `$PIIF_SECRET_1` gets the real value. `PreToolUse` runs `piifence restore` on every other tool call: it puts the real values into the tool's input, so a file the agent writes or an MCP argument holds the value, not the name.
 //!
 //! Files: `$PIIF_DATA_DIR` (default `~/.local/share/piifence`, which `scripts/install.sh` sets) holds `model/` (the secret model) and `plugin/piifence-notice` (the notice plugin). The gateway binary sits next to this one.
 
@@ -30,6 +30,7 @@ fn main() {
         // Run by Claude Code, not by people: the hook and the line it writes.
         Some("session-start") => session_start(&args[1..]),
         Some("env") => print_env(&args[1..]),
+        Some("restore") => restore(&args[1..]),
         Some("-h") | Some("--help") | Some("help") | None => {
             usage();
             Ok(0)
@@ -300,13 +301,17 @@ fn custom_headers(session_id: &str) -> Result<String> {
     )
 }
 
-/// The `SessionStart` hook that sets the session up: `piifence session-start <session> <port>`, by this binary's real path.
-fn session_start_hook(port: u16, session_id: &str) -> Result<serde_json::Value> {
-    let exe = real_exe()?;
+/// The session's hooks, run by this binary's real path: `SessionStart` (`piifence session-start <session> <port>`) sets the session up, and `PreToolUse` (`piifence restore <session> <port>`, every tool) puts real values back into tool input.
+fn session_hooks(port: u16, session_id: &str) -> Result<serde_json::Value> {
+    let exe = shell_quote(&real_exe()?.to_string_lossy());
     Ok(serde_json::json!({
         "SessionStart": [{"hooks": [{
             "type": "command",
-            "command": format!("{} session-start {session_id} {port}", shell_quote(&exe.to_string_lossy())),
+            "command": format!("{exe} session-start {session_id} {port}"),
+        }]}],
+        "PreToolUse": [{"matcher": "*", "hooks": [{
+            "type": "command",
+            "command": format!("{exe} restore {session_id} {port}"),
         }]}]
     }))
 }
@@ -322,7 +327,7 @@ fn write_settings_override(gateway_url: &str, port: u16, session_id: &str) -> Re
                 "ANTHROPIC_BASE_URL": gateway_url,
                 "ANTHROPIC_CUSTOM_HEADERS": custom_headers(session_id)?,
             },
-            "hooks": session_start_hook(port, session_id)?,
+            "hooks": session_hooks(port, session_id)?,
         })
     );
     fs::OpenOptions::new()
@@ -340,7 +345,8 @@ const VARIABLES_NOTE: &str = "# piifence environment variables
 
 This session runs through piifence, which keeps secrets (API keys, tokens, passwords, private keys) from reaching you. Before anything is sent to you (the user's prompts, command output, file contents), piifence replaces each secret with an environment variable name such as `$PIIF_SECRET_1`. The real value stays on the user's machine.
 
-- Use the name in Bash commands, quoted, where you would use the value: `curl -H \"Authorization: Bearer $PIIF_SECRET_1\" …`. piifence sets the variables before each command runs, so the name expands to the real value.
+- Use the name in Bash commands, inside double quotes, where you would use the value: `curl -H \"Authorization: Bearer $PIIF_SECRET_1\" …`. piifence exports the variables before each command runs, so the shell expands the name, and scripts the command starts can read the variable too. Single quotes and quoted heredocs (`<<'EOF'`) stop the shell from expanding it.
+- Everywhere else, write the name where the value belongs: in file contents (Write, Edit), in an edit's old text, and in arguments to other tools (MCP tools, for example). piifence puts the real value in before the tool runs, so a file you write holds the value and an edit matches the file.
 - Files, environment variables and command output on the user's machine hold the real value; only what is sent to you shows the name. A value you see as a `$PIIF_…` name was not exposed to you or the provider: do not warn that it leaked or suggest rotating it on that account.
 - When a command prints a value, you see its name again: `echo $PIIF_SECRET_1` shows you `$PIIF_SECRET_1` although the variable holds the real value. Do not conclude from that that the variable is wrong or holds its own name, and do not try to print, decode or otherwise reveal the values.";
 
@@ -398,6 +404,117 @@ fn session_start(args: &[String]) -> Result<i32> {
 /// `piifence env <session> <port>`: this session's values from the gateway as `export NAME='value'` lines, for the `eval` Claude Code runs before every Bash command. A gateway that does not answer is an error on stderr; the command then runs without the values.
 fn print_env(args: &[String]) -> Result<i32> {
     let (session, port) = session_args(args)?;
+    print!("{}", export_lines(&session_values(session, port)?));
+    Ok(0)
+}
+
+/// Tools whose input a shell reads, which expands `$PIIF_SECRET_<N>` itself from the exported variables. Putting a raw value into a command would break its quoting.
+const SHELL_TOOLS: &[&str] = &["Bash", "PowerShell", "Monitor"];
+
+/// `piifence restore <session> <port>`, the `PreToolUse` hook. The agent only ever sees names, so it writes `$PIIF_SECRET_<N>` into file contents, edits, and MCP tool arguments, where no shell expands it. This puts each known name's real value back into the tool's input before the tool runs. Shell tools and inputs without a name are left alone. A failure exits 2, which blocks the call, so a tool never runs with a name where a value belongs.
+fn restore(args: &[String]) -> Result<i32> {
+    match restored_input(args) {
+        Ok(Some(input)) => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": input}
+                })
+            );
+            Ok(0)
+        }
+        Ok(None) => Ok(0),
+        Err(err) => {
+            eprintln!("piifence: cannot put secret values back into this tool call: {err:#}");
+            Ok(2)
+        }
+    }
+}
+
+/// The hook's tool input with names replaced by values, or None when nothing changes.
+fn restored_input(args: &[String]) -> Result<Option<serde_json::Value>> {
+    let (session, port) = session_args(args)?;
+    let mut input = String::new();
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .context("read the hook input")?;
+    let hook: serde_json::Value =
+        serde_json::from_str(&input).context("the hook input is not JSON")?;
+    let tool = hook["tool_name"]
+        .as_str()
+        .context("the hook input has no tool_name")?;
+    if SHELL_TOOLS.contains(&tool) {
+        return Ok(None);
+    }
+    let mut tool_input = hook
+        .get("tool_input")
+        .context("the hook input has no tool_input")?
+        .clone();
+    if !names_in(&tool_input) {
+        return Ok(None);
+    }
+    let values = session_values(session, port)?;
+    fill_values(&mut tool_input, &values)?;
+    Ok(Some(tool_input))
+}
+
+/// `$PIIF_SECRET_12` or `${PIIF_SECRET_12}`; the number is read whole, so `_1` never matches inside `_12`.
+fn name_pattern() -> regex::Regex {
+    regex::Regex::new(r"\$(?:\{PIIF_SECRET_(\d+)\}|PIIF_SECRET_(\d+))").expect("valid pattern")
+}
+
+/// Whether any string in `value` holds a name.
+fn names_in(value: &serde_json::Value) -> bool {
+    let pattern = name_pattern();
+    let mut stack = vec![value];
+    while let Some(value) = stack.pop() {
+        match value {
+            serde_json::Value::String(s) if pattern.is_match(s) => return true,
+            serde_json::Value::Array(items) => stack.extend(items),
+            serde_json::Value::Object(map) => stack.extend(map.values()),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Replace every name in every string of `value` with its value. A name this session does not have is an error.
+fn fill_values(
+    value: &mut serde_json::Value,
+    values: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    let pattern = name_pattern();
+    let mut stack = vec![value];
+    while let Some(value) = stack.pop() {
+        match value {
+            serde_json::Value::String(s) => {
+                let mut missing = None;
+                let filled = pattern.replace_all(s, |caps: &regex::Captures| {
+                    let number = caps.get(1).or(caps.get(2)).map_or("", |m| m.as_str());
+                    let name = format!("PIIF_SECRET_{number}");
+                    match values.get(&name).and_then(|v| v.as_str()) {
+                        Some(real) => real.to_string(),
+                        None => {
+                            missing.get_or_insert(name);
+                            caps[0].to_string()
+                        }
+                    }
+                });
+                if let Some(name) = missing {
+                    bail!("this session has no value for ${name}");
+                }
+                *s = filled.into_owned();
+            }
+            serde_json::Value::Array(items) => stack.extend(items.iter_mut()),
+            serde_json::Value::Object(map) => stack.extend(map.values_mut()),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// This session's `{name: value}` map from the gateway's `/control/env`.
+fn session_values(session: &str, port: u16) -> Result<serde_json::Map<String, serde_json::Value>> {
     let response = http_get(
         port,
         "/control/env",
@@ -416,11 +533,10 @@ fn print_env(args: &[String]) -> Result<i32> {
     }
     let json: serde_json::Value =
         serde_json::from_str(body).context("the gateway sent invalid JSON")?;
-    let values = json["values"]
+    json["values"]
         .as_object()
-        .context("the gateway's reply has no `values`")?;
-    print!("{}", export_lines(values));
-    Ok(0)
+        .cloned()
+        .context("the gateway's reply has no `values`")
 }
 
 /// `export NAME='value'` for each `PIIF_SECRET_<N>` name; anything else is skipped, as is a value with a NUL byte, which a shell variable cannot hold.
@@ -446,6 +562,45 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fill_values_replaces_names_in_every_string() {
+        let values = serde_json::json!({"PIIF_SECRET_1": "one", "PIIF_SECRET_12": "twelve"});
+        let values = values.as_object().unwrap();
+        let mut input = serde_json::json!({
+            "file_path": "/tmp/a.py",
+            "content": "a = \"$PIIF_SECRET_1\"\nb = \"$PIIF_SECRET_12\"\nc = \"${PIIF_SECRET_1}x\"",
+            "edits": [{"old_string": "k=$PIIF_SECRET_12", "replace_all": false}],
+            "n": 3,
+        });
+        assert!(names_in(&input));
+        fill_values(&mut input, values).unwrap();
+        assert_eq!(
+            input,
+            serde_json::json!({
+                "file_path": "/tmp/a.py",
+                "content": "a = \"one\"\nb = \"twelve\"\nc = \"onex\"",
+                "edits": [{"old_string": "k=twelve", "replace_all": false}],
+                "n": 3,
+            })
+        );
+        assert!(!names_in(&input));
+    }
+
+    #[test]
+    fn fill_values_rejects_an_unknown_name() {
+        let values = serde_json::json!({"PIIF_SECRET_1": "one"});
+        let mut input = serde_json::json!({"content": "$PIIF_SECRET_1 $PIIF_SECRET_2"});
+        let err = fill_values(&mut input, values.as_object().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("PIIF_SECRET_2"));
+    }
+
+    #[test]
+    fn names_in_ignores_other_variables() {
+        assert!(!names_in(
+            &serde_json::json!({"command": "echo $HOME $PIIF_SECRET_X"})
+        ));
+    }
 
     #[test]
     fn export_lines_quote_values_and_skip_other_names() {
