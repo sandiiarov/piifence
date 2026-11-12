@@ -3,10 +3,15 @@ import type { EngineInterface, Register } from 'claude-code'
 const NAME = /\$\{(PIIF_SECRET_\d+)\}|\$(PIIF_SECRET_\d+)/g
 const EXPORT = /^export (PIIF_SECRET_\d+)='((?:[^']|'\\'')*)'$/gm
 const RELOAD_AFTER_MS = 2000
+const RETRY_MS = 1000
+const RETRIES = 30
 
 let values = new Map<string, string>()
 let loadedAt = -Infinity
 let loading: Promise<void> | undefined
+let retryPending = false
+const waiting = new Set<string>()
+const misses = new Map<string, number>()
 
 export function parseExports(stdout: string): Map<string, string> {
   const found = new Map<string, string>()
@@ -58,7 +63,35 @@ async function load($: EngineInterface): Promise<void> {
   const run = await $.process.run(['piifence', 'env', session.id, session.port], {
     timeoutMs: 5000,
   })
-  if (run.exitCode === 0) values = parseExports(run.stdout)
+  if (run.exitCode !== 0) return
+  const fresh = parseExports(run.stdout)
+  const grew = [...fresh.keys()].some(name => !values.has(name))
+  values = fresh
+  if (grew) $.ui.invalidate('ui.render')
+}
+
+function refresh($: EngineInterface): Promise<void> {
+  loading ??= load($).finally(() => {
+    loading = undefined
+  })
+  return loading
+}
+
+function retryMissing($: EngineInterface, names: string[]): void {
+  for (const name of names) {
+    if (!values.has(name) && (misses.get(name) ?? 0) < RETRIES) waiting.add(name)
+  }
+  if (retryPending || waiting.size === 0) return
+  retryPending = true
+  $.clock.after(RETRY_MS, () => {
+    retryPending = false
+    const retried = [...waiting]
+    waiting.clear()
+    for (const name of retried) misses.set(name, (misses.get(name) ?? 0) + 1)
+    void refresh($)
+      .catch(() => undefined)
+      .then(() => retryMissing($, retried))
+  })
 }
 
 async function valuesFor($: EngineInterface, text: string): Promise<Map<string, string> | undefined> {
@@ -68,11 +101,10 @@ async function valuesFor($: EngineInterface, text: string): Promise<Map<string, 
   const now = await $.clock.now()
   if (names.some(name => !values.has(name)) && now - loadedAt > RELOAD_AFTER_MS) {
     loadedAt = now
-    loading ??= load($).finally(() => {
-      loading = undefined
-    })
+    void refresh($)
   }
-  await loading
+  await loading?.catch(() => undefined)
+  if (names.some(name => !values.has(name))) retryMissing($, names)
   return values
 }
 
