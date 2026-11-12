@@ -7,7 +7,7 @@
 //!
 //! The override also adds two hooks. `SessionStart` runs `piifence session-start`: it tells the agent what `$PIIF_SECRET_<N>` names are, sends the gateway Claude Code's conversation id so a resumed conversation gets its old names back, and adds a line to Claude Code's `CLAUDE_ENV_FILE`, which Claude Code sources before every Bash command. That line runs `piifence env`, which exports this session's values from the gateway, so a command that names `$PIIF_SECRET_1` gets the real value. `PreToolUse` runs `piifence restore` on every tool call: it puts the real values into the tool's input, so a file the agent writes or an MCP argument holds the value, not the name; a backslash before a name's `$` counts as part of the name. In Bash and Monitor commands it fills in only the names the shell would not expand (single quotes, quoted heredocs, an escaped `$`), escaped for where they stand; PowerShell is skipped.
 //!
-//! Files: `$PIIF_DATA_DIR` (default `~/.local/share/piifence`, which `scripts/install.sh` sets) holds `model/` (the secret model) and `plugin/piifence-notice` (the notice plugin). The gateway binary sits next to this one. The hooks and the notice plugin reach the gateway on its control socket, `$PIIF_STATE_DIR/run/<port>.sock` (state dir `~/.local/state/piifence` by default), in a directory only the user can open; the gateway hands out no session data on TCP.
+//! Files: `$PIIF_DATA_DIR` (default `~/.local/share/piifence`, which `scripts/install.sh` sets) holds `model/` (the secret model) and `plugin/`, piifence's Claude Code plugins (`piifence-notice`, the notice, and `piifence-reveal`, which draws values in place of names on screen). The gateway binary sits next to this one. The hooks and the notice plugin reach the gateway on its control socket, `$PIIF_STATE_DIR/run/<port>.sock` (state dir `~/.local/state/piifence` by default), in a directory only the user can open; the gateway hands out no session data on TCP.
 
 use std::env;
 use std::ffi::OsStr;
@@ -129,7 +129,7 @@ fn run_claude(args: &[String]) -> Result<i32> {
     let port = port()?;
     let gateway_url = format!("http://127.0.0.1:{port}");
     let data = data_dir()?;
-    let plugin = existing(data.join("plugin/piifence-notice"), "the notice plugin")?;
+    let plugin = plugins(&data)?;
     let upstream = resolve_upstream(&gateway_url)?.context(
         "no upstream configured: set PIIF_UPSTREAM to your provider's base URL, or ANTHROPIC_BASE_URL in your shell or Claude settings",
     )?;
@@ -147,6 +147,13 @@ fn run_claude(args: &[String]) -> Result<i32> {
         false,
         &claude,
     )
+}
+
+/// The folder that holds piifence's Claude Code plugins, `plugin/` in `data`, after checking both are there. `--plugin-dir` loads each child of it.
+fn plugins(data: &Path) -> Result<PathBuf> {
+    existing(data.join("plugin/piifence-notice"), "the notice plugin")?;
+    existing(data.join("plugin/piifence-reveal"), "the reveal plugin")?;
+    Ok(data.join("plugin"))
 }
 
 /// Make sure a gateway that forwards to `upstream` runs on `port`, starting one if none answers, and lease it so it keeps running while this launcher does. A gateway that is shutting down is waited out and replaced. The launcher never stops a gateway: one it started exits by itself after the last lease ends.
@@ -259,7 +266,7 @@ fn start_gateway(data: &Path, port: u16, socket: &Path, upstream: &str) -> Resul
     Ok(())
 }
 
-/// Run Claude Code against the gateway with the session's settings override and the notice plugin. Returns Claude Code's exit code.
+/// Run Claude Code against the gateway with the session's settings override and piifence's plugins. Returns Claude Code's exit code.
 #[allow(clippy::too_many_arguments)]
 fn run_session(
     gateway_url: &str,
@@ -730,10 +737,7 @@ fn run_nested_claude(args: &[String]) -> Result<i32> {
     session_values(&session, port).context(
         "the piifence gateway for this session does not answer, so a claude started here would run without piifence's hooks",
     )?;
-    let plugin = existing(
-        data_dir()?.join("plugin/piifence-notice"),
-        "the notice plugin",
-    )?;
+    let plugin = plugins(&data_dir()?)?;
     run_session(
         &format!("http://127.0.0.1:{port}"),
         port,

@@ -12,6 +12,7 @@
 #   libexec/piifence/                     the piifence and piifence-gateway binaries
 #   share/piifence/model/                 the secret model (SporeLabs Scrub, about 70 MB)
 #   share/piifence/plugin/piifence-notice the Claude Code notice plugin
+#   share/piifence/plugin/piifence-reveal the plugin that draws values in place of names
 set -euo pipefail
 
 if [ "$(uname -s)" != "Darwin" ]; then
@@ -79,8 +80,10 @@ for bin in piifence piifence-gateway; do
   rm -f "$LIBEXEC/$bin"
   cp "$REPO/target/release/$bin" "$LIBEXEC/$bin"
 done
-rm -rf "$SHARE/plugin/piifence-notice"
-cp -R "$REPO/plugin/piifence-notice" "$SHARE/plugin/"
+for plugin in piifence-notice piifence-reveal; do
+  rm -rf "$SHARE/plugin/$plugin"
+  cp -R "$REPO/plugin/$plugin" "$SHARE/plugin/"
+done
 bash "$REPO/scripts/fetch-weights.sh" "$SHARE/model"
 
 cat > "$PREFIX/bin/piifence" <<EOF

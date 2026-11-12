@@ -49,5 +49,6 @@ class Piifence < Formula
     assert_path_exists libexec/"bin/piifence-gateway"
     assert_path_exists pkgshare/"model/model.safetensors"
     assert_path_exists pkgshare/"plugin/piifence-notice/.claude-plugin/plugin.json"
+    assert_path_exists pkgshare/"plugin/piifence-reveal/hooks/register.ts"
   end
 end

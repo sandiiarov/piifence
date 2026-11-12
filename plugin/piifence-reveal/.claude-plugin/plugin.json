@@ -1,0 +1,9 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "piifence-reveal",
+  "version": "0.1.0",
+  "description": "Draw the real values behind piifence's variable names in the agent's replies and tool rows, on screen only",
+  "author": {
+    "name": "piifence"
+  }
+}
