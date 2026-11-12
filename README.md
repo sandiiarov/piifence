@@ -40,13 +40,26 @@ piifence: replaced 1 secret(s) — DATABASE_CREDENTIAL×1 ($PIIF_SECRET_1 post�
 
 ## 📦 Install
 
-You need macOS on Apple Silicon and [Homebrew](https://brew.sh). The installer adds Rust, git and gitleaks if they are missing.
+You need macOS on Apple Silicon and [Homebrew](https://brew.sh). Either way below, piifence is built from source, which takes about 4 minutes, and the secret model (about 70 MB) is downloaded and checked against pinned SHA-256 hashes.
+
+**With Homebrew:**
+
+```bash
+brew tap sandiiarov/piifence https://github.com/sandiiarov/piifence
+brew install piifence
+```
+
+Homebrew installs Rust and gitleaks as dependencies and puts the `piifence` command in `$(brew --prefix)/bin`. `brew upgrade piifence` updates it, and `brew install --HEAD piifence` builds the latest `main` instead of the pinned release.
+
+**With the install script:**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sandiiarov/piifence/main/scripts/install.sh | bash
 ```
 
-The installer builds piifence, puts the `piifence` command in `~/.local/bin`, and downloads the secret model (about 70 MB, checked against pinned SHA-256 hashes) to `~/.local/share/piifence/model`. To install from a checkout instead, run `scripts/install.sh`.
+The script adds Rust, git and gitleaks if they are missing, puts the `piifence` command in `~/.local/bin`, and the model in `~/.local/share/piifence/model`. To install from a checkout instead, run `scripts/install.sh`.
+
+Use one of the two. If both are installed, the one that comes first in your `PATH` runs (`which piifence` tells you which).
 
 ## 🚀 Use
 
@@ -196,7 +209,7 @@ allow = ['^PROJ-\d+$', '^build-[0-9a-f]{12}$']
 | `PIIF_UPSTREAM` | `ANTHROPIC_BASE_URL` from your shell, then from Claude Code settings | The provider the gateway forwards to. |
 | `PIIF_PORT` | `7788` | The gateway's port on `127.0.0.1`. |
 | `PIIF_CONFIG` | `~/.config/piifence/config.toml` | The config file. |
-| `PIIF_DATA_DIR` | `~/.local/share/piifence` | Where the model and the notice plugin are installed. |
+| `PIIF_DATA_DIR` | `~/.local/share/piifence` (Homebrew: `$(brew --prefix)/opt/piifence/share/piifence`) | Where the model and the notice plugin are installed. |
 | `PIIF_CACHE_DIR` | `~/.cache/piifence` | Where the detection cache is kept. |
 | `PIIF_STATE_DIR` | `~/.local/state/piifence` | Where each conversation's encrypted names are kept, in `names/`. |
 | `PIIF_GATEWAY_LOG` | `$TMPDIR/piifence-gateway.log` | The gateway's own log. |
@@ -214,7 +227,7 @@ A value that is set but can't be parsed, such as `PIIF_PORT=abc`, is an error.
 <summary><b>Upgrading</b></summary>
 
 1. Quit every `piifence claude` session. `piifence claude` reuses a gateway that is already running, so an old gateway keeps serving until it stops.
-2. Run the install command again.
+2. Run `brew upgrade piifence`, or the install script again.
 3. Check that no old gateway is left with `pgrep -fl piifence-gateway`, and stop any you find with `pkill -f piifence-gateway`.
 
 </details>
@@ -242,7 +255,9 @@ The name has no value in this session. This happens to a conversation that was l
 
 ```bash
 pkill -f piifence-gateway
-rm -rf ~/.local/bin/piifence ~/.local/libexec/piifence ~/.local/share/piifence ~/.local/state/piifence ~/.cache/piifence ~/.config/piifence
+brew uninstall piifence && brew untap sandiiarov/piifence    # if installed with Homebrew
+rm -rf ~/.local/bin/piifence ~/.local/libexec/piifence ~/.local/share/piifence    # if installed with the script
+rm -rf ~/.local/state/piifence ~/.cache/piifence ~/.config/piifence
 security delete-generic-password -s piifence -a names-key
 ```
 

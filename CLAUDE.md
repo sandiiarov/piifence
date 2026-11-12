@@ -19,6 +19,7 @@ Local redaction gateway for Claude Code that keeps **secrets** (API keys, tokens
 - Launcher (`src/bin/piifence.rs`, binary `piifence`): `piifence claude`, `piifence session-start`, `piifence env`.
 - Notice plugin: `plugin/piifence-notice/` (hooks plus `scripts/notice.py`), loaded by `piifence claude` with `--plugin-dir`.
 - Installer and scripts: `scripts/install.sh` (macOS; binaries in `$PREFIX/libexec/piifence`, model and plugin in `$PREFIX/share/piifence`, a wrapper in `$PREFIX/bin/piifence` that sets `PIIF_DATA_DIR`), `scripts/fetch-weights.sh <dir>` (pinned revision, SHA-256 checked), `scripts/check.sh`.
+- Homebrew: `Formula/piifence.rb`, so the repo is its own tap (`brew tap sandiiarov/piifence https://github.com/sandiiarov/piifence`). It pins the source `revision` and repeats the model URLs and SHA-256 hashes from `scripts/fetch-weights.sh` as resources. Bump `revision` and `version` for a release, and change both files together when the model changes. Same layout as `install.sh`: binaries in `libexec/bin`, model and plugin in `pkgshare`, a `bin/piifence` wrapper that sets `PIIF_DATA_DIR`.
 - Tests: `tests/secrets/` (end-to-end suite), unit tests in each module. Bench: `bench/models/`, `examples/model_spans.rs`, `examples/guard_filter.rs`. Results: `docs/model-options.md`. Outside research (other detectors, proxies, papers; sources pinned): `docs/research/`.
 
 ## Local Contracts
