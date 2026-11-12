@@ -201,6 +201,8 @@ allow = ['^PROJ-\d+$', '^build-[0-9a-f]{12}$']
 
 `allow` is the only key. An unknown key or an invalid regex stops the gateway from starting, so a typo can't quietly change what gets replaced. See [`piifence.toml.example`](piifence.toml.example).
 
+Inline `gitleaks:allow` comments and `.gitleaksignore` files have no effect on the gateway. A line is scanned whatever it says about itself, and only your `allow` list makes exceptions.
+
 <details>
 <summary><b>Environment variables</b></summary>
 
