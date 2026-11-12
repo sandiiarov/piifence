@@ -35,7 +35,7 @@ import mined  # noqa: E402
 import negatives  # noqa: E402
 
 EXPECTATIONS = os.path.join(HERE, "expectations.json")
-SECRET_NAME = re.compile(r"\$PIIF_SECRET_\d+")
+SECRET_NAME = re.compile(r"\$(?:\{PIIF_SECRET_\d+\}|PIIF_SECRET_\d+)")
 
 
 def session_for(case_id):

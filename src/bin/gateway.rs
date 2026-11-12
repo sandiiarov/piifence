@@ -444,13 +444,16 @@ fn with_session<T>(state: &AppState, f: impl FnOnce(&mut Session) -> T) -> T {
     f(sessions.entry(state.session.clone()).or_default())
 }
 
-/// Below this many characters a known value is replaced only as a whole token: not where a letter or digit of the text runs into its own first or last letter or digit. A short value turns up inside other strings by chance (`2024` in `2024-10-30`); a long one does not, so it is replaced wherever it appears, which keeps a real secret covered inside a longer string.
+/// Below this many characters a known value is replaced only as a whole token: not where a letter or digit of the text runs into its first or last character, when that character is a letter, digit, `-` or `_`. A value cut from a longer token often ends in `-` or `_`, like the first group of a UUID. A short value turns up inside other strings by chance (`2024` in `2024-10-30`); a long one does not, so it is replaced wherever it appears, which keeps a real secret covered inside a longer string.
 const WHOLE_TOKEN_BELOW: usize = 16;
 
 /// Where `value` is in `text`, by the rule of `WHOLE_TOKEN_BELOW`.
 fn env_value_matches(text: &str, value: &str) -> Vec<usize> {
     let whole_token = value.chars().count() < WHOLE_TOKEN_BELOW;
-    let joins = |outside: Option<char>, edge: Option<char>| matches!((outside, edge), (Some(o), Some(e)) if o.is_alphanumeric() && e.is_alphanumeric());
+    let joins = |outside: Option<char>, edge: Option<char>| {
+        matches!((outside, edge), (Some(o), Some(e))
+            if o.is_alphanumeric() && (e.is_alphanumeric() || e == '-' || e == '_'))
+    };
     text.match_indices(value)
         .map(|(start, _)| start)
         .filter(|&start| {
@@ -485,7 +488,15 @@ fn audit_entry(
     })
 }
 
-/// Replace every named value in `text` with `$NAME`, returning the new text and one audit entry per replacement. Offsets are into the text as it stood when that value was replaced, after any longer values.
+/// How a name is written into text: `$NAME`, or `${NAME}` when a letter, digit or `_` comes next, because a shell and `piifence restore` would read that character as part of the name.
+fn name_token(name: &str, next: Option<char>) -> String {
+    match next {
+        Some(c) if c.is_alphanumeric() || c == '_' => format!("${{{name}}}"),
+        _ => format!("${name}"),
+    }
+}
+
+/// Replace every named value in `text` with its name (see `name_token`), returning the new text and one audit entry per replacement. Offsets are into the text as it stood when that value was replaced, after any longer values.
 fn replace_env_values(state: &AppState, text: &str, field: &str) -> (String, Vec<Value>) {
     with_session(state, |session| {
         let mut out = text.to_string();
@@ -498,22 +509,15 @@ fn replace_env_values(state: &AppState, text: &str, field: &str) -> (String, Vec
             if starts.is_empty() {
                 continue;
             }
-            let token = format!("${}", entry.name);
             let mut replaced = String::with_capacity(out.len());
             let mut copied = 0;
             for start in starts {
-                audit.push(audit_entry(
-                    field,
-                    start,
-                    start + entry.value.len(),
-                    entry,
-                    "env",
-                    !entry.seen,
-                ));
+                let end = start + entry.value.len();
+                audit.push(audit_entry(field, start, end, entry, "env", !entry.seen));
                 entry.seen = true;
                 replaced.push_str(&out[copied..start]);
-                replaced.push_str(&token);
-                copied = start + entry.value.len();
+                replaced.push_str(&name_token(&entry.name, out[end..].chars().next()));
+                copied = end;
             }
             replaced.push_str(&out[copied..]);
             out = replaced;
@@ -733,13 +737,14 @@ async fn redact_text(
                 let new = !entry.seen;
                 entry.seen = true;
                 (
-                    format!("${}", entry.name),
+                    entry.name.clone(),
                     audit_entry(field, span.start, span.end, entry, span.engine(), new),
                 )
             })
         })
         .collect();
-    for (span, (token, entry)) in accepted.iter().zip(named).rev() {
+    for (span, (name, entry)) in accepted.iter().zip(named).rev() {
+        let token = name_token(&name, out[span.end..].chars().next());
         out.replace_range(span.start..span.end, &token);
         audit.push(entry);
     }
@@ -1516,6 +1521,16 @@ mod tests {
         );
     }
 
+    /// A bare name, built at run time so this file never holds one literally.
+    fn bare(n: usize) -> String {
+        format!("$PIIF_SECRET_{n}")
+    }
+
+    /// A braced name, built the same way.
+    fn braced(n: usize) -> String {
+        format!("${{PIIF_SECRET_{n}}}")
+    }
+
     #[test]
     fn short_values_are_replaced_only_as_whole_tokens() {
         // Short: not inside a longer run of letters and digits, but next to punctuation.
@@ -1534,6 +1549,49 @@ mod tests {
         // Long: replaced wherever it appears.
         let long = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
         assert_eq!(env_value_matches(&format!("x{long}y"), long), vec![1]);
+    }
+
+    #[test]
+    fn a_short_value_cut_at_a_hyphen_or_underscore_is_not_replaced_inside_a_longer_token() {
+        let uuid = "12345678-abcd-4ef0-8123-456789abcdef";
+        assert_eq!(env_value_matches(uuid, "12345678-"), Vec::<usize>::new());
+        assert_eq!(
+            env_value_matches("a-8123-4567", "-8123"),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            env_value_matches("plugin/piifence-notice", "piifence-"),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            env_value_matches("MY_KEY_NAME", "KEY_"),
+            Vec::<usize>::new()
+        );
+        assert_eq!(env_value_matches("id: 12345678- end", "12345678-"), vec![4]);
+        assert_eq!(env_value_matches("x KEY_ y", "KEY_"), vec![2]);
+        assert_eq!(env_value_matches("a-hunter2 b", "hunter2"), vec![2]);
+    }
+
+    #[tokio::test]
+    async fn a_name_is_braced_when_a_letter_digit_or_underscore_follows() {
+        let state = fake_state();
+        let long = "known-value-of-twenty";
+        with_session(&state, |session| {
+            session.env.entry_for(long, "PASSWORD");
+            session.env.entry_for(":pw!", "PASSWORD");
+        });
+        let (out, _) =
+            replace_env_values(&state, &format!("{long}7 {long}_x {long}-x {long}"), "text");
+        assert_eq!(
+            out,
+            format!("{b}7 {b}_x {n}-x {n}", b = braced(1), n = bare(1))
+        );
+        let (out, _) = replace_env_values(&state, "a:pw!b", "text");
+        assert_eq!(out, format!("a{}b", braced(2)));
+        let (out, _) = redact_text(&state, "TOKENx TOKEN", "text", "")
+            .await
+            .unwrap();
+        assert_eq!(out, format!("{}x {}", braced(3), bare(3)));
     }
 
     #[test]

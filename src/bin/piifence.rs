@@ -347,6 +347,7 @@ This session runs through piifence, which keeps secrets (API keys, tokens, passw
 
 - Use the name in Bash commands, inside double quotes, where you would use the value: `curl -H \"Authorization: Bearer $PIIF_SECRET_1\" …`. piifence exports the variables before each command runs, so the shell expands the name, and scripts the command starts can read the variable too. Single quotes and quoted heredocs (`<<'EOF'`) stop the shell from expanding it.
 - Everywhere else, write the name where the value belongs: in file contents (Write, Edit), in an edit's old text, and in arguments to other tools (MCP tools, for example). piifence puts the real value in before the tool runs, so a file you write holds the value and an edit matches the file.
+- When a letter, digit or `_` comes right after a name, piifence writes the name in braces, as in `${PIIF_SECRET_…}_old`. Keep the braces when you use the name, in commands and in files: without them, the shell reads a longer variable name that does not exist.
 - Files, environment variables and command output on the user's machine hold the real value; only what is sent to you shows the name. A value you see as a `$PIIF_…` name was not exposed to you or the provider: do not warn that it leaked or suggest rotating it on that account.
 - When a command prints a value, you see its name again: `echo $PIIF_SECRET_1` shows you `$PIIF_SECRET_1` although the variable holds the real value. Do not conclude from that that the variable is wrong or holds its own name, and do not try to print, decode or otherwise reveal the values.";
 
@@ -500,7 +501,18 @@ fn names_in(value: &serde_json::Value) -> bool {
     false
 }
 
-/// Replace every name in every string of `value` with its value. A name this session does not have is an error.
+/// The first bare name in `text` that a letter, digit or `_` follows directly. A shell reads such a name as a longer, different variable, so the hook refuses it instead of guessing.
+fn glued_name(pattern: &regex::Regex, text: &str) -> Option<String> {
+    pattern.captures_iter(text).find_map(|caps| {
+        let number = caps.get(2)?;
+        let end = caps.get(0)?.end();
+        text[end..]
+            .starts_with(|c: char| c.is_alphanumeric() || c == '_')
+            .then(|| format!("PIIF_SECRET_{}", number.as_str()))
+    })
+}
+
+/// Replace every name in every string of `value` with its value. A name this session does not have is an error. So is a bare name that runs into a letter or `_` (`glued_name`).
 fn fill_values(
     value: &mut serde_json::Value,
     values: &serde_json::Map<String, serde_json::Value>,
@@ -510,6 +522,9 @@ fn fill_values(
     while let Some(value) = stack.pop() {
         match value {
             serde_json::Value::String(s) => {
+                if let Some(name) = glued_name(&pattern, s) {
+                    bail!("${name} runs into the text after it, so a shell would read a longer variable name; write ${{{name}}} instead");
+                }
                 let mut missing = None;
                 let filled = pattern.replace_all(s, |caps: &regex::Captures| {
                     let number = caps.get(1).or(caps.get(2)).map_or("", |m| m.as_str());
@@ -585,6 +600,16 @@ fn shell_quote(value: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A bare name, built at run time so this file never holds one literally.
+    fn bare(n: usize) -> String {
+        format!("$PIIF_SECRET_{n}")
+    }
+
+    /// A braced name, built the same way.
+    fn braced(n: usize) -> String {
+        format!("${{PIIF_SECRET_{n}}}")
+    }
+
     #[test]
     fn fill_values_replaces_names_in_every_string() {
         let values = serde_json::json!({"PIIF_SECRET_1": "one", "PIIF_SECRET_12": "twelve"});
@@ -615,6 +640,20 @@ mod tests {
         let mut input = serde_json::json!({"content": "$PIIF_SECRET_1 $PIIF_SECRET_2"});
         let err = fill_values(&mut input, values.as_object().unwrap()).unwrap_err();
         assert!(err.to_string().contains("PIIF_SECRET_2"));
+    }
+
+    #[test]
+    fn fill_values_rejects_a_bare_name_that_runs_into_a_letter_or_underscore() {
+        let values = serde_json::json!({"PIIF_SECRET_1": "one"});
+        let values = values.as_object().unwrap();
+        for text in [format!("{}x", bare(1)), format!("{}_old", bare(1))] {
+            let mut input = serde_json::json!({ "content": text });
+            let err = fill_values(&mut input, values).unwrap_err();
+            assert!(err.to_string().contains(&braced(1)), "{err}");
+        }
+        let mut input = serde_json::json!({"content": format!("{}-x {}x", bare(1), braced(1))});
+        fill_values(&mut input, values).unwrap();
+        assert_eq!(input["content"], "one-x onex");
     }
 
     #[test]

@@ -83,7 +83,7 @@ impl Guards {
         };
         Ok(Self {
             env_ref: Regex::new(
-                r#"os\.environ\.get\(\s*['"][A-Za-z0-9_]+['"]\s*\)|os\.environ\[\s*['"][A-Za-z0-9_]+['"]\s*\]|os\.getenv\(\s*['"][A-Za-z0-9_]+['"]\s*\)|process\.env\.[A-Za-z0-9_]+|\$PIIF_[A-Za-z0-9_]+"#,
+                r#"os\.environ\.get\(\s*['"][A-Za-z0-9_]+['"]\s*\)|os\.environ\[\s*['"][A-Za-z0-9_]+['"]\s*\]|os\.getenv\(\s*['"][A-Za-z0-9_]+['"]\s*\)|process\.env\.[A-Za-z0-9_]+|\$\{PIIF_[A-Za-z0-9_]+\}|\$PIIF_SECRET_[0-9]+|\$PIIF_[A-Za-z0-9_]+"#,
             )?,
             // name.ext:line[:col], optionally under a path; the extension is letters only.
             file_ref: Regex::new(
@@ -504,6 +504,32 @@ mod tests {
             g.suppress(text, start, text.len()),
             Some(Suppression::EnvReference)
         );
+    }
+
+    #[test]
+    fn braced_pif_env_reference_is_suppressed() {
+        let g = guards();
+        let reference = format!("${{PIIF_SECRET_{}}}", 1);
+        let text = format!("use this API key {reference}x");
+        let start = text.find(&reference).unwrap();
+        assert_eq!(
+            g.suppress(&text, start, text.len()),
+            Some(Suppression::EnvReference)
+        );
+    }
+
+    #[test]
+    fn text_glued_after_a_bare_name_is_not_part_of_the_reference() {
+        let g = guards();
+        let reference = format!("$PIIF_SECRET_{}", 7);
+        let text = format!("use {reference}tail now");
+        let start = text.find(&reference).unwrap();
+        let tail = start + reference.len();
+        assert_eq!(
+            g.suppress(&text, start, tail),
+            Some(Suppression::EnvReference)
+        );
+        assert_eq!(g.suppress(&text, tail, tail + 4), None);
     }
 
     #[test]
