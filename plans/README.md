@@ -13,8 +13,9 @@ This run had no interactive selection step. Following the skill's non-interactiv
 | [011](011-shared-gateway-lifetime.md) | Keep a shared gateway running until the last `piifence claude` that uses it exits | P1 | M | — | DONE |
 | [012](012-private-control-socket.md) | Serve the gateway's control endpoints and `/stats` only on a private Unix socket | P1 | M | 011 | DONE |
 | [013](013-names-never-land-as-text.md) | A secret's name never lands in a file, a command or a commit as text | P1 | M | — | DONE |
+| [014](014-nested-claude-hooks.md) | A `claude` started from inside a piifence session gets piifence's hooks | P1 | M | — | TODO |
 
-Run them in this order: 009, 010, 011, 012, 013.
+Run them in this order: 009, 010, 011, 012, 013, 014.
 
 Earlier plans: 001–008 came from a previous run, against `efdd25e`, and are all DONE. They are: 001 stable placeholders, 002 cache final detections, 003 the secret test suite, 004 every content block, 005 span normalization and the gitleaks location, 006 gitleaks rules for rule-less formats, 007 the verification baseline and CI, and 008 a notice that reports only new values. Their files, the previous index and `plans/tools` are on branch `fix/verification-baseline` (`f9752ba`); 001–003 are also on `docs/improvement-plans` (`c635c8b`). They are not on this branch, so this index starts at 009 to keep the numbering monotonic.
 
@@ -46,7 +47,7 @@ Vetted against the code at `fc97e3d`, in rough order of leverage:
 | PERF-02 | One detector thread serves every request, and cache hits wait in its queue | performance | `src/bin/gateway.rs:1258-1259` | M | |
 | PERF-03 | Every text block starts its own gitleaks process, about 21 ms each | performance | `src/gitleaks.rs:67` | M | |
 | DOCS-04 | The probe command, the test baseline and other numbers in the docs are stale | docs | `CLAUDE.md:27` | S | 012 adds the missing `PIIF_STATE_DIR` to `CLAUDE.md:27`. |
-| NESTED-01 | A `claude -p` started from a Bash command inherits the parent's session header but has no hooks, so it writes names as text | security | `src/bin/piifence.rs` (`custom_headers`) | M | Follow-up to 013; check how Claude Code passes its settings env to child processes first. |
+| NESTED-01 | A `claude -p` started from a Bash command inherits the parent's session header but has no hooks, so it writes names as text | security | `src/bin/piifence.rs` (`custom_headers`) | M | Follow-up to 013; check how Claude Code passes its settings env to child processes first. Planned as 014. |
 | SEC-08 | Values are filled into tools that interpret their input, such as MCP tools | security | — | — | Mostly by design; see "Direction". |
 
 Minor items: `scripts/install.sh` builds without `--locked`, from an unpinned checkout. The CI actions use movable tags and the workflow has no `permissions:` block. Redirects keep the `x-api-key` header. The gateway log is created without an explicit mode. The placeholder allowlist also exempts matches of gitleaks' default rules. Saved names tables have no version counter.
