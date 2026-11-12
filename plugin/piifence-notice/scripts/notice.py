@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Claude Code hook: show piifence redaction notices via systemMessage.
 
-Asks the local gateway's /stats endpoint how many distinct secrets were replaced, and emits a user-visible message when a secret was replaced for the first time since the last turn. Only metadata is shown (kinds, counts, `$PIIF_SECRET_<N>` names, masked previews), never a value or the text around it.
+Asks the local gateway's /stats endpoint how many distinct secrets were replaced, and emits a user-visible message when a secret was replaced for the first time since the last turn. Only metadata is shown (kinds, counts, `$PIIF_SECRET_<N>` names, masked previews), never a value or the text around it. It prints nothing unless PIIF_NOTICE=on.
 
 `piifence claude` loads this plugin and sets PIIF_GATEWAY_SOCKET, the gateway's control socket: a Unix socket in a directory only the user can open, and the only place the gateway serves /stats. A gateway that does not answer is an error: the hook exits non-zero, so Claude Code shows it.
 
@@ -61,6 +61,8 @@ def previous_total():
 
 
 def main():
+    if os.environ.get("PIIF_NOTICE") != "on":
+        emit({})
     raw = sys.stdin.read()
     hook = json.loads(raw)["hook_event_name"] if raw.strip() else ""
     stats = fetch_stats()

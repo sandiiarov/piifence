@@ -29,7 +29,7 @@ provider sees:  deploy with DATABASE_URL=$PIIF_SECRET_1
 agent runs:     psql "$PIIF_SECRET_1" -c 'select 1'      # gets the real URL locally
 ```
 
-After each turn, Claude Code shows what was replaced. The notice has a masked preview and never the value itself:
+On your screen nothing changes: Claude Code draws real values everywhere, so piifence stays invisible. Set `PIIF_NOTICE=on` to have Claude Code show what was replaced after each turn. The notice has a masked preview and never the value itself:
 
 ```text
 piifence: replaced 1 secret(s) — DATABASE_CREDENTIAL×1 ($PIIF_SECRET_1 post…prod)
@@ -141,7 +141,7 @@ flowchart LR
 - **A `SessionStart` hook** gives the agent the note about `$PIIF_*` names, and tells the gateway which Claude Code conversation the session is. It also adds one line to the file that Claude Code loads before every Bash command (`CLAUDE_ENV_FILE`). That line runs `piifence env`, which fetches the session's values from the gateway and exports them.
 - **A `PreToolUse` hook** runs `piifence restore` before every tool call. When the tool's input holds a `$PIIF_SECRET_*` name, it fetches the session's values and puts each value in place of its name; a backslash right before the name's `$` counts as part of the name. In Bash and Monitor commands it fills in a value only where the shell would not expand the name itself (single quotes, quoted heredocs, an escaped `$`), and PowerShell commands are left alone. If the gateway doesn't answer or a name is unknown, the hook blocks the call instead of letting the tool run with a name where a value belongs.
 - **A `claude` started inside the session gets the same hooks.** `piifence env` puts a small `claude` script from `~/.local/state/piifence/bin` first on `PATH`, so a command or script that runs `claude -p …` starts it with the session's hooks. That session shares the parent's names and does not take over the parent's saved names.
-- **The reveal plugin** draws the value in place of each `$PIIF_SECRET_*` name in the agent's replies and tool rows on your screen. Only the drawing changes: the transcript file, ctrl+o and what the model reads keep the names. Set `PIIF_REVEAL=off` before `piifence claude` to see the names instead, for example while you share your screen.
+- **The reveal plugin** draws the value in place of each `$PIIF_SECRET_*` name everywhere Claude Code draws one on your screen: the agent's replies, your prompts, tool rows and their output, slash-command output and question dialogs. Only the drawing changes: the transcript file and what the model reads keep the names. Set `PIIF_REVEAL=off` before `piifence claude` to see the names instead, for example while you share your screen.
 
 Here is what happens when the agent finds a secret in a file and then uses it:
 
@@ -218,6 +218,7 @@ Inline `gitleaks:allow` comments and `.gitleaksignore` files have no effect on t
 | `PIIF_CONFIG` | `~/.config/piifence/config.toml` | The config file. |
 | `PIIF_DATA_DIR` | `~/.local/share/piifence` (Homebrew: `$(brew --prefix)/opt/piifence/share/piifence`) | Where the model and the plugins are installed. |
 | `PIIF_REVEAL` | on | `off` keeps the `$PIIF_SECRET_*` names on screen instead of drawing their values. |
+| `PIIF_NOTICE` | off | `on` shows a notice after each turn that replaced a secret, with its name and a masked preview. |
 | `PIIF_CACHE_DIR` | `~/.cache/piifence` | Where the detection cache is kept. |
 | `PIIF_STATE_DIR` | `~/.local/state/piifence` | Where each conversation's encrypted names are kept, in `names/`, and the gateway's control socket, in `run/`. |
 | `PIIF_GATEWAY_LOG` | `$TMPDIR/piifence-gateway.log` | The gateway's own log. |

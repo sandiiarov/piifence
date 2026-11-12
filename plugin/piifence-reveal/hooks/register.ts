@@ -62,6 +62,7 @@ async function load($: EngineInterface): Promise<void> {
 }
 
 async function valuesFor($: EngineInterface, text: string): Promise<Map<string, string> | undefined> {
+  if (!text.includes('PIIF_SECRET_')) return undefined
   const names = namesIn(text)
   if (names.length === 0) return undefined
   const now = await $.clock.now()
@@ -82,7 +83,32 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
-    const known = await valuesFor($, JSON.stringify(e.props.input) ?? '')
-    return known ? next({ ...e, props: { ...e.props, input: revealDeep(e.props.input, known) } }) : next(e)
+    const known = await valuesFor($, JSON.stringify([e.props.input, e.props.output]) ?? '')
+    if (!known) return next(e)
+    const props = { ...e.props, input: revealDeep(e.props.input, known) }
+    if (e.props.output !== undefined) props.output = revealDeep(e.props.output, known)
+    return next({ ...e, props })
+  })
+
+  on('ui.render', { component: 'ToolResult' }, async ($, e, next) => {
+    const known = await valuesFor($, JSON.stringify(e.props.output) ?? '')
+    return known ? next({ ...e, props: { ...e.props, output: revealDeep(e.props.output, known) } }) : next(e)
+  })
+
+  on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
+    const known = await valuesFor($, e.props.text)
+    return known ? next({ ...e, props: { ...e.props, text: reveal(e.props.text, known) } }) : next(e)
+  })
+
+  on('ui.render', { component: 'CommandOutput' }, async ($, e, next) => {
+    const known = await valuesFor($, e.props.text)
+    return known ? next({ ...e, props: { ...e.props, text: reveal(e.props.text, known) } }) : next(e)
+  })
+
+  on('ui.render', { component: 'AskUserQuestion' }, async ($, e, next) => {
+    const known = await valuesFor($, JSON.stringify(e.props.questions) ?? '')
+    if (!known) return next(e)
+    const questions = revealDeep(e.props.questions, known)
+    return Array.isArray(questions) ? next({ ...e, props: { ...e.props, questions } }) : next(e)
   })
 }

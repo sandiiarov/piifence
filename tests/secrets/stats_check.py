@@ -30,8 +30,8 @@ def stats(gw):
     return json.loads(body)
 
 
-def notice(gw, state_file, hook="Stop"):
-    env = dict(os.environ, PIIF_GATEWAY_SOCKET=gw.socket, PIIF_NOTICE_STATE=state_file)
+def notice(gw, state_file, hook="Stop", switch="on"):
+    env = dict(os.environ, PIIF_GATEWAY_SOCKET=gw.socket, PIIF_NOTICE_STATE=state_file, PIIF_NOTICE=switch)
     out = subprocess.run([sys.executable, "-I", NOTICE], input=json.dumps({"hook_event_name": hook}).encode(),
                          capture_output=True, env=env, check=True)
     return json.loads(out.stdout or b"{}")
@@ -54,6 +54,7 @@ def main():
         try:
             path, body, _ = contexts.prompt_text(formats.BY_ID["aws_access_key_id"].generate)
             state = os.path.join(tmp, "state.json")
+            assert notice(gw, state, "SessionStart", switch="") == {}, "the notice must be silent unless PIIF_NOTICE=on"
             assert notice(gw, state, "SessionStart")["systemMessage"].startswith("piifence: active")
             assert run.post(gw.port, path, body, "turn") == 200
             # Any account on this machine can connect to the TCP port, so nothing there may hand out a session's values or previews, or name the upstream.
