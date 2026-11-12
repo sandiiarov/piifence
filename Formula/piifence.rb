@@ -41,7 +41,7 @@ class Piifence < Formula
     resources.each do |r|
       r.stage { (pkgshare/"model").install r.name }
     end
-    (bin/"piifence").write_env_script libexec/"bin/piifence", PIIF_DATA_DIR: pkgshare
+    (bin/"piifence").write_env_script opt_libexec/"bin/piifence", PIIF_DATA_DIR: opt_pkgshare
   end
 
   test do

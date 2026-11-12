@@ -77,9 +77,12 @@ fn home() -> Result<PathBuf> {
     Ok(PathBuf::from(env::var("HOME").context("HOME is not set")?))
 }
 
-/// This binary's real path, through any symlink.
+/// This binary's path as it was started, when the gateway binary sits next to it there, so a stable path such as Homebrew's `opt/piifence` survives an upgrade in the hooks and the env file. Otherwise its real path, through any symlink.
 fn real_exe() -> Result<PathBuf> {
     let exe = env::current_exe().context("cannot find the piifence binary's path")?;
+    if exe.is_absolute() && exe.with_file_name("piifence-gateway").exists() {
+        return Ok(exe);
+    }
     fs::canonicalize(&exe).with_context(|| format!("cannot resolve {}", exe.display()))
 }
 
@@ -516,17 +519,14 @@ fn session_start(args: &[String]) -> Result<i32> {
     );
     let path = env::var("CLAUDE_ENV_FILE")
         .context("CLAUDE_ENV_FILE is not set, so Bash commands cannot get $PIIF_* values")?;
-    let present = Path::new(&path).exists()
-        && fs::read_to_string(&path)
-            .with_context(|| format!("cannot read {path}"))?
-            .contains(&line);
-    if !present {
-        fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .and_then(|mut file| file.write_all(line.as_bytes()))
-            .with_context(|| format!("cannot write {path}"))?;
+    let existing = if Path::new(&path).exists() {
+        fs::read_to_string(&path).with_context(|| format!("cannot read {path}"))?
+    } else {
+        String::new()
+    };
+    let updated = env_file_with(&existing, &line);
+    if updated != existing {
+        fs::write(&path, updated).with_context(|| format!("cannot write {path}"))?;
     }
     bind_conversation(session, port, conversation)?;
     println!(
@@ -539,6 +539,19 @@ fn session_start(args: &[String]) -> Result<i32> {
         })
     );
     Ok(0)
+}
+
+/// `existing` env file content with every earlier `piifence env` line dropped and `line` added. A resumed conversation keeps its env file, so without this it would also run the lines of its earlier sessions, some through a binary an upgrade has removed.
+fn env_file_with(existing: &str, line: &str) -> String {
+    let ours = regex::Regex::new(r#"^eval "\$\('[^']*' env [0-9a-f]{32} [0-9]+\)"$"#)
+        .expect("valid pattern");
+    let mut kept: String = existing
+        .lines()
+        .filter(|l| !ours.is_match(l))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    kept.push_str(line);
+    kept
 }
 
 /// Tell the gateway which Claude Code conversation this session is, so it loads the names a resumed conversation already uses and stores new ones (encrypted, with a key kept in the Keychain).
@@ -833,6 +846,22 @@ mod tests {
             fill_values(&mut input, values).unwrap();
             assert_eq!(input["content"], want, "{text}");
         }
+    }
+
+    #[test]
+    fn env_file_keeps_only_the_current_piifence_line() {
+        let old = format!("eval \"$('/gone/piifence' env {} 7788)\"\n", "a".repeat(32));
+        let line = format!("eval \"$('/opt/piifence' env {} 7788)\"\n", "b".repeat(32));
+        let existing = format!("export OTHER=1\n{old}{old}");
+        assert_eq!(
+            env_file_with(&existing, &line),
+            format!("export OTHER=1\n{line}")
+        );
+        assert_eq!(
+            env_file_with(&format!("export OTHER=1\n{line}"), &line),
+            format!("export OTHER=1\n{line}")
+        );
+        assert_eq!(env_file_with("", &line), line);
     }
 
     #[test]
