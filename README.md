@@ -140,6 +140,7 @@ flowchart LR
 - **The gateway** is a proxy on `127.0.0.1:7788`. It scans every outgoing request (prompt, tool output, files, system prompt) and replaces each secret with its `$PIIF_SECRET_*` name. It keeps the values in memory and hands them only to the session they belong to, and only on its control socket, `~/.local/state/piifence/run/7788.sock`, never on its TCP port. It also saves each conversation's names, encrypted, so a resumed conversation gets them back (see [Guarantees](#guarantees)).
 - **A `SessionStart` hook** gives the agent the note about `$PIIF_*` names, and tells the gateway which Claude Code conversation the session is. It also adds one line to the file that Claude Code loads before every Bash command (`CLAUDE_ENV_FILE`). That line runs `piifence env`, which fetches the session's values from the gateway and exports them.
 - **A `PreToolUse` hook** runs `piifence restore` before every tool call. When the tool's input holds a `$PIIF_SECRET_*` name, it fetches the session's values and puts each value in place of its name; a backslash right before the name's `$` counts as part of the name. In Bash and Monitor commands it fills in a value only where the shell would not expand the name itself (single quotes, quoted heredocs, an escaped `$`), and PowerShell commands are left alone. If the gateway doesn't answer or a name is unknown, the hook blocks the call instead of letting the tool run with a name where a value belongs.
+- **A `claude` started inside the session gets the same hooks.** `piifence env` puts a small `claude` script from `~/.local/state/piifence/bin` first on `PATH`, so a command or script that runs `claude -p …` starts it with the session's hooks. That session shares the parent's names and does not take over the parent's saved names.
 
 Here is what happens when the agent finds a secret in a file and then uses it:
 
@@ -281,6 +282,7 @@ piifence never edits `~/.claude/settings.json`, so there's nothing to undo in Cl
 - **Names last 30 days.** A conversation resumed after 30 days unused has lost its saved names, so a `$PIIF_SECRET_N` the agent wrote before then has no value.
 - **The agent can use every secret it comes across** in commands, including sending it somewhere.
 - **Secrets that look like ids get through.** For example, a hex key right after a word like `commit` or `sha256` is read as a hash and sent as it is, and so is a secret in a URL query parameter whose name doesn't say it is secret.
+- **A `claude` started some other way runs without the hooks.** That is a `claude` started by its full path, by a shell alias that doesn't go through `PATH`, or by the Agent SDK. It still goes through the gateway, but it writes a `$PIIF_SECRET_<N>` name in a file as text.
 - **It runs on macOS only, with Claude Code only.**
 
 ## 🧑‍💻 Development
