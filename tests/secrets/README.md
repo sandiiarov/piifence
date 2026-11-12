@@ -31,7 +31,7 @@ python3 -I tests/secrets/run.py --model-dir <model dir>                   # ever
 python3 -I tests/secrets/run.py --model-dir <model dir> --filter github   # some cases
 python3 -I tests/secrets/run.py --check-generators   # each format matches its gitleaks rule
 python3 -I tests/secrets/run.py --self-test          # the checks themselves, no gateway
-PIIF_MODEL_DIR=<model dir> python3 -I tests/secrets/stats_check.py   # /stats counters and the notice
+PIIF_MODEL_DIR=<model dir> python3 -I tests/secrets/stats_check.py   # /stats and the notice over the control socket; TCP refuses them
 PIIF_MODEL_DIR=<model dir> python3 -I tests/secrets/lifecycle_check.py   # a shared gateway outlives the launcher that started it
 ```
 

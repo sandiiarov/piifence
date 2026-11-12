@@ -6,8 +6,9 @@
 //!   4. The response is streamed back byte for byte. Names are never replaced back: the provider never sees the value, and the agent uses the name. `piifence env` hands the values to the session's Bash commands, so `$PIIF_SECRET_1` expands to the real value on the user's machine.
 //!   5. The session-start hook sends Claude Code's conversation id to `/control/conversation`. The gateway then keeps that conversation's names in a file encrypted with a key from the macOS Keychain, and loads them back when the conversation is resumed, so names the agent already wrote keep their values across restarts.
 //!   6. `piifence claude` takes a lease on `/control/lease` (its session id and process id) before it starts Claude Code. Started with `PIIF_EXIT_WHEN_UNUSED=<seconds>`, as the launcher does, the gateway exits once no live launcher has held a lease for that long. Any other `/control/` path is answered 404 and never forwarded.
+//!   7. `/stats`, every `/control/` path and the `/health` answer that names the upstream are served only on the control socket, `$PIIF_STATE_DIR/run/<port>.sock`, in a directory only the user can open (see `piifence::control`). Any account on the machine can connect to the TCP port, so there those paths get 404 and `/health` leaves the upstream out.
 //!
-//! Env: PIIF_UPSTREAM (required: provider base URL), PIIF_MODEL_DIR (required: the model directory, or several joined with ':', each a Scrub or cbx model), PIIF_PORT (7788), PIIF_EXIT_WHEN_UNUSED (seconds; above 0, exit once no launcher has held a lease that long; unset or 0, run until stopped), PIIF_AUDIT_LOG (/tmp/piifence-audit.log), PIIF_AUDIT_BODY=1 (also log the rewritten request bodies), PIIF_CACHE_DIR (~/.cache/piifence: detection results kept across restarts, as offsets per text hash, never the text or values), PIIF_STATE_DIR (~/.local/state/piifence: `names/` holds each conversation's names, encrypted with a key kept in the macOS Keychain).
+//! Env: PIIF_UPSTREAM (required: provider base URL), PIIF_MODEL_DIR (required: the model directory, or several joined with ':', each a Scrub or cbx model), PIIF_PORT (7788), PIIF_EXIT_WHEN_UNUSED (seconds; above 0, exit once no launcher has held a lease that long; unset or 0, run until stopped), PIIF_AUDIT_LOG (/tmp/piifence-audit.log), PIIF_AUDIT_BODY=1 (also log the rewritten request bodies), PIIF_CACHE_DIR (~/.cache/piifence: detection results kept across restarts, as offsets per text hash, never the text or values), PIIF_STATE_DIR (~/.local/state/piifence: `names/` holds each conversation's names, encrypted with a key kept in the macOS Keychain, and `run/<port>.sock` is the control socket).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
@@ -502,7 +503,7 @@ fn process_alive(pid: i32) -> bool {
         || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// Finish once no launcher has held a lease for `grace`. `axum::serve` then stops accepting connections, finishes the open ones and returns, so the gateway exits.
+/// Finish once no launcher has held a lease for `grace`. `main` then removes the control socket and returns, which closes both listeners and ends the gateway.
 async fn until_unused(leases: Arc<Mutex<Leases>>, grace: Duration) {
     loop {
         tokio::time::sleep(LEASE_CHECK).await;
@@ -519,6 +520,74 @@ async fn until_unused(leases: Arc<Mutex<Leases>>, grace: Duration) {
             return;
         }
     }
+}
+
+/// The listener a request came in on.
+#[derive(Clone, Copy)]
+enum Via {
+    /// `127.0.0.1:<port>`, which every account on this machine can connect to.
+    Tcp,
+    /// The control socket, in a directory only this user can open (see `piifence::control`).
+    Socket,
+}
+
+/// Whether `path` is served on `via`. `/stats` and every `/control/` path are served only on the control socket, because they hand out a session's values and previews of them, and any account on this machine can connect to a loopback TCP port. The proxy is served only on TCP, where Claude Code sends its requests. `/health` is served on both.
+fn served_on(via: Via, path: &str) -> bool {
+    let control = path == "/stats" || path.starts_with("/control/");
+    match via {
+        Via::Tcp => !control,
+        Via::Socket => control || path == "/health",
+    }
+}
+
+/// The header in which `/health` names the upstream. Only the answer on the control socket keeps it.
+const UPSTREAM_HEADER: &str = "x-piifence-upstream";
+
+/// Middleware for the TCP listener: a path served only on the control socket gets 404, and the upstream is removed from the answer to `/health`.
+async fn tcp_only(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if !served_on(Via::Tcp, request.uri().path()) {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "this path is served only on the gateway's control socket",
+        );
+    }
+    let mut response = next.run(request).await;
+    response.headers_mut().remove(UPSTREAM_HEADER);
+    response
+}
+
+/// Middleware for the control socket: anything but `/health`, `/stats` and the `/control/` paths gets 404, so nothing sent there is forwarded to the provider.
+async fn socket_only(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if !served_on(Via::Socket, request.uri().path()) {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "the control socket serves only /health, /stats and /control/",
+        );
+    }
+    next.run(request).await
+}
+
+/// Bind the control socket at `path`, in a directory only this user can open: mode 0700, set again when the directory already exists. Call it only after binding the TCP port. Holding the port means no other gateway serves this socket, so a socket file that a killed gateway left behind is removed.
+fn bind_control_socket(path: &std::path::Path) -> anyhow::Result<tokio::net::UnixListener> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let dir = path
+        .parent()
+        .context("the control socket path has no directory")?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("create {}", dir.display()))?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("make {} private (mode 0700)", dir.display()))?;
+    if let Err(err) = std::fs::remove_file(path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return Err(err)
+                .with_context(|| format!("remove the old control socket {}", path.display()));
+        }
+    }
+    tokio::net::UnixListener::bind(path)
+        .with_context(|| format!("bind the control socket {}", path.display()))
 }
 
 /// Run `f` on this request's session, creating it on first use.
@@ -1146,10 +1215,10 @@ async fn proxy(
     };
     let path = uri.path();
     if path == "/health" {
-        // The launcher compares this header to its own upstream before reusing a gateway.
+        // The launcher reads this header on the control socket and compares it to its own upstream before reusing a gateway. `tcp_only` removes it from the answer on TCP.
         return Response::builder()
             .status(StatusCode::OK)
-            .header("x-piifence-upstream", state.upstream.as_str())
+            .header(UPSTREAM_HEADER, state.upstream.as_str())
             .body(Body::from("ok"))
             .expect("valid response");
     }
@@ -1338,12 +1407,8 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let names_dir = match std::env::var("PIIF_STATE_DIR") {
-        Ok(dir) => PathBuf::from(dir),
-        Err(_) => PathBuf::from(std::env::var("HOME").context("HOME is not set")?)
-            .join(".local/state/piifence"),
-    }
-    .join("names");
+    let state_dir = piifence::control::state_dir()?;
+    let names_dir = state_dir.join("names");
     prepare_names_dir(&names_dir)?;
     NAMES_DIR.set(names_dir).expect("set once");
 
@@ -1394,19 +1459,36 @@ async fn main() -> anyhow::Result<()> {
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    let socket_path = piifence::control::socket_path(&state_dir, port);
+    let control_listener = bind_control_socket(&socket_path)?;
     eprintln!("piifence gateway listening on http://127.0.0.1:{port}");
+    eprintln!("control socket: {}", socket_path.display());
     eprintln!(
         "audit log: {audit_path} (body log: {})",
         audit_body_path.as_deref().unwrap_or("off")
     );
-    let serve = axum::serve(listener, app);
-    if exit_when_unused > 0 {
+    let tcp_server = axum::serve(
+        listener,
+        app.clone().layer(axum::middleware::from_fn(tcp_only)),
+    );
+    let socket_server = axum::serve(
+        control_listener,
+        app.layer(axum::middleware::from_fn(socket_only)),
+    );
+    let unused = async move {
+        if exit_when_unused == 0 {
+            return std::future::pending::<anyhow::Result<()>>().await;
+        }
         eprintln!("exits {exit_when_unused} s after the last piifence claude session ends");
-        serve
-            .with_graceful_shutdown(until_unused(leases, Duration::from_secs(exit_when_unused)))
-            .await?;
-    } else {
-        serve.await?;
+        until_unused(leases, Duration::from_secs(exit_when_unused)).await;
+        // Removed while both listeners still run: once the TCP port is free, another gateway may take it and bind this same path.
+        std::fs::remove_file(&socket_path)
+            .with_context(|| format!("remove the control socket {}", socket_path.display()))
+    };
+    tokio::select! {
+        served = tcp_server => served.context("serve on TCP")?,
+        served = socket_server => served.context("serve on the control socket")?,
+        removed = unused => removed?,
     }
     Ok(())
 }
@@ -1948,5 +2030,59 @@ mod tests {
             headers.insert(LAUNCHER_HEADER, value.parse().unwrap());
             assert_eq!(launcher_pid(&headers), expected, "{value}");
         }
+    }
+
+    #[test]
+    fn paths_are_split_between_tcp_and_the_control_socket() {
+        for path in [
+            "/stats",
+            "/control/env",
+            "/control/conversation",
+            "/control/lease",
+            "/control/other",
+        ] {
+            assert!(
+                !served_on(Via::Tcp, path),
+                "{path} must not be served on TCP"
+            );
+            assert!(
+                served_on(Via::Socket, path),
+                "{path} must be served on the control socket"
+            );
+        }
+        for path in [
+            "/v1/messages",
+            "/v1/messages/count_tokens",
+            "/v1/models",
+            "/control",
+            "/stats/",
+        ] {
+            assert!(served_on(Via::Tcp, path), "{path} must be served on TCP");
+            assert!(
+                !served_on(Via::Socket, path),
+                "{path} must not be served on the control socket"
+            );
+        }
+        assert!(served_on(Via::Tcp, "/health"));
+        assert!(served_on(Via::Socket, "/health"));
+    }
+
+    #[tokio::test]
+    async fn binding_the_control_socket_makes_its_directory_private_and_replaces_a_stale_socket() {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        let state = std::env::temp_dir().join(format!("piif-gw-{}", std::process::id()));
+        let path = piifence::control::socket_path(&state, 7);
+        let dir = path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&path, "left behind").unwrap();
+
+        let listener = bind_control_socket(&path).unwrap();
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "the socket's directory must be private");
+        assert!(std::fs::metadata(&path).unwrap().file_type().is_socket());
+        drop(listener);
+        std::fs::remove_dir_all(&state).unwrap();
     }
 }

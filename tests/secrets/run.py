@@ -11,6 +11,7 @@ import argparse
 import collections
 import datetime
 import hashlib
+import http.client
 import http.server
 import json
 import math
@@ -208,6 +209,30 @@ def free_port():
         return s.getsockname()[1]
 
 
+class SocketConnection(http.client.HTTPConnection):
+    """HTTP over a gateway's control socket, a Unix socket, instead of TCP."""
+
+    def __init__(self, path, timeout=5):
+        super().__init__("127.0.0.1", timeout=timeout)
+        self.socket_path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.socket_path)
+
+
+def socket_get(socket_path, path, headers=None):
+    """Status, headers and body of `GET path` on a gateway's control socket; an error status is returned, not raised."""
+    conn = SocketConnection(socket_path)
+    try:
+        conn.request("GET", path, headers=headers or {})
+        resp = conn.getresponse()
+        return resp.status, resp.headers, resp.read()
+    finally:
+        conn.close()
+
+
 def post(port, path, body, case_id):
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}", data=json.dumps(body).encode(), method="POST",
@@ -225,6 +250,7 @@ def post(port, path, body, case_id):
 class Gateway:
     def __init__(self, model_dir, sink_port, tmp):
         self.port = free_port()
+        self.socket = os.path.join(tmp, "state", "run", f"{self.port}.sock")
         env = {k: v for k, v in os.environ.items() if not k.startswith("PIIF_")}
         env.update({
             "PIIF_UPSTREAM": f"http://127.0.0.1:{sink_port}",
@@ -235,6 +261,8 @@ class Gateway:
             "PIIF_CONFIG": os.path.join(tmp, "config.toml"),
             # A fresh detection cache, so every run measures detection itself.
             "PIIF_CACHE_DIR": os.path.join(tmp, "cache"),
+            # A temp state dir, so the gateway's names and its control socket (run/<port>.sock) stay out of the user's own.
+            "PIIF_STATE_DIR": os.path.join(tmp, "state"),
         })
         self.log_path = os.path.join(tmp, "gateway.log")
         self.log = open(self.log_path, "w")

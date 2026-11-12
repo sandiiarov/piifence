@@ -3,21 +3,49 @@
 
 Asks the local gateway's /stats endpoint how many distinct secrets were replaced, and emits a user-visible message when a secret was replaced for the first time since the last turn. Only metadata is shown (kinds, counts, `$PIIF_SECRET_<N>` names, masked previews), never a value or the text around it.
 
-`piifence claude` loads this plugin and sets PIIF_GATEWAY_URL. A gateway that does not answer is an error: the hook exits non-zero, so Claude Code shows it.
+`piifence claude` loads this plugin and sets PIIF_GATEWAY_SOCKET, the gateway's control socket: a Unix socket in a directory only the user can open, and the only place the gateway serves /stats. A gateway that does not answer is an error: the hook exits non-zero, so Claude Code shows it.
 
 Env:
-  PIIF_GATEWAY_URL   required, e.g. http://127.0.0.1:7788
+  PIIF_GATEWAY_SOCKET  required, e.g. ~/.local/state/piifence/run/7788.sock
   PIIF_NOTICE_STATE  default /tmp/piifence-notice-state.json
 """
 
+import http.client
 import json
 import os
 import pathlib
+import socket
 import sys
-import urllib.request
 
-GATEWAY = os.environ["PIIF_GATEWAY_URL"].rstrip("/")
+SOCKET = os.environ["PIIF_GATEWAY_SOCKET"]
 STATE = pathlib.Path(os.environ.get("PIIF_NOTICE_STATE", "/tmp/piifence-notice-state.json"))
+
+
+class SocketConnection(http.client.HTTPConnection):
+    """HTTP over the gateway's control socket, a Unix socket, instead of TCP."""
+
+    def __init__(self, path, timeout):
+        super().__init__("127.0.0.1", timeout=timeout)
+        self.socket_path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.socket_path)
+
+
+def fetch_stats():
+    """The gateway's /stats, read on its control socket. An answer other than 200 is an error."""
+    conn = SocketConnection(SOCKET, 1.5)
+    try:
+        conn.request("GET", "/stats")
+        resp = conn.getresponse()
+        body = resp.read()
+    finally:
+        conn.close()
+    if resp.status != 200:
+        raise RuntimeError(f"the gateway answered /stats with {resp.status}")
+    return json.loads(body)
 
 
 def emit(payload):
@@ -35,8 +63,7 @@ def previous_total():
 def main():
     raw = sys.stdin.read()
     hook = json.loads(raw)["hook_event_name"] if raw.strip() else ""
-    with urllib.request.urlopen(GATEWAY + "/stats", timeout=1.5) as resp:
-        stats = json.loads(resp.read())
+    stats = fetch_stats()
 
     # `values` counts each distinct value once; the per-span counter grows every turn because the history is re-sent.
     total = int(stats["values"])

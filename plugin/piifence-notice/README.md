@@ -4,7 +4,7 @@ Shows a Claude Code notice (a `systemMessage`) whenever the piifence gateway rep
 
 ## Loading
 
-`piifence claude` loads the plugin for its session with `--plugin-dir` and sets `PIIF_GATEWAY_URL`. `scripts/install.sh` installs it to `~/.local/share/piifence/plugin/piifence-notice`. Nothing is copied into your Claude Code config.
+`piifence claude` loads the plugin for its session with `--plugin-dir` and sets `PIIF_GATEWAY_SOCKET`, the gateway's control socket: a Unix socket in a directory only you can open, and the only place the gateway serves `/stats`. `scripts/install.sh` installs it to `~/.local/share/piifence/plugin/piifence-notice`. Nothing is copied into your Claude Code config.
 
 Requires `python3` (standard library only).
 

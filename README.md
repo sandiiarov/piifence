@@ -85,6 +85,8 @@ There is nothing to switch on. Every secret found is replaced.
 
 > [!IMPORTANT]
 > The gateway serves only `piifence claude` sessions. Plain `claude` pointed at the gateway is refused, because its requests lack the session id that `piifence claude` adds.
+>
+> The gateway hands a session's values only to your own account. `piifence env`, the `PreToolUse` hook and the notice reach it on a Unix socket in `~/.local/state/piifence/run/`, a directory only you can open. Its TCP port, which every account on the Mac can reach, serves only the proxy and a health check.
 
 ## 🔍 What it catches
 
@@ -135,7 +137,7 @@ flowchart LR
 
 `piifence claude` starts the gateway, gives the session a random id, and launches Claude Code with a temporary settings file and the notice plugin:
 
-- **The gateway** is a proxy on `127.0.0.1:7788`. It scans every outgoing request (prompt, tool output, files, system prompt) and replaces each secret with its `$PIIF_SECRET_*` name. It keeps the values in memory and hands them only to the session they belong to. It also saves each conversation's names, encrypted, so a resumed conversation gets them back (see [Guarantees](#guarantees)).
+- **The gateway** is a proxy on `127.0.0.1:7788`. It scans every outgoing request (prompt, tool output, files, system prompt) and replaces each secret with its `$PIIF_SECRET_*` name. It keeps the values in memory and hands them only to the session they belong to, and only on its control socket, `~/.local/state/piifence/run/7788.sock`, never on its TCP port. It also saves each conversation's names, encrypted, so a resumed conversation gets them back (see [Guarantees](#guarantees)).
 - **A `SessionStart` hook** gives the agent the note about `$PIIF_*` names, and tells the gateway which Claude Code conversation the session is. It also adds one line to the file that Claude Code loads before every Bash command (`CLAUDE_ENV_FILE`). That line runs `piifence env`, which fetches the session's values from the gateway and exports them.
 - **A `PreToolUse` hook** runs `piifence restore` before every other tool call. When the tool's input holds a `$PIIF_SECRET_*` name, it fetches the session's values and puts each value in place of its name. If the gateway doesn't answer or a name is unknown, the hook blocks the call instead of letting the tool run with a name where a value belongs.
 
@@ -160,6 +162,7 @@ sequenceDiagram
 - 🔁 **Names are stable.** The same value gets the same name on every turn, so the conversation stays consistent and prompt caching keeps working.
 - ⏯️ **Names survive a restart.** The agent's own messages, and scripts it wrote, hold names like `$PIIF_SECRET_39`. So the gateway saves each conversation's name→value table, and `piifence claude -c` or `--resume` loads it back, even after the gateway restarted. The table is a file in `~/.local/state/piifence/names/`, named after the conversation id, readable only by you, and encrypted (XChaCha20-Poly1305) with a random key kept in your macOS login Keychain (service `piifence`, account `names-key`). A table nobody has resumed for 30 days is deleted.
 - 🙈 **No raw values are written in the clear.** Apart from that encrypted table, values live only in the gateway's memory, in the environment of the commands the agent runs, and in the tool inputs the `PreToolUse` hook fills in on your machine. Logs and the notice hold only kinds, counts and masked previews.
+- 👤 **Other accounts on your Mac can't read the values.** Any account can connect to the gateway's TCP port, so the gateway serves only the proxy there. It hands out values, saved names and the notice's previews only on a Unix socket in `~/.local/state/piifence/run/`, a directory only you can open.
 - 🛡️ **A value put back never goes out.** Before detection, the gateway replaces every value it has named in the session with its name, everywhere in the request. After detection it sweeps the whole request again, so a value first found late in a request is also replaced where it appeared earlier, and in fields that are not scanned. So a value that comes back in a file the agent reads, or in command output, leaves your machine as its name. Only thinking blocks (signed by the provider, so they can't be changed), base64 attachments and the request's `metadata` are left as they are.
 - 🚫 **It fails closed.** If a request can't be fully scanned, it is blocked, not sent. If the gateway can't start, Claude Code isn't launched.
 
@@ -213,7 +216,7 @@ Inline `gitleaks:allow` comments and `.gitleaksignore` files have no effect on t
 | `PIIF_CONFIG` | `~/.config/piifence/config.toml` | The config file. |
 | `PIIF_DATA_DIR` | `~/.local/share/piifence` (Homebrew: `$(brew --prefix)/opt/piifence/share/piifence`) | Where the model and the notice plugin are installed. |
 | `PIIF_CACHE_DIR` | `~/.cache/piifence` | Where the detection cache is kept. |
-| `PIIF_STATE_DIR` | `~/.local/state/piifence` | Where each conversation's encrypted names are kept, in `names/`. |
+| `PIIF_STATE_DIR` | `~/.local/state/piifence` | Where each conversation's encrypted names are kept, in `names/`, and the gateway's control socket, in `run/`. |
 | `PIIF_GATEWAY_LOG` | `$TMPDIR/piifence-gateway.log` | The gateway's own log. |
 | `PIIF_EXIT_WHEN_UNUSED` | `10` | Seconds a gateway started by `piifence claude` keeps running after the last `piifence claude` that used it exits. `0` keeps it running until you stop it. |
 | `PIIF_AUDIT_LOG` | `/tmp/piifence-audit.log` | One line per replacement: kind, position, name and masked preview. |
@@ -243,6 +246,7 @@ A value that is set but can't be parsed, such as `PIIF_PORT=abc`, is an error.
 - **A config error**, such as `unknown field` or `invalid allow pattern`. Older versions had settings like `categories` and `auto_approve`, and those are now errors. Keep only `allow` in `~/.config/piifence/config.toml`, or delete the file.
 - **`no upstream configured`**: set `PIIF_UPSTREAM`, or `ANTHROPIC_BASE_URL` in your shell or Claude Code settings.
 - **`a gateway on … forwards to …`**: another session's gateway is using the port with a different provider. Quit that session, or set `PIIF_PORT` to a free port.
+- **`no piifence gateway answers on …`**: something answers on the port, but it is not a gateway this piifence can reach: another program, another account's gateway, a gateway from a piifence older than the control socket, or one started with a different `PIIF_STATE_DIR`. Stop it, or set `PIIF_PORT` to a free port.
 - **`cannot hold a lease`**: a gateway from an older piifence is still running on the port. Quit the sessions that use it, or stop it with `pkill -f piifence-gateway`.
 
 </details>

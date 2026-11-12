@@ -7,12 +7,13 @@
 //!
 //! The override also adds two hooks. `SessionStart` runs `piifence session-start`: it tells the agent what `$PIIF_SECRET_<N>` names are, sends the gateway Claude Code's conversation id so a resumed conversation gets its old names back, and adds a line to Claude Code's `CLAUDE_ENV_FILE`, which Claude Code sources before every Bash command. That line runs `piifence env`, which exports this session's values from the gateway, so a command that names `$PIIF_SECRET_1` gets the real value. `PreToolUse` runs `piifence restore` on every other tool call: it puts the real values into the tool's input, so a file the agent writes or an MCP argument holds the value, not the name.
 //!
-//! Files: `$PIIF_DATA_DIR` (default `~/.local/share/piifence`, which `scripts/install.sh` sets) holds `model/` (the secret model) and `plugin/piifence-notice` (the notice plugin). The gateway binary sits next to this one.
+//! Files: `$PIIF_DATA_DIR` (default `~/.local/share/piifence`, which `scripts/install.sh` sets) holds `model/` (the secret model) and `plugin/piifence-notice` (the notice plugin). The gateway binary sits next to this one. The hooks and the notice plugin reach the gateway on its control socket, `$PIIF_STATE_DIR/run/<port>.sock` (state dir `~/.local/state/piifence` by default), in a directory only the user can open; the gateway hands out no session data on TCP.
 
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -136,8 +137,9 @@ fn run_claude(args: &[String]) -> Result<i32> {
 /// Make sure a gateway that forwards to `upstream` runs on `port`, starting one if none answers, and lease it so it keeps running while this launcher does. A gateway that is shutting down is waited out and replaced. The launcher never stops a gateway: one it started exits by itself after the last lease ends.
 fn ensure_gateway(data: &Path, port: u16, upstream: &str, session_id: &str) -> Result<()> {
     let gateway_url = format!("http://127.0.0.1:{port}");
+    let socket = control_socket(port)?;
     for _ in 0..2 {
-        match running_gateway_upstream(port) {
+        match running_gateway_upstream(port, &socket)? {
             // Reuse only a gateway that forwards to the same place this launch would. Reusing another one would send this session's credentials elsewhere.
             Some(running) if running == upstream => {
                 eprintln!("piifence: using existing gateway on {gateway_url} (upstream {upstream})");
@@ -145,9 +147,9 @@ fn ensure_gateway(data: &Path, port: u16, upstream: &str, session_id: &str) -> R
             Some(running) => bail!(
                 "a gateway on {gateway_url} forwards to {running:?}, but this launch wants {upstream}. Stop that gateway or set PIIF_PORT to a free port."
             ),
-            None => start_gateway(data, port, upstream)?,
+            None => start_gateway(data, port, &socket, upstream)?,
         }
-        if lease(port, session_id)? {
+        if lease(&socket, session_id)? {
             return Ok(());
         }
         wait_until_closed(port)?;
@@ -155,13 +157,14 @@ fn ensure_gateway(data: &Path, port: u16, upstream: &str, session_id: &str) -> R
     bail!("the gateway on {gateway_url} shut down twice while this launch tried to use it; refusing to launch Claude Code (fail closed)")
 }
 
-/// Ask the gateway on `port` to keep running while this process runs session `session_id`. False when the gateway is shutting down (503) or no longer answers. Any other answer means the gateway predates leases.
-fn lease(port: u16, session_id: &str) -> Result<bool> {
+/// Ask the gateway whose control socket is `socket` to keep running while this process runs session `session_id`. False when the gateway is shutting down (503) or no longer answers. Any other answer means the gateway predates leases.
+fn lease(socket: &Path, session_id: &str) -> Result<bool> {
     let headers = format!(
         "x-piifence-session: {session_id}\r\nx-piifence-launcher-pid: {}\r\n",
         std::process::id()
     );
-    let Ok(response) = http_get(port, "/control/lease", &headers, Duration::from_secs(5)) else {
+    let Ok(response) = control_get(socket, "/control/lease", &headers, Duration::from_secs(5))
+    else {
         return Ok(false);
     };
     if response.starts_with("HTTP/1.1 200") {
@@ -171,15 +174,16 @@ fn lease(port: u16, session_id: &str) -> Result<bool> {
         return Ok(false);
     }
     let status = response.lines().next().unwrap_or_default();
+    let socket = socket.display();
     bail!(
-        "the gateway on port {port} cannot hold a lease ({status}); it is probably from an older piifence. Quit the sessions that use it, or stop it with `pkill -f piifence-gateway`, and run again."
+        "the gateway at {socket} cannot hold a lease ({status}); it is probably from an older piifence. Quit the sessions that use it, or stop it with `pkill -f piifence-gateway`, and run again."
     )
 }
 
 /// Wait until the gateway on `port`, which is shutting down, stops answering.
 fn wait_until_closed(port: u16) -> Result<()> {
     let deadline = Instant::now() + GATEWAY_START_TIMEOUT;
-    while running_gateway_upstream(port).is_some() {
+    while tcp_answers(port) {
         if Instant::now() >= deadline {
             bail!(
                 "the gateway on port {port} did not shut down in {} s",
@@ -192,7 +196,7 @@ fn wait_until_closed(port: u16) -> Result<()> {
 }
 
 /// Start a gateway that exits by itself once no launcher holds a lease, and wait until a gateway that forwards to `upstream` is healthy. Claude Code is never launched without one (fail closed).
-fn start_gateway(data: &Path, port: u16, upstream: &str) -> Result<()> {
+fn start_gateway(data: &Path, port: u16, socket: &Path, upstream: &str) -> Result<()> {
     let exe = real_exe()?;
     let gateway_bin = existing(exe.with_file_name("piifence-gateway"), "the gateway binary")?;
     let model_dir = existing(data.join("model"), "the secret model")?;
@@ -221,7 +225,7 @@ fn start_gateway(data: &Path, port: u16, upstream: &str) -> Result<()> {
         .spawn()
         .with_context(|| format!("could not start the gateway {}", gateway_bin.display()))?;
 
-    if let Err(err) = wait_healthy(port, upstream, &mut child) {
+    if let Err(err) = wait_healthy(port, socket, upstream, &mut child) {
         let _ = child.kill();
         let _ = child.wait();
         let lines = match fs::read_to_string(&gateway_log) {
@@ -248,6 +252,7 @@ fn run_session(
     args: &[String],
     session_id: &str,
 ) -> Result<i32> {
+    let socket = control_socket(port)?;
     let settings_path = write_settings_override(gateway_url, port, session_id)
         .context("cannot write the session settings")?;
     let claude = env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
@@ -257,7 +262,7 @@ fn run_session(
         .arg("--plugin-dir")
         .arg(plugin)
         .args(args)
-        .env("PIIF_GATEWAY_URL", gateway_url)
+        .env("PIIF_GATEWAY_SOCKET", &socket)
         .status();
     let _ = fs::remove_file(&settings_path);
     let status = status.with_context(|| format!("failed to run `{claude}`"))?;
@@ -299,13 +304,42 @@ fn user_settings_env(name: &str) -> Result<Option<String>> {
 /// Raw HTTP response to `GET path` on the loopback port, with `headers` (`Name: value` lines).
 fn http_get(port: u16, path: &str, headers: &str, timeout: Duration) -> std::io::Result<String> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(300))?;
+    let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(300))?;
     stream.set_read_timeout(Some(timeout))?;
+    send_get(stream, &format!("127.0.0.1:{port}"), path, headers)
+}
+
+/// The control socket of the gateway on `port` (see `piifence::control`).
+fn control_socket(port: u16) -> Result<PathBuf> {
+    Ok(piifence::control::socket_path(
+        &piifence::control::state_dir()?,
+        port,
+    ))
+}
+
+/// Raw HTTP response to `GET path` on the gateway's control socket `socket`, with `headers` (`Name: value` lines).
+fn control_get(
+    socket: &Path,
+    path: &str,
+    headers: &str,
+    timeout: Duration,
+) -> std::io::Result<String> {
+    let stream = UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    send_get(stream, "127.0.0.1", path, headers)
+}
+
+/// Send `GET path` with the Host `host` and `headers` over `stream`, and return the whole raw response.
+fn send_get(
+    mut stream: impl Read + Write,
+    host: &str,
+    path: &str,
+    headers: &str,
+) -> std::io::Result<String> {
     stream.write_all(
-        format!(
-            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{headers}Connection: close\r\n\r\n"
-        )
-        .as_bytes(),
+        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{headers}Connection: close\r\n\r\n")
+            .as_bytes(),
     )?;
     // The gateway closes the connection after the response (Connection: close), so reading to the end gets the whole reply.
     let mut buf = Vec::new();
@@ -313,26 +347,53 @@ fn http_get(port: u16, path: &str, headers: &str, timeout: Duration) -> std::io:
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// The upstream a healthy gateway on `port` reports, or None when nothing healthy answers there.
-fn running_gateway_upstream(port: u16) -> Option<String> {
-    let response = http_get(port, "/health", "", Duration::from_millis(500)).ok()?;
-    if !response.starts_with("HTTP/1.1 200") {
-        return None;
+/// Whether anything on the loopback port answers `GET /health` with an HTTP response. A gateway answers there only once it serves both its TCP port and its control socket.
+fn tcp_answers(port: u16) -> bool {
+    http_get(port, "/health", "", Duration::from_millis(500))
+        .is_ok_and(|response| response.starts_with("HTTP/"))
+}
+
+/// The upstream of the gateway on `port`, or None when nothing answers there. The upstream comes from `/health` on the gateway's control socket, which only this user's processes can reach. So a port that answers on TCP while its control socket does not is an error, never reused: another program, another account's gateway, a gateway from an older piifence or one started with a different `PIIF_STATE_DIR` holds it. TCP is asked first because a gateway answers there only once its socket is bound.
+fn running_gateway_upstream(port: u16, socket: &Path) -> Result<Option<String>> {
+    if !tcp_answers(port) {
+        return Ok(None);
     }
-    response.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.trim()
-            .eq_ignore_ascii_case("x-piifence-upstream")
-            .then(|| value.trim().to_string())
-    })
+    let response = control_get(socket, "/health", "", Duration::from_millis(500)).with_context(|| {
+        format!(
+            "something answers on 127.0.0.1:{port}, but no piifence gateway answers on {}. Another program, another account's gateway, a gateway from an older piifence or one started with a different PIIF_STATE_DIR holds the port. Stop it, or set PIIF_PORT to a free port.",
+            socket.display()
+        )
+    })?;
+    if !response.starts_with("HTTP/1.1 200") {
+        bail!(
+            "the gateway's control socket {} answered /health with {}",
+            socket.display(),
+            response.lines().next().unwrap_or_default()
+        );
+    }
+    let upstream = response
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("x-piifence-upstream")
+                .then(|| value.trim().to_string())
+        })
+        .with_context(|| {
+            format!(
+                "the gateway's control socket {} did not name its upstream",
+                socket.display()
+            )
+        })?;
+    Ok(Some(upstream))
 }
 
 /// Wait until a gateway that forwards to `upstream` answers on `port`. Another launcher may start a gateway at the same moment, and only one of the two gets the port; the other one's gateway is used when it forwards to the same upstream.
-fn wait_healthy(port: u16, upstream: &str, child: &mut Child) -> Result<()> {
+fn wait_healthy(port: u16, socket: &Path, upstream: &str, child: &mut Child) -> Result<()> {
     let deadline = Instant::now() + GATEWAY_START_TIMEOUT;
     while Instant::now() < deadline {
         let exited = child.try_wait()?;
-        match running_gateway_upstream(port) {
+        match running_gateway_upstream(port, socket)? {
             Some(running) if running == upstream => return Ok(()),
             Some(running) => bail!(
                 "a gateway that forwards to {running:?} took port {port} first, but this launch wants {upstream}. Set PIIF_PORT to a free port."
@@ -481,13 +542,19 @@ fn session_start(args: &[String]) -> Result<i32> {
 
 /// Tell the gateway which Claude Code conversation this session is, so it loads the names a resumed conversation already uses and stores new ones (encrypted, with a key kept in the Keychain).
 fn bind_conversation(session: &str, port: u16, conversation: &str) -> Result<()> {
-    let response = http_get(
-        port,
+    let socket = control_socket(port)?;
+    let response = control_get(
+        &socket,
         "/control/conversation",
         &format!("x-piifence-session: {session}\r\nx-piifence-conversation: {conversation}\r\n"),
         Duration::from_secs(30),
     )
-    .with_context(|| format!("the gateway on port {port} did not answer"))?;
+    .with_context(|| {
+        format!(
+            "the gateway's control socket {} did not answer",
+            socket.display()
+        )
+    })?;
     if !response.starts_with("HTTP/1.1 200") {
         let body = response.split_once("\r\n\r\n").map_or("", |(_, body)| body);
         bail!("the gateway could not load this conversation's names: {body}");
@@ -623,13 +690,19 @@ fn fill_values(
 
 /// This session's `{name: value}` map from the gateway's `/control/env`.
 fn session_values(session: &str, port: u16) -> Result<serde_json::Map<String, serde_json::Value>> {
-    let response = http_get(
-        port,
+    let socket = control_socket(port)?;
+    let response = control_get(
+        &socket,
         "/control/env",
         &format!("x-piifence-session: {session}\r\n"),
         Duration::from_secs(2),
     )
-    .with_context(|| format!("the gateway on port {port} did not answer"))?;
+    .with_context(|| {
+        format!(
+            "the gateway's control socket {} did not answer",
+            socket.display()
+        )
+    })?;
     let (head, body) = response
         .split_once("\r\n\r\n")
         .context("the gateway sent a malformed response")?;
@@ -765,44 +838,93 @@ mod tests {
         assert!(session_args(&ok[..1]).is_err());
     }
 
-    /// The port of a one-request HTTP server on loopback that reads a whole request and answers `status` with an empty body.
-    fn answer_once(status: &'static str) -> u16 {
+    /// Read one whole HTTP request from `stream`, then answer with `head` (a status line, optionally followed by header lines, joined by `\r\n`) and an empty body. Answering before the request is read can reset the connection and make a test flaky.
+    fn answer(mut stream: impl Read + Write, head: &str) {
+        let mut request = Vec::new();
+        let mut buf = [0u8; 512];
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = stream.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..n]);
+        }
+        let reply = format!("{head}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        stream.write_all(reply.as_bytes()).unwrap();
+    }
+
+    /// The port of a loopback TCP server that answers one request with `head`.
+    fn tcp_answering(head: &'static str) -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut buf = [0u8; 512];
-            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                let n = stream.read(&mut buf).unwrap();
-                if n == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buf[..n]);
-            }
-            let reply =
-                format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-            stream.write_all(reply.as_bytes()).unwrap();
-        });
+        thread::spawn(move || answer(listener.accept().unwrap().0, head));
         port
+    }
+
+    /// A Unix socket path in the temp dir that no other test uses, with nothing listening on it.
+    fn unused_socket_path() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = env::temp_dir().join(format!("piif-test-{}-{n}.sock", std::process::id()));
+        let _ = fs::remove_file(&path);
+        path
+    }
+
+    /// The path of a Unix socket whose server answers one request with `head`, then removes the socket file.
+    fn socket_answering(head: &'static str) -> PathBuf {
+        let path = unused_socket_path();
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let file = path.clone();
+        thread::spawn(move || {
+            answer(listener.accept().unwrap().0, head);
+            fs::remove_file(file).unwrap();
+        });
+        path
     }
 
     #[test]
     fn a_lease_is_held_on_200_and_refused_on_503_or_no_answer() {
         let session = "0".repeat(32);
-        assert!(lease(answer_once("200 OK"), &session).unwrap());
-        assert!(!lease(answer_once("503 Service Unavailable"), &session).unwrap());
+        assert!(lease(&socket_answering("HTTP/1.1 200 OK"), &session).unwrap());
+        assert!(!lease(
+            &socket_answering("HTTP/1.1 503 Service Unavailable"),
+            &session
+        )
+        .unwrap());
+        assert!(!lease(&unused_socket_path(), &session).unwrap());
+    }
+
+    #[test]
+    fn a_lease_on_a_gateway_that_predates_leases_is_an_error() {
+        let err = lease(&socket_answering("HTTP/1.1 404 Not Found"), &"0".repeat(32)).unwrap_err();
+        assert!(format!("{err:#}").contains("older piifence"), "{err:#}");
+    }
+
+    #[test]
+    fn a_gateway_is_trusted_only_when_its_control_socket_answers() {
         let closed = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap()
             .port();
-        assert!(!lease(closed, &session).unwrap());
-    }
+        assert_eq!(
+            running_gateway_upstream(closed, &unused_socket_path()).unwrap(),
+            None
+        );
 
-    #[test]
-    fn a_lease_on_a_gateway_that_predates_leases_is_an_error() {
-        let err = lease(answer_once("404 Not Found"), &"0".repeat(32)).unwrap_err();
-        assert!(format!("{err:#}").contains("older piifence"), "{err:#}");
+        let squatted = tcp_answering("HTTP/1.1 200 OK");
+        let err = running_gateway_upstream(squatted, &unused_socket_path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no piifence gateway answers"),
+            "{err:#}"
+        );
+
+        let port = tcp_answering("HTTP/1.1 200 OK");
+        let socket =
+            socket_answering("HTTP/1.1 200 OK\r\nx-piifence-upstream: http://upstream.test");
+        assert_eq!(
+            running_gateway_upstream(port, &socket).unwrap().as_deref(),
+            Some("http://upstream.test")
+        );
     }
 }
