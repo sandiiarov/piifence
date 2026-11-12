@@ -5,7 +5,7 @@
 //!
 //! It starts the gateway if it is not already healthy (upstream derived from the user's current Claude Code settings), points this Claude Code session at it with a temporary `--settings` override, takes a lease on the gateway, and runs Claude Code. It never stops a gateway: one it started exits by itself once no `piifence claude` has held a lease for `PIIF_EXIT_WHEN_UNUSED` seconds (10 by default). The user's settings file is never modified.
 //!
-//! The override also adds two hooks. `SessionStart` runs `piifence session-start`: it tells the agent what `$PIIF_SECRET_<N>` names are, sends the gateway Claude Code's conversation id so a resumed conversation gets its old names back, and adds a line to Claude Code's `CLAUDE_ENV_FILE`, which Claude Code sources before every Bash command. That line runs `piifence env`, which exports this session's values from the gateway, so a command that names `$PIIF_SECRET_1` gets the real value. `PreToolUse` runs `piifence restore` on every other tool call: it puts the real values into the tool's input, so a file the agent writes or an MCP argument holds the value, not the name.
+//! The override also adds two hooks. `SessionStart` runs `piifence session-start`: it tells the agent what `$PIIF_SECRET_<N>` names are, sends the gateway Claude Code's conversation id so a resumed conversation gets its old names back, and adds a line to Claude Code's `CLAUDE_ENV_FILE`, which Claude Code sources before every Bash command. That line runs `piifence env`, which exports this session's values from the gateway, so a command that names `$PIIF_SECRET_1` gets the real value. `PreToolUse` runs `piifence restore` on every tool call: it puts the real values into the tool's input, so a file the agent writes or an MCP argument holds the value, not the name; a backslash before a name's `$` counts as part of the name. In Bash and Monitor commands it fills in only the names the shell would not expand (single quotes, quoted heredocs, an escaped `$`), escaped for where they stand; PowerShell is skipped.
 //!
 //! Files: `$PIIF_DATA_DIR` (default `~/.local/share/piifence`, which `scripts/install.sh` sets) holds `model/` (the secret model) and `plugin/piifence-notice` (the notice plugin). The gateway binary sits next to this one. The hooks and the notice plugin reach the gateway on its control socket, `$PIIF_STATE_DIR/run/<port>.sock` (state dir `~/.local/state/piifence` by default), in a directory only the user can open; the gateway hands out no session data on TCP.
 
@@ -477,7 +477,7 @@ const VARIABLES_NOTE: &str = "# piifence environment variables
 
 This session runs through piifence, which keeps secrets (API keys, tokens, passwords, private keys) from reaching you. Before anything is sent to you (the user's prompts, command output, file contents), piifence replaces each secret with an environment variable name such as `$PIIF_SECRET_1`. The real value stays on the user's machine.
 
-- Use the name in Bash commands, inside double quotes, where you would use the value: `curl -H \"Authorization: Bearer $PIIF_SECRET_1\" …`. piifence exports the variables before each command runs, so the shell expands the name, and scripts the command starts can read the variable too. Single quotes and quoted heredocs (`<<'EOF'`) stop the shell from expanding it.
+- Use the name in Bash commands, inside double quotes, where you would use the value: `curl -H \"Authorization: Bearer $PIIF_SECRET_1\" …`. piifence exports the variables before each command runs, so the shell expands the name, and scripts the command starts can read the variable too. Where the shell would not expand a name (single quotes, quoted heredocs such as `<<'EOF'`), piifence puts the value in before the command runs, so a commit message or a file written from a command gets the value too. Never put a backslash before a name to keep it as text: the name stands for the value, and piifence fills in the value there as well.
 - Everywhere else, write the name where the value belongs: in file contents (Write, Edit), in an edit's old text, and in arguments to other tools (MCP tools, for example). piifence puts the real value in before the tool runs, so a file you write holds the value and an edit matches the file.
 - When a letter, digit or `_` comes right after a name, piifence writes the name in braces, as in `${PIIF_SECRET_…}_old`. Keep the braces when you use the name, in commands and in files: without them, the shell reads a longer variable name that does not exist.
 - Files, environment variables and command output on the user's machine hold the real value; only what is sent to you shows the name. A value you see as a `$PIIF_…` name was not exposed to you or the provider: do not warn that it leaked or suggest rotating it on that account.
@@ -569,10 +569,10 @@ fn print_env(args: &[String]) -> Result<i32> {
     Ok(0)
 }
 
-/// Tools whose input a shell reads, which expands `$PIIF_SECRET_<N>` itself from the exported variables. Putting a raw value into a command would break its quoting.
-const SHELL_TOOLS: &[&str] = &["Bash", "PowerShell", "Monitor"];
+/// Tools whose input a shell reads, which expands `$PIIF_SECRET_<N>` itself from the exported variables, so the hook fills in only the names the shell would not expand (`piifence::shellfill`). The hook leaves `PowerShell` commands alone.
+const SHELL_TOOLS: &[&str] = &["Bash", "Monitor"];
 
-/// `piifence restore <session> <port>`, the `PreToolUse` hook. The agent only ever sees names, so it writes `$PIIF_SECRET_<N>` into file contents, edits, and MCP tool arguments, where no shell expands it. This puts each known name's real value back into the tool's input before the tool runs. Shell tools and inputs without a name are left alone. A failure exits 2, which blocks the call, so a tool never runs with a name where a value belongs.
+/// `piifence restore <session> <port>`, the `PreToolUse` hook. The agent only ever sees names, so it writes `$PIIF_SECRET_<N>` into file contents, edits, and MCP tool arguments, where no shell expands it. This puts each known name's real value back into the tool's input before the tool runs. A backslash that escapes a name's `$` goes with the name. In `Bash` and `Monitor` commands only the names the shell would not expand are filled in, escaped for where they stand (`SHELL_TOOLS`). `PowerShell` and inputs without a name are left alone. A failure exits 2, which blocks the call, so a tool never runs with a name where a value belongs.
 fn restore(args: &[String]) -> Result<i32> {
     match restored_input(args) {
         Ok(Some(input)) => {
@@ -592,7 +592,7 @@ fn restore(args: &[String]) -> Result<i32> {
     }
 }
 
-/// The hook's tool input with names replaced by values, or None when nothing changes.
+/// The hook's tool input with names replaced by values (in a shell command, only the names the shell would not expand), or None when nothing changes.
 fn restored_input(args: &[String]) -> Result<Option<serde_json::Value>> {
     let (session, port) = session_args(args)?;
     let mut input = String::new();
@@ -604,13 +604,28 @@ fn restored_input(args: &[String]) -> Result<Option<serde_json::Value>> {
     let tool = hook["tool_name"]
         .as_str()
         .context("the hook input has no tool_name")?;
-    if SHELL_TOOLS.contains(&tool) {
+    if tool == "PowerShell" {
         return Ok(None);
     }
     let mut tool_input = hook
         .get("tool_input")
         .context("the hook input has no tool_input")?
         .clone();
+    if SHELL_TOOLS.contains(&tool) {
+        let Some(command) = tool_input["command"].as_str() else {
+            return Ok(None);
+        };
+        if !name_pattern().is_match(command) {
+            return Ok(None);
+        }
+        let values = session_values(session, port)?;
+        let value_of = |var: &str| values.get(var).and_then(|v| v.as_str()).map(str::to_string);
+        let Some(command) = piifence::shellfill::fill_command(command, &value_of)? else {
+            return Ok(None);
+        };
+        tool_input["command"] = command.into();
+        return Ok(Some(tool_input));
+    }
     if !names_in(&tool_input) {
         return Ok(None);
     }
@@ -619,9 +634,9 @@ fn restored_input(args: &[String]) -> Result<Option<serde_json::Value>> {
     Ok(Some(tool_input))
 }
 
-/// `$PIIF_SECRET_12` or `${PIIF_SECRET_12}`; the number is read whole, so `_1` never matches inside `_12`.
+/// `$PIIF_SECRET_12` or `${PIIF_SECRET_12}`; the number is read whole, so `_1` never matches inside `_12`. Group 1 holds the backslashes right before the `$`: an odd count escapes the `$`, so the escaping backslash belongs to the name.
 fn name_pattern() -> regex::Regex {
-    regex::Regex::new(r"\$(?:\{PIIF_SECRET_(\d+)\}|PIIF_SECRET_(\d+))").expect("valid pattern")
+    regex::Regex::new(r"(\\*)\$(?:\{PIIF_SECRET_(\d+)\}|PIIF_SECRET_(\d+))").expect("valid pattern")
 }
 
 /// Whether any string in `value` holds a name.
@@ -642,7 +657,7 @@ fn names_in(value: &serde_json::Value) -> bool {
 /// The first bare name in `text` that a letter, digit or `_` follows directly. A shell reads such a name as a longer, different variable, so the hook refuses it instead of guessing.
 fn glued_name(pattern: &regex::Regex, text: &str) -> Option<String> {
     pattern.captures_iter(text).find_map(|caps| {
-        let number = caps.get(2)?;
+        let number = caps.get(3)?;
         let end = caps.get(0)?.end();
         text[end..]
             .starts_with(|c: char| c.is_alphanumeric() || c == '_')
@@ -665,10 +680,13 @@ fn fill_values(
                 }
                 let mut missing = None;
                 let filled = pattern.replace_all(s, |caps: &regex::Captures| {
-                    let number = caps.get(1).or(caps.get(2)).map_or("", |m| m.as_str());
+                    let number = caps.get(2).or(caps.get(3)).map_or("", |m| m.as_str());
                     let name = format!("PIIF_SECRET_{number}");
                     match values.get(&name).and_then(|v| v.as_str()) {
-                        Some(real) => real.to_string(),
+                        Some(real) => {
+                            let slashes = &caps[1];
+                            format!("{}{real}", &slashes[..slashes.len() / 2 * 2])
+                        }
                         None => {
                             missing.get_or_insert(name);
                             caps[0].to_string()
@@ -798,6 +816,22 @@ mod tests {
         let mut input = serde_json::json!({"content": format!("{}-x {}x", bare(1), braced(1))});
         fill_values(&mut input, values).unwrap();
         assert_eq!(input["content"], "one-x onex");
+    }
+
+    #[test]
+    fn fill_values_takes_an_escaping_backslash_with_the_name() {
+        let values = serde_json::json!({"PIIF_SECRET_1": "one"});
+        let values = values.as_object().unwrap();
+        for (text, want) in [
+            (format!("\\{}: x", bare(1)), "one: x"),
+            (format!("\\{}: x", braced(1)), "one: x"),
+            (format!("\\\\{}", bare(1)), "\\\\one"),
+            (format!("\\\\\\{}", bare(1)), "\\\\one"),
+        ] {
+            let mut input = serde_json::json!({ "content": text });
+            fill_values(&mut input, values).unwrap();
+            assert_eq!(input["content"], want, "{text}");
+        }
     }
 
     #[test]
