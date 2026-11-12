@@ -10,6 +10,7 @@
 //! Files: `$PIIF_DATA_DIR` (default `~/.local/share/piifence`, which `scripts/install.sh` sets) holds `model/` (the secret model) and `plugin/piifence-notice` (the notice plugin). The gateway binary sits next to this one. The hooks and the notice plugin reach the gateway on its control socket, `$PIIF_STATE_DIR/run/<port>.sock` (state dir `~/.local/state/piifence` by default), in a directory only the user can open; the gateway hands out no session data on TCP.
 
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -35,6 +36,7 @@ fn main() {
         Some("session-start") => session_start(&args[1..]),
         Some("env") => print_env(&args[1..]),
         Some("restore") => restore(&args[1..]),
+        Some("nested-claude") => run_nested_claude(&args[1..]),
         Some("-h") | Some("--help") | Some("help") | None => {
             usage();
             Ok(0)
@@ -134,7 +136,17 @@ fn run_claude(args: &[String]) -> Result<i32> {
 
     let session_id = new_session_id().context("cannot create a session id")?;
     ensure_gateway(&data, port, &upstream, &session_id)?;
-    run_session(&gateway_url, port, &plugin, args, &session_id)
+    let claude = env::var_os("CLAUDE_BIN").unwrap_or_else(|| "claude".into());
+    run_session(
+        &gateway_url,
+        port,
+        &plugin,
+        args,
+        &session_id,
+        &custom_headers(&session_id)?,
+        false,
+        &claude,
+    )
 }
 
 /// Make sure a gateway that forwards to `upstream` runs on `port`, starting one if none answers, and lease it so it keeps running while this launcher does. A gateway that is shutting down is waited out and replaced. The launcher never stops a gateway: one it started exits by itself after the last lease ends.
@@ -248,18 +260,21 @@ fn start_gateway(data: &Path, port: u16, socket: &Path, upstream: &str) -> Resul
 }
 
 /// Run Claude Code against the gateway with the session's settings override and the notice plugin. Returns Claude Code's exit code.
+#[allow(clippy::too_many_arguments)]
 fn run_session(
     gateway_url: &str,
     port: u16,
     plugin: &Path,
     args: &[String],
     session_id: &str,
+    headers: &str,
+    nested: bool,
+    claude: &OsStr,
 ) -> Result<i32> {
     let socket = control_socket(port)?;
-    let settings_path = write_settings_override(gateway_url, port, session_id)
+    let settings_path = write_settings_override(gateway_url, port, session_id, headers, nested)
         .context("cannot write the session settings")?;
-    let claude = env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
-    let status = Command::new(&claude)
+    let status = Command::new(claude)
         .arg("--settings")
         .arg(&settings_path)
         .arg("--plugin-dir")
@@ -268,7 +283,7 @@ fn run_session(
         .env("PIIF_GATEWAY_SOCKET", &socket)
         .status();
     let _ = fs::remove_file(&settings_path);
-    let status = status.with_context(|| format!("failed to run `{claude}`"))?;
+    let status = status.with_context(|| format!("failed to run `{}`", claude.to_string_lossy()))?;
     Ok(status.code().unwrap_or(1))
 }
 
@@ -436,13 +451,14 @@ fn custom_headers(session_id: &str) -> Result<String> {
     )
 }
 
-/// The session's hooks, run by this binary's real path: `SessionStart` (`piifence session-start <session> <port>`) sets the session up, and `PreToolUse` (`piifence restore <session> <port>`, every tool) puts real values back into tool input.
-fn session_hooks(port: u16, session_id: &str) -> Result<serde_json::Value> {
+/// The session's hooks, run by this binary's real path: `SessionStart` (`piifence session-start <session> <port>`, with a trailing `nested` for a `claude` started inside a session) sets the session up, and `PreToolUse` (`piifence restore <session> <port>`, every tool) puts real values back into tool input.
+fn session_hooks(port: u16, session_id: &str, nested: bool) -> Result<serde_json::Value> {
     let exe = shell_quote(&real_exe()?.to_string_lossy());
+    let tail = if nested { " nested" } else { "" };
     Ok(serde_json::json!({
         "SessionStart": [{"hooks": [{
             "type": "command",
-            "command": format!("{exe} session-start {session_id} {port}"),
+            "command": format!("{exe} session-start {session_id} {port}{tail}"),
         }]}],
         "PreToolUse": [{"matcher": "*", "hooks": [{
             "type": "command",
@@ -451,18 +467,27 @@ fn session_hooks(port: u16, session_id: &str) -> Result<serde_json::Value> {
     }))
 }
 
-/// Write the per-session settings override. The name holds the random session id and the file is created with `create_new`, so a file or symlink planted at a guessable /tmp path cannot make this write land somewhere else. Mode 0600 is set at creation.
-fn write_settings_override(gateway_url: &str, port: u16, session_id: &str) -> Result<PathBuf> {
+/// Write the per-process settings override, with `headers` as `ANTHROPIC_CUSTOM_HEADERS`. The name holds the session id and a random id, and the file is created with `create_new`, so a file or symlink planted at a guessable /tmp path cannot make this write land somewhere else, and two processes on one session do not collide. Mode 0600 is set at creation.
+fn write_settings_override(
+    gateway_url: &str,
+    port: u16,
+    session_id: &str,
+    headers: &str,
+    nested: bool,
+) -> Result<PathBuf> {
     use std::os::unix::fs::OpenOptionsExt;
-    let path = env::temp_dir().join(format!("piifence-claude-settings-{session_id}.json"));
+    let nonce = new_session_id().context("cannot create a settings file name")?;
+    let path = env::temp_dir().join(format!(
+        "piifence-claude-settings-{session_id}-{nonce}.json"
+    ));
     let content = format!(
         "{}\n",
         serde_json::json!({
             "env": {
                 "ANTHROPIC_BASE_URL": gateway_url,
-                "ANTHROPIC_CUSTOM_HEADERS": custom_headers(session_id)?,
+                "ANTHROPIC_CUSTOM_HEADERS": headers,
             },
-            "hooks": session_hooks(port, session_id)?,
+            "hooks": session_hooks(port, session_id, nested)?,
         })
     );
     fs::OpenOptions::new()
@@ -501,21 +526,24 @@ fn session_args(args: &[String]) -> Result<(&str, u16)> {
     Ok((session.as_str(), port))
 }
 
-/// `piifence session-start <session> <port>`, the `SessionStart` hook. Adds the line that runs `piifence env` to `CLAUDE_ENV_FILE` (once per file), binds the session to Claude Code's conversation id (see `bind_conversation`), and answers with VARIABLES_NOTE as context for the agent. A failure exits non-zero, so Claude Code shows it.
+/// `piifence session-start <session> <port> [nested]`, the `SessionStart` hook. Installs the `claude` shim, adds the line that runs `piifence env` to `CLAUDE_ENV_FILE` (once per file), binds the session to Claude Code's conversation id (see `bind_conversation`), and answers with VARIABLES_NOTE as context for the agent. A nested session, the hook of a `claude` started inside a piifence session, does not bind, so it does not take over its parent's conversation. A failure exits non-zero, so Claude Code shows it.
 fn session_start(args: &[String]) -> Result<i32> {
     let mut input = String::new();
     std::io::stdin()
         .read_to_string(&mut input)
         .context("read the hook input")?;
+    let (args, nested) = split_nested(args);
     let (session, port) = session_args(args)?;
     let hook: serde_json::Value =
         serde_json::from_str(&input).context("the hook input is not JSON")?;
     let conversation = hook["session_id"]
         .as_str()
         .context("the hook input has no session_id")?;
+    let exe = real_exe()?;
+    install_shim(&shim_dir()?, &exe).context("cannot install the claude shim")?;
     let line = format!(
         "eval \"$({} env {session} {port})\"\n",
-        shell_quote(&real_exe()?.to_string_lossy())
+        shell_quote(&exe.to_string_lossy())
     );
     let path = env::var("CLAUDE_ENV_FILE")
         .context("CLAUDE_ENV_FILE is not set, so Bash commands cannot get $PIIF_* values")?;
@@ -528,7 +556,9 @@ fn session_start(args: &[String]) -> Result<i32> {
     if updated != existing {
         fs::write(&path, updated).with_context(|| format!("cannot write {path}"))?;
     }
-    bind_conversation(session, port, conversation)?;
+    if !nested {
+        bind_conversation(session, port, conversation)?;
+    }
     println!(
         "{}",
         serde_json::json!({
@@ -576,11 +606,144 @@ fn bind_conversation(session: &str, port: u16, conversation: &str) -> Result<()>
     Ok(())
 }
 
-/// `piifence env <session> <port>`: this session's values from the gateway as `export NAME='value'` lines, for the `eval` Claude Code runs before every Bash command. A gateway that does not answer is an error on stderr; the command then runs without the values.
+/// `piifence env <session> <port>`: a line that puts the `claude` shim first on `PATH`, then this session's values from the gateway as `export NAME='value'` lines, for the `eval` Claude Code runs before every Bash command. A gateway that does not answer is an error on stderr; the command then runs without the values.
 fn print_env(args: &[String]) -> Result<i32> {
     let (session, port) = session_args(args)?;
+    print!("{}", path_line(&shim_dir()?));
     print!("{}", export_lines(&session_values(session, port)?));
     Ok(0)
+}
+
+/// A shell line that puts `dir` first on `PATH` unless it is already there, so running it twice adds it once. `piifence env` prints it, so a `claude` that a command starts by name is the shim.
+fn path_line(dir: &Path) -> String {
+    let dir = shell_quote(&dir.to_string_lossy());
+    format!("case \":$PATH:\" in *:{dir}:*) ;; *) PATH={dir}:\"$PATH\"; export PATH ;; esac\n")
+}
+
+/// Where `piifence session-start` puts the `claude` shim: `bin` in piifence's state directory.
+fn shim_dir() -> Result<PathBuf> {
+    Ok(piifence::control::state_dir()?.join("bin"))
+}
+
+/// The `claude` shim, which runs `piifence nested-claude` through `exe`.
+fn shim_script(exe: &Path) -> String {
+    format!(
+        "#!/bin/sh\nexec {} nested-claude \"$@\"\n",
+        shell_quote(&exe.to_string_lossy())
+    )
+}
+
+/// Make `dir/claude` the shim for `exe`, leaving it alone when it already is. The shim is written under a temporary name and renamed, so several sessions starting at once never see a half-written file.
+fn install_shim(dir: &Path, exe: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("cannot create {}", dir.display()))?;
+    let script = shim_script(exe);
+    let target = dir.join("claude");
+    if fs::read_to_string(&target).is_ok_and(|current| current == script) {
+        return Ok(());
+    }
+    let temp = dir.join(format!("claude.{}.tmp", std::process::id()));
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o755)
+        .open(&temp)
+        .and_then(|mut file| file.write_all(script.as_bytes()))
+        .with_context(|| format!("cannot write {}", temp.display()))?;
+    fs::rename(&temp, &target).with_context(|| format!("cannot replace {}", target.display()))?;
+    Ok(())
+}
+
+/// `args` without a trailing `nested`, and whether it was there. The hook of a `claude` started inside a piifence session passes it, so that session does not take over the parent's conversation binding.
+fn split_nested(args: &[String]) -> (&[String], bool) {
+    match args {
+        [rest @ .., last] if last == "nested" => (rest, true),
+        _ => (args, false),
+    }
+}
+
+/// The session id and port of the piifence session named by `ANTHROPIC_CUSTOM_HEADERS` (`headers`) and `ANTHROPIC_BASE_URL` (`base_url`), or None when they do not name one.
+fn nested_session(headers: Option<&str>, base_url: Option<&str>) -> Option<(String, u16)> {
+    let session = headers?.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("x-piifence-session")
+            .then(|| value.trim())
+    })?;
+    if session.len() != 32 || !session.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let base_url = base_url?;
+    let base_url = base_url.strip_suffix('/').unwrap_or(base_url);
+    let port = base_url.strip_prefix("http://127.0.0.1:")?.parse().ok()?;
+    Some((session.to_string(), port))
+}
+
+/// The first executable `claude` on `path` (a `PATH` value) that is not in `shim_dir`, comparing directories by their real paths.
+fn find_claude(path: &OsStr, shim_dir: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let shim_dir = fs::canonicalize(shim_dir).ok();
+    let shim = shim_dir.as_ref().map(|dir| dir.join("claude"));
+    env::split_paths(path).find_map(|dir| {
+        if shim_dir.is_some() && fs::canonicalize(&dir).ok() == shim_dir {
+            return None;
+        }
+        let candidate = dir.join("claude");
+        let real = fs::canonicalize(&candidate).ok()?;
+        if Some(&real) == shim.as_ref() {
+            return None;
+        }
+        let meta = fs::metadata(&candidate).ok()?;
+        (meta.is_file() && meta.permissions().mode() & 0o111 != 0).then_some(candidate)
+    })
+}
+
+/// `piifence nested-claude [claude arguments...]`, what the `claude` shim runs. Inside a piifence session it runs the real `claude` on that session with the same hooks (see `session_hooks`), and refuses when it cannot (no gateway, or the arguments hold `--settings`). Outside one it runs the real `claude` unchanged. It starts no gateway and takes no lease.
+fn run_nested_claude(args: &[String]) -> Result<i32> {
+    let claude = match env::var_os("CLAUDE_BIN") {
+        Some(bin) => PathBuf::from(bin),
+        None => find_claude(&env::var_os("PATH").unwrap_or_default(), &shim_dir()?)
+            .context("cannot find the real `claude` on PATH")?,
+    };
+    let headers = env::var("ANTHROPIC_CUSTOM_HEADERS").ok();
+    let Some((session, port)) = nested_session(
+        headers.as_deref(),
+        env::var("ANTHROPIC_BASE_URL").ok().as_deref(),
+    ) else {
+        let status = Command::new(&claude)
+            .args(args)
+            .status()
+            .with_context(|| format!("failed to run `{}`", claude.display()))?;
+        return Ok(status.code().unwrap_or(1));
+    };
+    if args
+        .iter()
+        .any(|a| a == "--settings" || a.starts_with("--settings="))
+    {
+        bail!("piifence cannot add its hooks to a claude that is given --settings inside a piifence session; drop --settings");
+    }
+    session_values(&session, port).context(
+        "the piifence gateway for this session does not answer, so a claude started here would run without piifence's hooks",
+    )?;
+    let plugin = existing(
+        data_dir()?.join("plugin/piifence-notice"),
+        "the notice plugin",
+    )?;
+    run_session(
+        &format!("http://127.0.0.1:{port}"),
+        port,
+        &plugin,
+        args,
+        &session,
+        headers.as_deref().unwrap_or_default(),
+        true,
+        claude.as_os_str(),
+    )
 }
 
 /// Tools whose input a shell reads, which expands `$PIIF_SECRET_<N>` itself from the exported variables, so the hook fills in only the names the shell would not expand (`piifence::shellfill`). The hook leaves `PowerShell` commands alone.
@@ -862,6 +1025,157 @@ mod tests {
             format!("export OTHER=1\n{line}")
         );
         assert_eq!(env_file_with("", &line), line);
+    }
+
+    #[test]
+    fn split_nested_takes_a_trailing_nested() {
+        let strings = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let with = strings(&["s", "p", "nested"]);
+        assert_eq!(split_nested(&with), (&with[..2], true));
+        let without = strings(&["s", "p"]);
+        assert_eq!(split_nested(&without), (&without[..], false));
+        let first = strings(&["nested", "s", "p"]);
+        assert_eq!(split_nested(&first), (&first[..], false));
+    }
+
+    #[test]
+    fn nested_hooks_skip_the_bind() {
+        let session = "a".repeat(32);
+        let plain = session_hooks(7788, &session, false).unwrap();
+        let nested = session_hooks(7788, &session, true).unwrap();
+        let start = |hooks: &serde_json::Value| {
+            hooks["SessionStart"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert!(start(&nested).ends_with(" nested"), "{}", start(&nested));
+        assert!(start(&plain).ends_with(" 7788"), "{}", start(&plain));
+        assert_eq!(nested["PreToolUse"], plain["PreToolUse"]);
+    }
+
+    #[test]
+    fn nested_session_reads_the_parent_session() {
+        let session = "a".repeat(32);
+        let url = Some("http://127.0.0.1:7788/");
+        let headers = format!("X-Other: 1\nx-piifence-session: {session}");
+        assert_eq!(
+            nested_session(Some(&headers), url),
+            Some((session.clone(), 7788))
+        );
+        let headers = format!("X-Piifence-Session: {session}");
+        assert_eq!(
+            nested_session(Some(&headers), url),
+            Some((session.clone(), 7788))
+        );
+        let short = format!("x-piifence-session: {}", "a".repeat(31));
+        assert_eq!(nested_session(Some(&short), url), None);
+        assert_eq!(
+            nested_session(Some(&headers), Some("https://api.anthropic.com")),
+            None
+        );
+        assert_eq!(nested_session(None, url), None);
+        assert_eq!(nested_session(Some(&headers), None), None);
+    }
+
+    /// A fresh directory in the temp dir for the test `name`, removed first if it exists.
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("piif-test-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Write `content` to `path` (creating its directory) with `mode`.
+    fn write_file(path: &Path, content: &str, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn find_claude_skips_the_shim() {
+        let root = test_dir("find");
+        let (shim, real, plain, link) = (
+            root.join("shim"),
+            root.join("real"),
+            root.join("plain"),
+            root.join("link"),
+        );
+        write_file(&shim.join("claude"), "#!/bin/sh\n", 0o755);
+        write_file(&real.join("claude"), "#!/bin/sh\n", 0o755);
+        write_file(&plain.join("claude"), "#!/bin/sh\n", 0o644);
+        fs::create_dir_all(&link).unwrap();
+        std::os::unix::fs::symlink(shim.join("claude"), link.join("claude")).unwrap();
+
+        let path = env::join_paths([&shim, &plain, &real]).unwrap();
+        assert_eq!(find_claude(&path, &shim), Some(real.join("claude")));
+        let path = env::join_paths([&link, &real]).unwrap();
+        assert_eq!(find_claude(&path, &shim), Some(real.join("claude")));
+        let path = env::join_paths([&shim, &plain]).unwrap();
+        assert_eq!(find_claude(&path, &shim), None);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn install_shim_writes_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = test_dir("shim");
+        let dir = root.join("bin");
+        let exe = Path::new("/opt/piifence/bin/piifence");
+        install_shim(&dir, exe).unwrap();
+        let target = dir.join("claude");
+        let meta = fs::metadata(&target).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o755);
+        assert_eq!(fs::read_to_string(&target).unwrap(), shim_script(exe));
+
+        install_shim(&dir, exe).unwrap();
+        assert_eq!(
+            fs::metadata(&target).unwrap().modified().unwrap(),
+            meta.modified().unwrap()
+        );
+
+        let other = Path::new("/opt/other/piifence");
+        install_shim(&dir, other).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), shim_script(other));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn path_line_adds_the_directory_once() {
+        let line = path_line(Path::new("/tmp/piif test/bin"));
+        for shell in ["/bin/sh", "/bin/zsh"] {
+            let out = Command::new(shell)
+                .arg("-c")
+                .arg(format!("PATH=/usr/bin; {line}{line}printf %s \"$PATH\""))
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                "/tmp/piif test/bin:/usr/bin",
+                "{shell}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_settings_keep_the_headers() {
+        let session = "a".repeat(32);
+        let headers = format!("X-Mine: 1\nx-piifence-session: {session}");
+        let url = "http://127.0.0.1:7788";
+        let first = write_settings_override(url, 7788, &session, &headers, true).unwrap();
+        let second = write_settings_override(url, 7788, &session, &headers, true).unwrap();
+        assert_ne!(first, second);
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&first).unwrap()).unwrap();
+        fs::remove_file(&first).unwrap();
+        fs::remove_file(&second).unwrap();
+        assert_eq!(json["env"]["ANTHROPIC_CUSTOM_HEADERS"], headers.as_str());
+        assert!(json["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with(" nested"));
     }
 
     #[test]
