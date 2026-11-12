@@ -22,6 +22,11 @@ def _ulid(rng):
     return "0" + rng.choice("1234567") + "".join(rng.choice(CROCKFORD) for _ in range(24))
 
 
+def _upper_id(rng, prefix):
+    """A chat-style id: a type letter, a digit, then upper-case letters and digits (U0ABCD12E)."""
+    return prefix + "0" + formats.expand("{L:4}", rng).upper() + formats.expand("{A:4}", rng)
+
+
 def _git_log(rng):
     msgs = ["Fix flaky checkout test", "Bump axum to 0.8", "Add retry to uploader", "Refactor config loader",
             "Document the release process"]
@@ -84,6 +89,16 @@ NEGATIVES = [
     ("masked_bullets", lambda r: "token: ••••••••"),
     ("template_literal", lambda r: 'value = "sk-{b62:20}"'),
     ("example_name", lambda r: 'name = "piifence-example"'),
+    ("placeholder_word_value", lambda r: "            DEPLOY_TOKEN: 'deploy-token',"),
+    ("placeholder_invalid_token", lambda r: "JWT validation error: Invalid JWT Bearer token: 'invalid-token'"),
+    # Shapes seen in real sessions (tests/secrets/mined.jsonl has the rest).
+    # Joined at run time so the repo's own gitleaks scan does not read the literal as a curl password.
+    ("curl_user_env_reference", lambda r: ":".join(['curl -s -u "$SONAR_TOKEN', '" "https://sonar.acme.dev/api/issues/search?resolved=false"'])),
+    ("curl_user_env_defaults", lambda r: ":".join(['curl -s -u "${JIRA_EMAIL', "-$ATL_EMAIL}", "${JIRA_API_TOKEN", '-$ATL_API_TOKEN}" "$BASE/rest/api/3/myself"'])),
+    ("url_value_in_json", lambda r: '{"cp":"https://www.acme.dev","env":"testing","login":"dev@acme.dev","success":true}'),
+    ("ci_duration_table", lambda r: "test / build\tpass\t2m34s\thttps://ci.acme.dev/run/" + E("{d:10}", r)),
+    ("chat_ids_in_shell_loop", lambda r: "for u in " + " ".join(_upper_id(r, p) for p in "UUU") + "; do ./slack users-info --user $u; done"),
+    ("chat_id_constant", lambda r: f"SLACK_CHANNEL = '{_upper_id(r, 'C')}'"),
 ]
 
 

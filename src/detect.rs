@@ -1,10 +1,11 @@
-//! The detection pipeline: the secret model, the key rule and gitleaks, then the guards.
+//! The detection pipeline: the secret models, the key rules and gitleaks, then the guards.
 //!
 //! ```text
-//! text ─┬─ model, 3 KB windows ────────────┐
-//!       ├─ model on the isolated copy ─────┤ model spans → Guards::suppress_model
-//!       ├─ key rule ───────────────────────┐
-//!       └─ gitleaks ───────────────────────┤ rule spans  → Guards::suppress
+//! text ─┬─ each model, 3 KB windows ───────┐
+//!       ├─ each model on the isolated copy ┤ model spans → grown to whole words → Guards::suppress_model
+//!       ├─ key rule, hex, cue, prefix ─────┐
+//!       ├─ gitleaks ───────────────────────┤ rule spans  → Guards::suppress
+//!       └─ full-width folded copy ─────────┤ the whole pipeline again, spans mapped back
 //!                                          ▼
 //!                       kept spans, overlaps unioned, cached per text
 //! ```
@@ -21,7 +22,8 @@ use crate::cache::{DetectionCache, Fingerprint};
 use crate::gitleaks;
 use crate::guards::{Guards, Suppression};
 use crate::keyrule;
-use crate::model::{SecretModel, MODEL_FILES};
+use crate::model::{ModelSpan, SecretModel, MODEL_FILES};
+use crate::scrub::{ScrubModel, SCRUB_FILES};
 
 /// One detected secret. `source` says what found it: `model:<TYPE>` (`model:API_KEY`), `keyrule`, or `gitleaks:<rule>`.
 #[derive(Debug, Clone)]
@@ -56,27 +58,67 @@ pub struct Detection {
     pub suppressed: Vec<(DetectedSpan, Suppression)>,
 }
 
+/// One model the detector runs. A directory with `scrub_config.json` holds Scrub; any other holds a cbx model.
+enum Model {
+    Cbx(SecretModel),
+    Scrub(ScrubModel),
+}
+
+impl Model {
+    fn files(dir: &Path) -> &'static [&'static str] {
+        if dir.join("scrub_config.json").is_file() {
+            &SCRUB_FILES
+        } else {
+            &MODEL_FILES
+        }
+    }
+
+    fn load(dir: &Path) -> anyhow::Result<Self> {
+        for file in Self::files(dir) {
+            anyhow::ensure!(
+                dir.join(file).is_file(),
+                "model file missing: {} (run scripts/fetch-weights.sh)",
+                dir.join(file).display()
+            );
+        }
+        Ok(if dir.join("scrub_config.json").is_file() {
+            Model::Scrub(ScrubModel::load(dir)?)
+        } else {
+            Model::Cbx(SecretModel::load(dir)?)
+        })
+    }
+
+    fn predict(&self, text: &str) -> anyhow::Result<Vec<ModelSpan>> {
+        match self {
+            Model::Cbx(m) => m.predict(text),
+            Model::Scrub(m) => m.predict(text),
+        }
+    }
+}
+
 pub struct Detector {
-    model: SecretModel,
+    models: Vec<Model>,
     guards: Guards,
     gitleaks_config: PathBuf,
     cache: std::sync::Mutex<DetectionCache>,
 }
 
 impl Detector {
-    /// Load the model from `model_dir` and open the detection cache in `cache_dir`, where the gitleaks rules are written too. `allow` holds the user's regexes for values never redacted (`Config::allow_patterns`).
-    pub fn load(model_dir: &Path, allow: Vec<Regex>, cache_dir: &Path) -> anyhow::Result<Self> {
-        for file in MODEL_FILES {
-            anyhow::ensure!(
-                model_dir.join(file).is_file(),
-                "model file missing: {} (run scripts/fetch-weights.sh)",
-                model_dir.join(file).display()
-            );
-        }
+    /// Load the models from `model_dirs` (one or more, each read on every text) and open the detection cache in `cache_dir`, where the gitleaks rules are written too. `allow` holds the user's regexes for values never redacted (`Config::allow_patterns`).
+    pub fn load(
+        model_dirs: &[PathBuf],
+        allow: Vec<Regex>,
+        cache_dir: &Path,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(!model_dirs.is_empty(), "no model directory given");
+        let models = model_dirs
+            .iter()
+            .map(|dir| Model::load(dir))
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let gitleaks_config = gitleaks::write_config(cache_dir)?;
-        let fingerprint = fingerprint(model_dir, &allow)?;
+        let fingerprint = fingerprint(model_dirs, &allow)?;
         Ok(Self {
-            model: SecretModel::load(model_dir)?,
+            models,
             guards: Guards::with_allowlist(allow)?,
             gitleaks_config,
             cache: std::sync::Mutex::new(DetectionCache::open(
@@ -105,9 +147,28 @@ impl Detector {
                 span
             }));
         }
+        for span in &mut model_spans {
+            (span.start, span.end) = whole_word(text, span.start, span.end);
+            span.word = text[span.start..span.end].to_string();
+        }
         let rule_spans = keyrule::spans(text)
             .into_iter()
             .map(|(start, end)| span(text, start, end, "keyrule".to_string()))
+            .chain(
+                keyrule::hex_spans(text)
+                    .into_iter()
+                    .map(|(start, end)| span(text, start, end, "keyrule:hex".to_string())),
+            )
+            .chain(
+                keyrule::cue_spans(text)
+                    .into_iter()
+                    .map(|(start, end)| span(text, start, end, "keyrule:cue".to_string())),
+            )
+            .chain(
+                keyrule::prefix_spans(text)
+                    .into_iter()
+                    .map(|(start, end)| span(text, start, end, "keyrule:prefix".to_string())),
+            )
             .chain(self.gitleaks_spans(text)?);
 
         let mut detection = Detection::default();
@@ -123,20 +184,30 @@ impl Detector {
                 None => detection.kept.push(span),
             }
         }
+        if let Some((folded, index)) = fold(text) {
+            for mut span in self.detect(&folded)?.kept {
+                (span.start, span.end) = (index[span.start], index[span.end]);
+                span.word = text[span.start..span.end].to_string();
+                detection.kept.push(span);
+            }
+        }
         detection.kept = union(detection.kept, text);
         self.cache.lock().unwrap().insert(text, &detection)?;
         Ok(detection)
     }
 
     fn model_spans(&self, text: &str) -> anyhow::Result<Vec<DetectedSpan>> {
-        windowed(text, |chunk| {
-            Ok(self
-                .model
-                .predict(chunk)?
-                .into_iter()
-                .map(|s| span(chunk, s.start, s.end, format!("model:{}", s.kind)))
-                .collect())
-        })
+        let mut out = Vec::new();
+        for model in &self.models {
+            out.extend(windowed(text, |chunk| {
+                Ok(model
+                    .predict(chunk)?
+                    .into_iter()
+                    .map(|s| span(chunk, s.start, s.end, format!("model:{}", s.kind)))
+                    .collect())
+            })?);
+        }
+        Ok(out)
     }
 
     fn gitleaks_spans(&self, text: &str) -> anyhow::Result<Vec<DetectedSpan>> {
@@ -165,7 +236,7 @@ fn span(text: &str, start: usize, end: usize, source: String) -> DetectedSpan {
 }
 
 /// Everything besides the text that decides a detection result. `crate::cache` keys entries on it, so a change to any of these misses instead of returning stale spans. The binary's stamp covers the code and the built-in gitleaks rules.
-fn fingerprint(model_dir: &Path, allow: &[Regex]) -> anyhow::Result<[u8; 32]> {
+fn fingerprint(model_dirs: &[PathBuf], allow: &[Regex]) -> anyhow::Result<[u8; 32]> {
     let mut fp = Fingerprint::default();
     fp.add("format", b"2");
     fp.add_file_stamp(
@@ -175,8 +246,10 @@ fn fingerprint(model_dir: &Path, allow: &[Regex]) -> anyhow::Result<[u8; 32]> {
     for pattern in allow {
         fp.add("allow", pattern.as_str().as_bytes());
     }
-    for file in MODEL_FILES {
-        fp.add_file_stamp(file, &model_dir.join(file))?;
+    for (n, dir) in model_dirs.iter().enumerate() {
+        for file in Model::files(dir) {
+            fp.add_file_stamp(&format!("{n}/{file}"), &dir.join(file))?;
+        }
     }
     fp.add("gitleaks-version", &gitleaks::version()?);
     Ok(fp.finish())
@@ -263,6 +336,52 @@ fn isolate(text: &str) -> Option<(String, Vec<usize>)> {
     copy.push_str(&text[last..]);
     index.extend(last..=text.len());
     Some((copy, index))
+}
+
+/// A copy of `text` with full-width ASCII (`ｇｈｐ＿…`) and the ideographic space folded to plain ASCII and invisible characters (zero-width space and joiners, word joiner, byte-order mark, soft hyphen) dropped, and for each byte of the copy (plus its end) the byte of `text` it came from. `None` when there is nothing to fold. Every detector reads ASCII, so a value disguised this way passes all of them unfolded.
+fn fold(text: &str) -> Option<(String, Vec<usize>)> {
+    let wide = |c: char| matches!(c, '\u{FF01}'..='\u{FF5E}' | '\u{3000}');
+    let invisible = |c: char| {
+        matches!(
+            c,
+            '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}' | '\u{00AD}'
+        )
+    };
+    if !text.chars().any(|c| wide(c) || invisible(c)) {
+        return None;
+    }
+    let mut copy = String::with_capacity(text.len());
+    let mut index = Vec::with_capacity(text.len() + 1);
+    for (at, c) in text.char_indices() {
+        if invisible(c) {
+            continue;
+        }
+        if wide(c) {
+            copy.push(match c {
+                '\u{3000}' => ' ',
+                _ => char::from_u32(c as u32 - 0xFEE0).expect("full-width ASCII folds to ASCII"),
+            });
+            index.push(at);
+        } else {
+            copy.push(c);
+            index.extend(at..at + c.len_utf8());
+        }
+    }
+    index.push(text.len());
+    Some((copy, index))
+}
+
+/// `start..end` grown over the ASCII letters and digits on either side, so a model span that stops inside a value (`a7a6[2c73]eabf…`) covers all of it.
+fn whole_word(text: &str, start: usize, end: usize) -> (usize, usize) {
+    let bytes = text.as_bytes();
+    let (mut start, mut end) = (start, end);
+    while start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+        start -= 1;
+    }
+    while end < bytes.len() && bytes[end].is_ascii_alphanumeric() {
+        end += 1;
+    }
+    (start, end)
 }
 
 /// Order of trust when overlapping spans are unioned: a rule knows the format, the model guesses.
@@ -356,6 +475,38 @@ mod tests {
         let found = windowed(&text, predict).unwrap();
         let starts: Vec<usize> = found.iter().map(|s| s.start).collect();
         assert_eq!(starts, markers.to_vec());
+    }
+
+    #[test]
+    fn whole_word_grows_a_span_to_its_letters_and_digits() {
+        let text = "use a7a62c73eabf6a8c6b72 now, key=Ab1-x9";
+        let s = text.find("2c73").unwrap();
+        let (a, b) = whole_word(text, s, s + 4);
+        assert_eq!(&text[a..b], "a7a62c73eabf6a8c6b72");
+        let s = text.find("b1").unwrap();
+        let (a, b) = whole_word(text, s, s + 2);
+        assert_eq!(&text[a..b], "Ab1");
+        assert_eq!(whole_word("密钥abc", 7, 8), (6, 9));
+    }
+
+    #[test]
+    fn fold_maps_full_width_ascii_back_to_the_original_bytes() {
+        let text = "key　ｔｏｋ＿９x 密";
+        let (copy, index) = fold(text).unwrap();
+        assert_eq!(copy, "key tok_9x 密");
+        let s = copy.find("tok_9x").unwrap();
+        assert_eq!(&text[index[s]..index[s + 6]], "ｔｏｋ＿９x");
+        assert_eq!(index[copy.len()], text.len());
+        assert!(fold("plain 密钥 text").is_none());
+
+        let text = "pw g\u{200B}h\u{200B}p\u{00AD}_x\u{FEFF} end";
+        let (copy, index) = fold(text).unwrap();
+        assert_eq!(copy, "pw ghp_x end");
+        let s = copy.find("ghp_x").unwrap();
+        assert_eq!(
+            &text[index[s]..index[s + 5]],
+            "g\u{200B}h\u{200B}p\u{00AD}_x\u{FEFF}"
+        );
     }
 
     #[test]

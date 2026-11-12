@@ -5,7 +5,7 @@
 //!
 //! It starts the gateway if it is not already healthy (upstream derived from the user's current Claude Code settings), points this Claude Code session at it with a temporary `--settings` override, runs Claude Code, then tears the gateway down if this process started it. The user's settings file is never modified.
 //!
-//! The override also adds two hooks. `SessionStart` runs `piifence session-start`: it tells the agent what `$PIIF_SECRET_<N>` names are, and adds a line to Claude Code's `CLAUDE_ENV_FILE`, which Claude Code sources before every Bash command. That line runs `piifence env`, which exports this session's values from the gateway, so a command that names `$PIIF_SECRET_1` gets the real value. `PreToolUse` runs `piifence restore` on every other tool call: it puts the real values into the tool's input, so a file the agent writes or an MCP argument holds the value, not the name.
+//! The override also adds two hooks. `SessionStart` runs `piifence session-start`: it tells the agent what `$PIIF_SECRET_<N>` names are, sends the gateway Claude Code's conversation id so a resumed conversation gets its old names back, and adds a line to Claude Code's `CLAUDE_ENV_FILE`, which Claude Code sources before every Bash command. That line runs `piifence env`, which exports this session's values from the gateway, so a command that names `$PIIF_SECRET_1` gets the real value. `PreToolUse` runs `piifence restore` on every other tool call: it puts the real values into the tool's input, so a file the agent writes or an MCP argument holds the value, not the name.
 //!
 //! Files: `$PIIF_DATA_DIR` (default `~/.local/share/piifence`, which `scripts/install.sh` sets) holds `model/` (the secret model) and `plugin/piifence-notice` (the notice plugin). The gateway binary sits next to this one.
 
@@ -364,13 +364,18 @@ fn session_args(args: &[String]) -> Result<(&str, u16)> {
     Ok((session.as_str(), port))
 }
 
-/// `piifence session-start <session> <port>`, the `SessionStart` hook. Adds the line that runs `piifence env` to `CLAUDE_ENV_FILE` (once per file), and answers with VARIABLES_NOTE as context for the agent. A failure exits non-zero, so Claude Code shows it.
+/// `piifence session-start <session> <port>`, the `SessionStart` hook. Adds the line that runs `piifence env` to `CLAUDE_ENV_FILE` (once per file), binds the session to Claude Code's conversation id (see `bind_conversation`), and answers with VARIABLES_NOTE as context for the agent. A failure exits non-zero, so Claude Code shows it.
 fn session_start(args: &[String]) -> Result<i32> {
     let mut input = String::new();
     std::io::stdin()
         .read_to_string(&mut input)
         .context("read the hook input")?;
     let (session, port) = session_args(args)?;
+    let hook: serde_json::Value =
+        serde_json::from_str(&input).context("the hook input is not JSON")?;
+    let conversation = hook["session_id"]
+        .as_str()
+        .context("the hook input has no session_id")?;
     let line = format!(
         "eval \"$({} env {session} {port})\"\n",
         shell_quote(&real_exe()?.to_string_lossy())
@@ -389,6 +394,7 @@ fn session_start(args: &[String]) -> Result<i32> {
             .and_then(|mut file| file.write_all(line.as_bytes()))
             .with_context(|| format!("cannot write {path}"))?;
     }
+    bind_conversation(session, port, conversation)?;
     println!(
         "{}",
         serde_json::json!({
@@ -399,6 +405,22 @@ fn session_start(args: &[String]) -> Result<i32> {
         })
     );
     Ok(0)
+}
+
+/// Tell the gateway which Claude Code conversation this session is, so it loads the names a resumed conversation already uses and stores new ones (encrypted, with a key kept in the Keychain).
+fn bind_conversation(session: &str, port: u16, conversation: &str) -> Result<()> {
+    let response = http_get(
+        port,
+        "/control/conversation",
+        &format!("x-piifence-session: {session}\r\nx-piifence-conversation: {conversation}\r\n"),
+        Duration::from_secs(30),
+    )
+    .with_context(|| format!("the gateway on port {port} did not answer"))?;
+    if !response.starts_with("HTTP/1.1 200") {
+        let body = response.split_once("\r\n\r\n").map_or("", |(_, body)| body);
+        bail!("the gateway could not load this conversation's names: {body}");
+    }
+    Ok(())
 }
 
 /// `piifence env <session> <port>`: this session's values from the gateway as `export NAME='value'` lines, for the `eval` Claude Code runs before every Bash command. A gateway that does not answer is an error on stderr; the command then runs without the values.

@@ -1,12 +1,50 @@
 # Model options
 
-Why piifence detects secrets with [cbx-secrets-detector-32M](https://huggingface.co/CobuildX-AI/cbx-secrets-detector-32M), and the benchmarks behind that choice.
+Why piifence detects secrets with [SporeLabs Scrub](https://huggingface.co/SporeLabs/scrub) plus deterministic key rules, and the benchmarks behind that choice.
 
 | Section | What's in it |
 |---|---|
-| [Decision (2026-11-09)](#decision-2026-11-09) | The model piifence ships, and how it scores through the real gateway. |
+| [Decision (2026-11-11)](#decision-2026-11-11) | The model piifence ships now, the rules added with it, and how it scores. |
+| [Decision (2026-11-09)](#decision-2026-11-09) | The switch to cbx-secrets-detector-32M, and how it scored through the real gateway. |
 | [Faster secret models (2026-11-09)](#faster-secret-models--benchmark-2026-11-09) | The benchmark that picked it: every pipeline tried, with leaks, false positives and speed. |
 | [History](#history) | Research from when piifence ran `openai/privacy-filter` and also redacted personal data. |
+
+## Decision (2026-11-11)
+
+piifence ships one model, SporeLabs Scrub at revision `62fb8bfd026382b243cee14fc24aebd30f834645` (a 17M ModernBERT with 16 sigmoid heads, run in Rust on candle in `src/scrub.rs`, only its `SECRET` head kept, threshold 0.55), plus gitleaks, the guards and four deterministic key rules in `src/keyrule.rs`. `PIIF_MODEL_DIR` still takes several model directories joined with `:`, and loads a cbx model from any directory without `scrub_config.json`, so a second model can be added without code changes.
+
+The goal was the best balance of coverage, speed and memory, with rules that work for any provider rather than one rule per vendor. The rules added:
+
+- **Prose and label cue** (`cue_spans`): a value within six tokens after a secret word in prose, in any common language (`the wifi password is …`, `пароль: …`, `Passwort lautet …`), or a random-looking lone token under a short label line (`## Webhook secret`). The value must look like a password: 8–128 printable ASCII characters with a letter and a digit, and a symbol or several letter-digit switches; paths, `${…}` references, emails and masked values are skipped.
+- **Prefixed key** (`prefix_spans`): `<prefix>_<random>` or `<prefix>-<random>` of any provider (`tvly-dev-…`, `pa-…`), when the body mixes upper case, lower case and digits with at least four letter-digit switches. Anthropic API ids (`toolu_`, `msg_`, `req_`), UUIDs inside and hash-named prefixes are skipped.
+- **Hex key** (`hex_spans`): a bare hex key, unless a hash word (`commit`, `sha256`, `digest`) sits nearer to it than a secret word.
+- **Fold**: text with full-width ASCII look-alikes (`ｇｈｐ_…`) or invisible characters (zero-width space and joiners, word joiner, byte-order mark, soft hyphen) is folded to plain ASCII, detected again, and the spans are mapped back. Scrub alone marked only part of a GitHub token with a zero-width space between every character; the fold closes that.
+
+The gateway also sweeps the whole request after naming, so a value first found in a later field is replaced in earlier fields too. Before, the gateway blocked such requests with a 502.
+
+Speed and peak memory of the whole detector (`examples/detect_spans.rs`, peak resident memory from `/usr/bin/time -l`) on 305 KB of mixed session text, M4 CPU:
+
+| Model set | Speed | Peak memory |
+|---|---|---|
+| cbx-32M | 7.5 KB/s | 5.05 GB |
+| cbx-17M | 12.4 KB/s | 3.15 GB |
+| **Scrub** | **15.9 KB/s** | **228 MB** |
+| cbx-32M + Scrub | 6.2 KB/s | 5.19 GB |
+| cbx-17M + Scrub | 9.0 KB/s | 3.24 GB |
+
+Outside data sets, with all rules on (caught / look-alikes flagged / clean texts flagged):
+
+| Set | cbx-32M | Scrub |
+|---|---|---|
+| aparte-chat | 73.2% / 7.0% / 7.3% | 77.5% / 3.3% / 2.7% |
+| aparte-json | 62.9% / 5.5% / 5.5% | 77.5% / 3.7% / 4.5% |
+| CredDetX | 82.8% / 28.3% / 58.1% | 86.4% / 41.3% / 81.7% |
+| scrub-dev | 80.6% / 5.2% / 27.8% | 88.0% / 6.4% / 22.2% |
+| scrub-test | 68.9% / 3.0% / 18.6% | 76.3% / 3.9% / 18.6% |
+
+Scrub catches more on every set and flags fewer clean texts on all but CredDetX, a set of code snippets full of key-shaped test values, where it flags more. Raising its threshold to 0.7 or 0.8 barely lowered that and cost catches, so it stays at 0.55. Adding cbx to Scrub closed one more of 21 bypass probes (3 left instead of 4) but costs 20× the memory and 60% of the speed, so piifence ships Scrub alone.
+
+Through the real gateway, the secret suite passes 1,119 of 1,122 cases: 0 leaks, and 3 known false positives on mined negatives (a variable name, an app id in prose, a phrase of plain words), listed in `tests/secrets/expectations.json`. The three hex cases cbx leaked and four base64 data dumps now pass.
 
 ## Decision (2026-11-09)
 

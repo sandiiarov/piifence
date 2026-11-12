@@ -120,24 +120,57 @@ fn line_start(text: &str, line: usize) -> Result<usize> {
         .with_context(|| format!("gitleaks reported line {line}, past the end of the text"))
 }
 
-/// A base64 or base64url run long enough for gitleaks to decode.
+/// A base64, base64url or hex run long enough for gitleaks to decode.
 fn encoded_run() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"[A-Za-z0-9+/_-]{16,}={0,2}").expect("encoded-run regex"))
 }
 
+/// A token holding at least one `%XX` escape, as in `mongodb://user:p%40ss@host`.
+fn percent_run() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"[^\s"'`<>()\[\]{}]*%[0-9A-Fa-f]{2}[^\s"'`<>()\[\]{}]*"#)
+            .expect("percent-run regex")
+    })
+}
+
+/// The runs on `line` that the decoders named in a decoded finding's tags (`decoded:base64`, `decoded:hex`, `decoded:percent`) read.
+fn decoded_runs(finding: &Finding, line: &str) -> Result<Vec<(usize, usize)>> {
+    let mut ranges = Vec::new();
+    for decoder in finding
+        .tags
+        .iter()
+        .filter_map(|t| t.strip_prefix("decoded:"))
+        .flat_map(|t| t.split(','))
+    {
+        let run = match decoder.trim() {
+            "base64" | "hex" => encoded_run(),
+            "percent" => percent_run(),
+            other => anyhow::bail!(
+                "gitleaks finding {} was decoded from {other}, which piifence cannot place",
+                finding.rule_id
+            ),
+        };
+        ranges.extend(run.find_iter(line).map(|m| (m.start(), m.end())));
+    }
+    ranges.sort_unstable();
+    ranges.dedup();
+    Ok(ranges)
+}
+
 /// Every byte range in `text` to redact for `finding`.
 ///
-/// A plain finding: every copy of its secret in the text. gitleaks reports one finding per line, and a copy that only the model would catch must not stay raw. A decoded finding (base64 etc.): every encoded run on the line gitleaks reports, since the decoded value is not in the text. Its columns are not used: gitleaks 8.30.1 reports `EndColumn` 0 for some decoded findings and the key's column for others.
+/// A plain finding: every copy of its secret in the text. gitleaks reports one finding per line, and a copy that only the model would catch must not stay raw. A decoded finding (base64, hex, percent): every run on the line gitleaks reports that its decoders read, since the decoded value is not in the text. Its columns are not used: gitleaks 8.30.1 reports `EndColumn` 0 for some decoded findings and the key's column for others.
 ///
 /// A finding that cannot be placed is an error, so the request is blocked instead of sent with the secret.
 pub fn locate(finding: &Finding, text: &str) -> Result<Vec<(usize, usize)>> {
     if finding.is_decoded() {
         let start = line_start(text, finding.start_line)?;
         let end = text[start..].find('\n').map_or(text.len(), |i| start + i);
-        let ranges: Vec<(usize, usize)> = encoded_run()
-            .find_iter(&text[start..end])
-            .map(|m| (start + m.start(), start + m.end()))
+        let ranges: Vec<(usize, usize)> = decoded_runs(finding, &text[start..end])?
+            .into_iter()
+            .map(|(a, b)| (start + a, start + b))
             .collect();
         anyhow::ensure!(
             !ranges.is_empty(),
@@ -196,6 +229,42 @@ mod tests {
             &text[ranges[0].0..ranges[0].1],
             "ZW5jb2RlZC12YWx1ZS1vdGhlcg=="
         );
+    }
+
+    #[test]
+    fn percent_decoded_finding_redacts_the_escaped_token() {
+        let text = "ok\nconnect with mongodb://app:Zx%40qT7%23mLw2@db.example.internal/app now\n";
+        let ranges = locate(
+            &finding("decoded", 2, &["decoded:percent", "decode-depth:1"]),
+            text,
+        )
+        .unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(
+            &text[ranges[0].0..ranges[0].1],
+            "mongodb://app:Zx%40qT7%23mLw2@db.example.internal/app"
+        );
+        // Base64 of a percent-encoded URL: gitleaks tags both decoders.
+        let blob = "blob: bW9uZ29kYjovL2FwcDpaeCU0MHFUNw==";
+        let ranges = locate(
+            &finding(
+                "decoded",
+                1,
+                &["decoded:percent", "decoded:base64", "decode-depth:2"],
+            ),
+            blob,
+        )
+        .unwrap();
+        assert_eq!(
+            &blob[ranges[0].0..ranges[0].1],
+            "bW9uZ29kYjovL2FwcDpaeCU0MHFUNw=="
+        );
+    }
+
+    #[test]
+    fn an_unknown_decoder_is_an_error() {
+        let text = "VALUE: ZW5jb2RlZC12YWx1ZS1oZXJl";
+        assert!(locate(&finding("x", 1, &["decoded:rot13"]), text).is_err());
     }
 
     #[test]

@@ -10,7 +10,7 @@
 # Layout under $PREFIX:
 #   bin/piifence                          wrapper that sets PIIF_DATA_DIR, then runs the launcher
 #   libexec/piifence/                     the piifence and piifence-gateway binaries
-#   share/piifence/model/                 the secret model (cbx-secrets-detector-32M, about 128 MB)
+#   share/piifence/model/                 the secret model (SporeLabs Scrub, about 70 MB)
 #   share/piifence/plugin/piifence-notice the Claude Code notice plugin
 set -euo pipefail
 

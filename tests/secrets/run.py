@@ -31,6 +31,7 @@ sys.path.insert(0, HERE)
 
 import contexts  # noqa: E402
 import formats  # noqa: E402
+import mined  # noqa: E402
 import negatives  # noqa: E402
 
 EXPECTATIONS = os.path.join(HERE, "expectations.json")
@@ -90,7 +91,7 @@ def mask(s):
 
 
 class Case:
-    def __init__(self, cid, family, context, path, body, secrets, keep, negative=False):
+    def __init__(self, cid, family, context, path, body, secrets, keep, negative=False, watch=None):
         self.id = cid
         self.family = family
         self.context = context
@@ -99,6 +100,8 @@ class Case:
         self.secrets = secrets
         self.keep = keep
         self.negative = negative
+        # For a negative: the values whose replacement counts as a false positive. None means any new name does.
+        self.watch = watch
 
 
 def build_cases():
@@ -119,6 +122,12 @@ def build_cases():
             value = neg.generate("0").full
             cases.append(Case(f"{cid}/{neg.id}", "negative", cid, path, body, [],
                               keep + [line for line in value.split("\n") if line], negative=True))
+    for cid, category, kind, body, value, secret in mined.load():
+        if secret:
+            cases.append(Case(f"mined/{cid}", "mined", f"mined_{kind}", "/v1/messages", body, [value], []))
+        else:
+            cases.append(Case(f"mined/{cid}", "negative", f"mined_{kind}", "/v1/messages", body, [], [],
+                              negative=True, watch=[value]))
     return cases
 
 
@@ -141,7 +150,11 @@ def evaluate(case, received_list, status):
             break
     sent = sum(len(SECRET_NAME.findall(s)) for s in strings_of(case.body))
     got = sum(len(SECRET_NAME.findall(s)) for s in strings)
-    if case.negative and got > sent:
+    if case.watch:
+        false_positive = any(not any(w in s for s in strings) for w in case.watch)
+    else:
+        false_positive = case.negative and got > sent
+    if false_positive:
         failures.append("false positive")
     else:
         missing = [k for k in case.keep if not any(k in s for s in strings)]
@@ -414,7 +427,7 @@ def main():
         return check_generators()
     if args.self_test:
         return self_test()
-    if not args.model_dir or not os.path.exists(os.path.join(args.model_dir, "model.safetensors")):
+    if not args.model_dir or not all(os.path.exists(os.path.join(d, "model.safetensors")) for d in args.model_dir.split(os.pathsep)):
         print(f"setup error: no model in {args.model_dir} (pass --model-dir or set PIIF_MODEL_DIR)", file=sys.stderr)
         return 2
 

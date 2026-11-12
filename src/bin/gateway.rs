@@ -1,11 +1,12 @@
 //! piifence gateway — keeps secrets out of what Claude Code sends to the model provider.
 //!
 //!   1. `piifence claude` points Claude Code at it (`ANTHROPIC_BASE_URL=http://127.0.0.1:7788`) and gives the session an id, sent on every request in the `x-piifence-session` header.
-//!   2. `POST /v1/messages` and `/v1/messages/count_tokens` bodies are scanned (system, message text, tool_result, tool_use.input, documents, search results) by the shared Detector (secret model + key rule + gitleaks + guards). Each secret becomes an environment variable name, `$PIIF_SECRET_<N>`, numbered once per value per session, so re-sent history is rewritten identically every turn.
+//!   2. `POST /v1/messages` and `/v1/messages/count_tokens` bodies are scanned (system, tool descriptions, message text, tool_result, tool_use / server_tool_use / mcp_tool_use input, mcp_tool_result, web fetch results, documents, search results) by the shared Detector (secret model + key rule + gitleaks + guards). Each secret becomes an environment variable name, `$PIIF_SECRET_<N>`, numbered once per value per session, so re-sent history is rewritten identically every turn.
 //!   3. The rewritten request is forwarded to `PIIF_UPSTREAM` with the original auth headers.
 //!   4. The response is streamed back byte for byte. Names are never replaced back: the provider never sees the value, and the agent uses the name. `piifence env` hands the values to the session's Bash commands, so `$PIIF_SECRET_1` expands to the real value on the user's machine.
+//!   5. The session-start hook sends Claude Code's conversation id to `/control/conversation`. The gateway then keeps that conversation's names in a file encrypted with a key from the macOS Keychain, and loads them back when the conversation is resumed, so names the agent already wrote keep their values across restarts.
 //!
-//! Env: PIIF_UPSTREAM (required: provider base URL), PIIF_MODEL_DIR (required: the cbx model files), PIIF_PORT (7788), PIIF_AUDIT_LOG (/tmp/piifence-audit.log), PIIF_AUDIT_BODY=1 (also log the rewritten request bodies), PIIF_CACHE_DIR (~/.cache/piifence: detection results kept across restarts, as offsets per text hash, never the text or values).
+//! Env: PIIF_UPSTREAM (required: provider base URL), PIIF_MODEL_DIR (required: the model directory, or several joined with ':', each a Scrub or cbx model), PIIF_PORT (7788), PIIF_AUDIT_LOG (/tmp/piifence-audit.log), PIIF_AUDIT_BODY=1 (also log the rewritten request bodies), PIIF_CACHE_DIR (~/.cache/piifence: detection results kept across restarts, as offsets per text hash, never the text or values), PIIF_STATE_DIR (~/.local/state/piifence: `names/` holds each conversation's names, encrypted with a key kept in the macOS Keychain).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
@@ -99,7 +100,7 @@ struct EnvValue {
     seen: bool,
 }
 
-/// One session's secrets and their names. Commands run with the real value, so their output can contain it (`echo $PIIF_SECRET_1`); the gateway replaces every copy of a named value with `$NAME` in all provider-bound text before detection runs, so it never leaves even when detection would miss it. Held in memory only, never logged or written to disk, and lost when the gateway stops.
+/// One session's secrets and their names. Commands run with the real value, so their output can contain it (`echo $PIIF_SECRET_1`); the gateway replaces every copy of a named value with `$NAME` in all provider-bound text before detection runs, so it never leaves even when detection would miss it. Never logged or written in the clear; once the session is bound to a Claude Code conversation, the table is also kept encrypted under `NAMES_DIR`, so a resumed conversation's names still work after the gateway restarts.
 #[derive(Default)]
 struct EnvValues {
     /// Longest value first, so a value that contains another is replaced whole.
@@ -139,12 +140,289 @@ impl EnvValues {
             .map(|entry| (entry.name.clone(), Value::String(entry.value.clone())))
             .collect()
     }
+
+    /// The table as stored in the Keychain.
+    fn stored(&self) -> Value {
+        json!(self
+            .entries
+            .iter()
+            .map(|e| json!({"name": e.name, "value": e.value, "kind": e.kind}))
+            .collect::<Vec<_>>())
+    }
+
+    /// Take in a conversation's stored table. A stored value keeps its name, since the conversation already uses it; a value named only here keeps its name unless a stored entry has it, and is renumbered then.
+    fn merge(&mut self, stored: &[(String, String, String)]) {
+        let current = std::mem::take(&mut self.entries);
+        let number = |name: &str| {
+            name.strip_prefix("PIIF_SECRET_")
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(0)
+        };
+        for (name, value, kind) in stored {
+            self.counter = self.counter.max(number(name));
+            self.entries.push(EnvValue {
+                value: value.clone(),
+                name: name.clone(),
+                kind: kind.clone(),
+                seen: true,
+            });
+        }
+        for mut entry in current {
+            if self.entries.iter().any(|e| e.value == entry.value) {
+                continue;
+            }
+            if self.entries.iter().any(|e| e.name == entry.name) {
+                self.counter += 1;
+                entry.name = format!("PIIF_SECRET_{}", self.counter);
+            }
+            self.counter = self.counter.max(number(&entry.name));
+            self.entries.push(entry);
+        }
+        self.entries
+            .sort_by_key(|entry| std::cmp::Reverse(entry.value.len()));
+    }
 }
 
 /// Per-session state, keyed by the `x-piifence-session` id the launcher gives each Claude Code session.
 #[derive(Default)]
 struct Session {
     env: EnvValues,
+    /// Claude Code's conversation id, once the session-start hook has sent it. Only then is the table stored.
+    conversation: Option<String>,
+    /// The table's `counter` when it was last saved; None when it must be saved.
+    saved: Option<usize>,
+}
+
+/// Where each conversation's table is kept, one encrypted file per conversation id, set once in `main`. The agent's own messages and the files it wrote hold `$PIIF_SECRET_<N>` names, and `claude --resume` or `-c` can bring them back after this gateway has stopped, so the names must outlive it.
+static NAMES_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// A table nobody has resumed for this long is deleted when a gateway starts.
+const NAMES_KEPT_DAYS: u64 = 30;
+
+/// The header the session-start hook sends Claude Code's conversation id in.
+const CONVERSATION_HEADER: &str = "x-piifence-conversation";
+
+/// Apple's Keychain tool, which holds the key the tables are encrypted with. The gateway goes through it rather than the Keychain API so the item belongs to a program that does not change when piifence is updated; otherwise macOS asks for access after every update.
+const SECURITY_TOOL: &str = "/usr/bin/security";
+
+/// The Keychain item (service and account) holding the key.
+const KEY_SERVICE: &str = "piifence";
+const KEY_ACCOUNT: &str = "names-key";
+
+/// `security`'s exit code when no item matches.
+const KEYCHAIN_NOT_FOUND: i32 = 44;
+
+static NAMES_KEY: Mutex<Option<[u8; 32]>> = Mutex::new(None);
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex(text: &str) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(text.len().is_multiple_of(2) && text.is_ascii(), "not hex");
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).context("not hex"))
+        .collect()
+}
+
+fn random_bytes<const N: usize>() -> anyhow::Result<[u8; N]> {
+    use std::io::Read;
+    let mut bytes = [0u8; N];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .context("read /dev/urandom")?;
+    Ok(bytes)
+}
+
+/// The key as stored, or None when there is none yet.
+fn read_key() -> anyhow::Result<Option<[u8; 32]>> {
+    let out = std::process::Command::new(SECURITY_TOOL)
+        .args([
+            "find-generic-password",
+            "-s",
+            KEY_SERVICE,
+            "-a",
+            KEY_ACCOUNT,
+            "-w",
+        ])
+        .output()
+        .context("run security")?;
+    if out.status.code() == Some(KEYCHAIN_NOT_FOUND) {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        out.status.success(),
+        "read piifence's key from the Keychain: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let key = unhex(String::from_utf8_lossy(&out.stdout).trim())?;
+    Ok(Some(key.try_into().map_err(|_| {
+        anyhow::anyhow!("piifence's Keychain key is not 32 bytes")
+    })?))
+}
+
+/// The key the tables are encrypted with, created in the Keychain on first use. It is added without `-U`, so when two gateways race the second add fails and both read the one that won.
+fn names_key() -> anyhow::Result<[u8; 32]> {
+    let mut cached = NAMES_KEY.lock().unwrap();
+    if let Some(key) = *cached {
+        return Ok(key);
+    }
+    let key = match read_key()? {
+        Some(key) => key,
+        None => {
+            // `security -i` reads the command on stdin, so the key never shows in the process list.
+            let mut child = std::process::Command::new(SECURITY_TOOL)
+                .arg("-i")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .context("run security")?;
+            let fresh = hex(hex(&random_bytes::<32>()?).as_bytes());
+            writeln!(
+                child.stdin.take().context("security's stdin")?,
+                "add-generic-password -s {KEY_SERVICE} -a {KEY_ACCOUNT} -X {fresh}"
+            )
+            .context("write to security")?;
+            child.wait().context("wait for security")?;
+            read_key()?.context("piifence's key is not in the Keychain after adding it")?
+        }
+    };
+    *cached = Some(key);
+    Ok(key)
+}
+
+fn names_path(conversation: &str) -> anyhow::Result<PathBuf> {
+    Ok(NAMES_DIR
+        .get()
+        .context("the names directory is not set")?
+        .join(conversation))
+}
+
+/// The stored `(name, value, kind)` table of `conversation`, empty when it has none.
+fn load_names(conversation: &str) -> anyhow::Result<Vec<(String, String, String)>> {
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+    let path = names_path(conversation)?;
+    let sealed = match std::fs::read(&path) {
+        Ok(sealed) => sealed,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    };
+    anyhow::ensure!(sealed.len() > 24, "{} is cut short", path.display());
+    let cipher = chacha20poly1305::XChaCha20Poly1305::new(&names_key()?.into());
+    let (nonce, data) = sealed.split_at(24);
+    let plain = cipher
+        .decrypt(
+            nonce.into(),
+            Payload {
+                msg: data,
+                aad: conversation.as_bytes(),
+            },
+        )
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "{} does not decrypt with piifence's Keychain key",
+                path.display()
+            )
+        })?;
+    let entries: Vec<Value> =
+        serde_json::from_slice(&plain).context("the stored table is not a JSON list")?;
+    entries
+        .iter()
+        .map(|e| {
+            let field = |key: &str| {
+                e[key]
+                    .as_str()
+                    .map(str::to_string)
+                    .with_context(|| format!("a stored entry has no {key}"))
+            };
+            Ok((field("name")?, field("value")?, field("kind")?))
+        })
+        .collect()
+}
+
+/// Save the session's table when it is bound to a conversation and has changed since the last save. The file is written whole under a temporary name and renamed, so a reader never sees half of it.
+fn save_names(state: &AppState) -> anyhow::Result<()> {
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+    use std::os::unix::fs::OpenOptionsExt;
+    let pending = with_session(state, |session| {
+        let conversation = session.conversation.clone()?;
+        (session.saved != Some(session.env.counter))
+            .then(|| (conversation, session.env.stored(), session.env.counter))
+    });
+    let Some((conversation, table, counter)) = pending else {
+        return Ok(());
+    };
+    let cipher = chacha20poly1305::XChaCha20Poly1305::new(&names_key()?.into());
+    let nonce = random_bytes::<24>()?;
+    let plain = table.to_string();
+    let mut sealed = nonce.to_vec();
+    sealed.extend(
+        cipher
+            .encrypt(
+                &nonce.into(),
+                Payload {
+                    msg: plain.as_bytes(),
+                    aad: conversation.as_bytes(),
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("encrypt the names"))?,
+    );
+    let path = names_path(&conversation)?;
+    let temp = path.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temp)
+        .and_then(|mut file| file.write_all(&sealed))
+        .with_context(|| format!("write {}", temp.display()))?;
+    std::fs::rename(&temp, &path).with_context(|| format!("write {}", path.display()))?;
+    with_session(state, |session| session.saved = Some(counter));
+    Ok(())
+}
+
+/// Create the names directory (owner only) and delete tables older than `NAMES_KEPT_DAYS`.
+fn prepare_names_dir(dir: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("create {}", dir.display()))?;
+    let cutoff =
+        std::time::SystemTime::now() - std::time::Duration::from_secs(NAMES_KEPT_DAYS * 24 * 3600);
+    for entry in std::fs::read_dir(dir).with_context(|| format!("list {}", dir.display()))? {
+        let entry = entry?;
+        if entry.metadata()?.modified()? < cutoff {
+            std::fs::remove_file(entry.path())
+                .with_context(|| format!("delete {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Bind this session to Claude Code's conversation: merge in the names the conversation already uses and save the result. Returns how many were stored.
+fn bind_conversation(state: &AppState, conversation: &str) -> anyhow::Result<usize> {
+    let stored = load_names(conversation)?;
+    with_session(state, |session| {
+        session.env.merge(&stored);
+        session.conversation = Some(conversation.to_string());
+        session.saved = None;
+    });
+    save_names(state)?;
+    Ok(stored.len())
+}
+
+/// The conversation id in `headers`: Claude Code's session UUID, so 36 hex digits and dashes.
+fn conversation_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(CONVERSATION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|id| id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'))
+        .map(str::to_string)
 }
 
 /// The header carrying the session id: Claude Code sends it on every request (the launcher sets `ANTHROPIC_CUSTOM_HEADERS`), and `piifence env` on its call for the values. It is stripped before forwarding.
@@ -558,7 +836,7 @@ async fn redact_block(
                 audit.append(&mut entries);
             }
         }
-        Some("tool_result") => {
+        Some("tool_result" | "mcp_tool_result") => {
             let context = block["tool_use_id"]
                 .as_str()
                 .and_then(|id| tools.get(id))
@@ -580,9 +858,21 @@ async fn redact_block(
                 _ => {}
             }
         }
-        Some("tool_use") => {
+        Some(kind @ ("tool_use" | "server_tool_use" | "mcp_tool_use")) => {
+            let field = format!("{kind}.input");
             if let Some(input) = block.get_mut("input") {
-                audit.extend(redact_json_strings(state, input, "tool_use.input").await?);
+                audit.extend(redact_json_strings(state, input, &field).await?);
+            }
+        }
+        Some("web_fetch_tool_result") => {
+            if let Some(result) = block.get_mut("content") {
+                audit.extend(redact_block(state, result, tools, context).await?);
+            }
+        }
+        Some("web_fetch_result") => {
+            audit.extend(redact_string_field(state, block, "url", "web_fetch_result.url").await?);
+            if let Some(document) = block.get_mut("content") {
+                audit.extend(redact_block(state, document, tools, context).await?);
             }
         }
         Some("document") => {
@@ -617,7 +907,7 @@ async fn redact_payload(state: &AppState, body: &mut Value) -> anyhow::Result<Ve
     let mut tools = ToolContexts::new();
     for message in body["messages"].as_array().into_iter().flatten() {
         for block in message["content"].as_array().into_iter().flatten() {
-            if let ("tool_use", Some(id), Some(name)) = (
+            if let ("tool_use" | "mcp_tool_use", Some(id), Some(name)) = (
                 block["type"].as_str().unwrap_or_default(),
                 block["id"].as_str(),
                 block["name"].as_str(),
@@ -628,6 +918,14 @@ async fn redact_payload(state: &AppState, body: &mut Value) -> anyhow::Result<Ve
     }
     if let Some(system) = body.get_mut("system") {
         audit.extend(redact_content(state, system, &tools).await?);
+    }
+    for tool in body
+        .get_mut("tools")
+        .and_then(|t| t.as_array_mut())
+        .into_iter()
+        .flatten()
+    {
+        audit.extend(redact_string_field(state, tool, "description", "tools.description").await?);
     }
     if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
         for message in messages.iter_mut() {
@@ -654,11 +952,73 @@ fn error_response(status: StatusCode, message: &str) -> Response {
     )
 }
 
+/// Replace the session's named values wherever they are still in `payload` after redaction, by the rule of `WHOLE_TOKEN_BELOW`. A value can be named in a later field after an earlier one was already rewritten, or sit in a field the walker does not scan. Thinking blocks are signed and cannot be rewritten, base64 sources hold no text, and `metadata` holds the client's ids, so those are skipped.
+fn sweep_values(state: &AppState, payload: &mut Value) -> anyhow::Result<Vec<Value>> {
+    let values: Vec<String> = with_session(state, |session| {
+        session
+            .env
+            .entries
+            .iter()
+            .map(|e| e.value.clone())
+            .collect()
+    });
+    let mut audit = Vec::new();
+    if values.is_empty() {
+        return Ok(audit);
+    }
+    let finder = aho_corasick::AhoCorasick::new(&values).context("index the named values")?;
+    sweep(state, payload, &finder, &values, "$", &mut audit);
+    Ok(audit)
+}
+
+fn sweep(
+    state: &AppState,
+    value: &mut Value,
+    finder: &aho_corasick::AhoCorasick,
+    values: &[String],
+    path: &str,
+    audit: &mut Vec<Value>,
+) {
+    match value {
+        Value::String(text) => {
+            let hit = finder
+                .find_overlapping_iter(text.as_str())
+                .any(|m| !env_value_matches(text, &values[m.pattern().as_usize()]).is_empty());
+            if hit {
+                let (out, mut entries) = replace_env_values(state, text, path);
+                *text = out;
+                audit.append(&mut entries);
+            }
+        }
+        Value::Array(items) => {
+            for (i, item) in items.iter_mut().enumerate() {
+                sweep(state, item, finder, values, &format!("{path}[{i}]"), audit);
+            }
+        }
+        Value::Object(map) => {
+            if matches!(
+                map.get("type").and_then(Value::as_str),
+                Some("thinking" | "redacted_thinking" | "base64")
+            ) {
+                return;
+            }
+            for (key, item) in map.iter_mut() {
+                if !(path == "$" && key.as_str() == "metadata") {
+                    sweep(state, item, finder, values, &format!("{path}.{key}"), audit);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Scan a messages request and return its rewritten body.
 async fn redact_request(state: &AppState, body: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut payload: Value = serde_json::from_slice(body).context("request body is not JSON")?;
     let started = std::time::Instant::now();
-    let audit = redact_payload(state, &mut payload).await?;
+    let mut audit = redact_payload(state, &mut payload).await?;
+    audit.append(&mut sweep_values(state, &mut payload)?);
+    save_names(state)?;
     let redact_ms = started.elapsed().as_secs_f64() * 1000.0;
     let redacted = serde_json::to_vec(&payload)?;
     if !audit.is_empty() {
@@ -721,10 +1081,12 @@ async fn proxy(
             }),
         );
     }
-    // Every POST under /v1/messages carries conversation text. Scan the two shapes that share the Messages body and refuse any other, such as batches, rather than forwarding its text unscanned.
+    // Every POST under /v1/messages carries conversation text. Scan the two shapes that share the Messages body and refuse any other, such as batches, and the legacy /v1/complete prompt, rather than forwarding their text unscanned.
     let is_messages = matches!(path, "/v1/messages" | "/v1/messages/count_tokens");
     let is_scanned = is_messages && method == Method::POST;
-    if path.starts_with("/v1/messages/") && !is_messages && method == Method::POST {
+    if (path == "/v1/complete" || path.starts_with("/v1/messages/") && !is_messages)
+        && method == Method::POST
+    {
         return error_response(
             StatusCode::FORBIDDEN,
             "this endpoint is not redacted; request blocked",
@@ -741,6 +1103,19 @@ async fn proxy(
     if path == "/control/env" && method == Method::GET {
         let values = with_session(&state, |session| session.env.all());
         return json_response(StatusCode::OK, json!({"values": values}));
+    }
+    // The session-start hook sends Claude Code's conversation id, so a resumed conversation gets back the names it already uses.
+    if path == "/control/conversation" && method == Method::GET {
+        let Some(conversation) = conversation_id(&headers) else {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "missing or malformed x-piifence-conversation",
+            );
+        };
+        return match bind_conversation(&state, &conversation) {
+            Ok(loaded) => json_response(StatusCode::OK, json!({"loaded": loaded})),
+            Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
+        };
     }
 
     let outgoing = if is_scanned {
@@ -837,10 +1212,11 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> anyhow::Result<T> {
 async fn main() -> anyhow::Result<()> {
     let upstream = std::env::var("PIIF_UPSTREAM")
         .context("PIIF_UPSTREAM is required: set it to the provider's base URL")?;
-    let model_dir = PathBuf::from(
-        std::env::var("PIIF_MODEL_DIR")
-            .context("PIIF_MODEL_DIR is required: the directory with the cbx model files")?,
-    );
+    let model_dirs: Vec<PathBuf> =
+        std::env::split_paths(&std::env::var_os("PIIF_MODEL_DIR").context(
+            "PIIF_MODEL_DIR is required: the model directory, or several joined with ':'",
+        )?)
+        .collect();
     let port: u16 = env_or("PIIF_PORT", 7788)?;
     let audit_path: String = env_or("PIIF_AUDIT_LOG", "/tmp/piifence-audit.log".to_string())?;
     let audit_body_path = (env_or("PIIF_AUDIT_BODY", 0u8)? == 1)
@@ -852,6 +1228,15 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    let names_dir = match std::env::var("PIIF_STATE_DIR") {
+        Ok(dir) => PathBuf::from(dir),
+        Err(_) => PathBuf::from(std::env::var("HOME").context("HOME is not set")?)
+            .join(".local/state/piifence"),
+    }
+    .join("names");
+    prepare_names_dir(&names_dir)?;
+    NAMES_DIR.set(names_dir).expect("set once");
+
     let audit = open_private_append(&audit_path)?;
     let audit_body = audit_body_path
         .as_deref()
@@ -859,10 +1244,10 @@ async fn main() -> anyhow::Result<()> {
         .transpose()?;
     let allow = piifence::config::load()?.allow_patterns()?;
     eprintln!(
-        "loading the secret model from {} (upstream {upstream}, port {port})",
-        model_dir.display()
+        "loading the secret models from {} (upstream {upstream}, port {port})",
+        std::env::join_paths(&model_dirs)?.to_string_lossy()
     );
-    let detector = Detector::load(&model_dir, allow, &cache_dir)?;
+    let detector = Detector::load(&model_dirs, allow, &cache_dir)?;
     eprintln!(
         "detection cache: {} ({} entries)",
         cache_dir.join("detections.jsonl").display(),
@@ -1152,6 +1537,50 @@ mod tests {
     }
 
     #[test]
+    fn a_resumed_conversation_keeps_its_stored_names() {
+        let mut env = EnvValues::default();
+        env.entry_for("seen-before-bind", "PASSWORD");
+        env.entry_for("stored-too", "API_KEY");
+        let stored = [
+            (
+                "PIIF_SECRET_1".to_string(),
+                "old-one".to_string(),
+                "PASSWORD".to_string(),
+            ),
+            (
+                "PIIF_SECRET_7".to_string(),
+                "stored-too".to_string(),
+                "API_KEY".to_string(),
+            ),
+        ];
+        env.merge(&stored);
+        let all = env.all();
+        assert_eq!(all["PIIF_SECRET_1"], "old-one");
+        assert_eq!(all["PIIF_SECRET_7"], "stored-too");
+        assert_eq!(all["PIIF_SECRET_8"], "seen-before-bind");
+        assert_eq!(all.len(), 3);
+        assert_eq!(env.entry_for("new", "API_KEY").name, "PIIF_SECRET_9");
+
+        let round_trip: Vec<(String, String, String)> = env
+            .stored()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["name"].as_str().unwrap().into(),
+                    e["value"].as_str().unwrap().into(),
+                    e["kind"].as_str().unwrap().into(),
+                )
+            })
+            .collect();
+        let mut again = EnvValues::default();
+        again.merge(&round_trip);
+        assert_eq!(again.all(), env.all());
+        assert_eq!(again.counter, 9);
+    }
+
+    #[test]
     fn names_count_up_and_a_value_keeps_its_name() {
         let mut env = EnvValues::default();
         assert_eq!(env.entry_for("abcd", "PASSWORD").name, "PIIF_SECRET_1");
@@ -1179,6 +1608,62 @@ mod tests {
             .unwrap();
         assert_eq!(content, before);
         assert!(audit.is_empty());
+    }
+
+    #[tokio::test]
+    async fn server_and_mcp_blocks_and_tool_descriptions_are_redacted() {
+        let state = fake_state();
+        let mut body = json!({
+            "tools": [{"name": "deploy", "description": "Uses TOKEN.", "input_schema": {"type": "object"}}],
+            "messages": [{"role": "assistant", "content": [
+                {"type": "server_tool_use", "id": "s1", "name": "web_fetch",
+                 "input": {"url": "https://example.com/?access_token=TOKEN"}},
+                {"type": "web_fetch_tool_result", "tool_use_id": "s1", "content": {
+                    "type": "web_fetch_result", "url": "https://example.com/TOKEN",
+                    "content": {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "key TOKEN"}}}},
+                {"type": "mcp_tool_use", "id": "m1", "name": "set", "server_name": "vault", "input": {"value": "TOKEN"}},
+                {"type": "mcp_tool_result", "tool_use_id": "m1", "content": [{"type": "text", "text": "saved TOKEN"}]}
+            ]}]
+        });
+        redact_payload(&state, &mut body).await.unwrap();
+        let text = body.to_string();
+        assert!(!text.contains("TOKEN"), "{text}");
+        assert_eq!(body["tools"][0]["description"], "Uses $PIIF_SECRET_1.");
+        assert_eq!(
+            body["messages"][0]["content"][2]["input"]["value"],
+            "$PIIF_SECRET_1"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_named_value_left_anywhere_is_replaced() {
+        let state = fake_state();
+        with_session(&state, |session| {
+            session.env.entry_for("if-ajsdlk231lj", "PASSWORD");
+        });
+        let leaked = json!({"messages": [{"role": "user", "content": "hi"}],
+            "container": {"note": "pw if-ajsdlk231lj"}});
+        let out = redact_request(&state, leaked.to_string().as_bytes())
+            .await
+            .unwrap();
+        let out: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(out["container"]["note"], "pw $PIIF_SECRET_1");
+
+        // Thinking, base64 data and metadata are not rewritten; a short value inside a longer word is not a copy.
+        let allowed = json!({"metadata": {"user_id": "if-ajsdlk231lj"},
+            "messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "if-ajsdlk231lj", "signature": "s"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "if-ajsdlk231lj"}},
+                {"type": "text", "text": "the value if-ajsdlk231lj"}]}],
+            "tool_choice": {"name": "xif-ajsdlk231ljx"}});
+        let out = redact_request(&state, allowed.to_string().as_bytes())
+            .await
+            .unwrap();
+        let out: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            out["messages"][0]["content"][2]["text"],
+            "the value $PIIF_SECRET_1"
+        );
     }
 
     #[test]
