@@ -13,7 +13,7 @@ This run had no interactive selection step. Following the skill's non-interactiv
 | [011](011-shared-gateway-lifetime.md) | Keep a shared gateway running until the last `piifence claude` that uses it exits | P1 | M | — | DONE |
 | [012](012-private-control-socket.md) | Serve the gateway's control endpoints and `/stats` only on a private Unix socket | P1 | M | 011 | DONE |
 | [013](013-names-never-land-as-text.md) | A secret's name never lands in a file, a command or a commit as text | P1 | M | — | DONE |
-| [014](014-nested-claude-hooks.md) | A `claude` started from inside a piifence session gets piifence's hooks | P1 | M | — | TODO |
+| [014](014-nested-claude-hooks.md) | A `claude` started from inside a piifence session gets piifence's hooks | P1 | M | — | DONE |
 
 Run them in this order: 009, 010, 011, 012, 013, 014.
 
