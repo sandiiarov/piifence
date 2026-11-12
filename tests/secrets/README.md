@@ -32,6 +32,7 @@ python3 -I tests/secrets/run.py --model-dir <model dir> --filter github   # some
 python3 -I tests/secrets/run.py --check-generators   # each format matches its gitleaks rule
 python3 -I tests/secrets/run.py --self-test          # the checks themselves, no gateway
 PIIF_MODEL_DIR=<model dir> python3 -I tests/secrets/stats_check.py   # /stats counters and the notice
+PIIF_MODEL_DIR=<model dir> python3 -I tests/secrets/lifecycle_check.py   # a shared gateway outlives the launcher that started it
 ```
 
 `--model-dir` defaults to `$PIIF_MODEL_DIR`. The harness ignores any other `PIIF_*` variables in your shell and runs without a config file, so your `allow` list does not apply.

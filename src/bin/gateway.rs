@@ -5,14 +5,16 @@
 //!   3. The rewritten request is forwarded to `PIIF_UPSTREAM` with the original auth headers.
 //!   4. The response is streamed back byte for byte. Names are never replaced back: the provider never sees the value, and the agent uses the name. `piifence env` hands the values to the session's Bash commands, so `$PIIF_SECRET_1` expands to the real value on the user's machine.
 //!   5. The session-start hook sends Claude Code's conversation id to `/control/conversation`. The gateway then keeps that conversation's names in a file encrypted with a key from the macOS Keychain, and loads them back when the conversation is resumed, so names the agent already wrote keep their values across restarts.
+//!   6. `piifence claude` takes a lease on `/control/lease` (its session id and process id) before it starts Claude Code. Started with `PIIF_EXIT_WHEN_UNUSED=<seconds>`, as the launcher does, the gateway exits once no live launcher has held a lease for that long. Any other `/control/` path is answered 404 and never forwarded.
 //!
-//! Env: PIIF_UPSTREAM (required: provider base URL), PIIF_MODEL_DIR (required: the model directory, or several joined with ':', each a Scrub or cbx model), PIIF_PORT (7788), PIIF_AUDIT_LOG (/tmp/piifence-audit.log), PIIF_AUDIT_BODY=1 (also log the rewritten request bodies), PIIF_CACHE_DIR (~/.cache/piifence: detection results kept across restarts, as offsets per text hash, never the text or values), PIIF_STATE_DIR (~/.local/state/piifence: `names/` holds each conversation's names, encrypted with a key kept in the macOS Keychain).
+//! Env: PIIF_UPSTREAM (required: provider base URL), PIIF_MODEL_DIR (required: the model directory, or several joined with ':', each a Scrub or cbx model), PIIF_PORT (7788), PIIF_EXIT_WHEN_UNUSED (seconds; above 0, exit once no launcher has held a lease that long; unset or 0, run until stopped), PIIF_AUDIT_LOG (/tmp/piifence-audit.log), PIIF_AUDIT_BODY=1 (also log the rewritten request bodies), PIIF_CACHE_DIR (~/.cache/piifence: detection results kept across restarts, as offsets per text hash, never the text or values), PIIF_STATE_DIR (~/.local/state/piifence: `names/` holds each conversation's names, encrypted with a key kept in the macOS Keychain).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use axum::body::Body;
@@ -57,6 +59,8 @@ struct AppState {
     stats: Arc<Mutex<Stats>>,
     /// Per-session `$PIIF_…` values (see `Session`).
     sessions: Arc<Mutex<HashMap<String, Session>>>,
+    /// The launchers using this gateway (see `Leases`).
+    leases: Arc<Mutex<Leases>>,
     /// This request's session id (`x-piifence-session`), `""` outside a request or without one.
     session: String,
 }
@@ -436,6 +440,85 @@ fn session_id(headers: &HeaderMap) -> String {
         .filter(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
         .map(str::to_string)
         .unwrap_or_default()
+}
+
+/// The header carrying the process id of the `piifence claude` launcher that takes a lease.
+const LAUNCHER_HEADER: &str = "x-piifence-launcher-pid";
+
+/// How often a gateway started with `PIIF_EXIT_WHEN_UNUSED` checks that its launchers are still running.
+const LEASE_CHECK: Duration = Duration::from_secs(1);
+
+/// The `piifence claude` launchers using this gateway, as process ids by session id, and whether the gateway has started to shut down.
+#[derive(Default)]
+struct Leases {
+    pids: HashMap<String, i32>,
+    empty_since: Option<Instant>,
+    closing: bool,
+}
+
+/// The launcher process id in `headers`, or None when it is missing or not a positive number.
+fn launcher_pid(headers: &HeaderMap) -> Option<i32> {
+    headers
+        .get(LAUNCHER_HEADER)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
+        .filter(|pid| *pid > 0)
+}
+
+/// Record that launcher `pid` runs `session` on this gateway. False when the gateway is shutting down: the launcher then waits for it to close and starts a new one.
+fn take_lease(leases: &mut Leases, session: &str, pid: i32) -> bool {
+    if leases.closing {
+        return false;
+    }
+    leases.pids.insert(session.to_string(), pid);
+    leases.empty_since = None;
+    true
+}
+
+/// Drop the leases whose launcher process is gone, and mark the gateway as closing once no lease has been held for `grace`. Returns whether it is closing.
+fn expire_leases(
+    leases: &mut Leases,
+    now: Instant,
+    grace: Duration,
+    alive: impl Fn(i32) -> bool,
+) -> bool {
+    leases.pids.retain(|_, pid| alive(*pid));
+    if !leases.pids.is_empty() {
+        leases.empty_since = None;
+        return false;
+    }
+    let since = *leases.empty_since.get_or_insert(now);
+    if now.duration_since(since) >= grace {
+        leases.closing = true;
+    }
+    leases.closing
+}
+
+/// Whether process `pid` exists. Signal 0 is never delivered: `kill` only checks the process, and EPERM means it exists but belongs to another user.
+fn process_alive(pid: i32) -> bool {
+    (unsafe { libc::kill(pid, 0) == 0 })
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Finish once no launcher has held a lease for `grace`. `axum::serve` then stops accepting connections, finishes the open ones and returns, so the gateway exits.
+async fn until_unused(leases: Arc<Mutex<Leases>>, grace: Duration) {
+    loop {
+        tokio::time::sleep(LEASE_CHECK).await;
+        if expire_leases(
+            &mut leases.lock().unwrap(),
+            Instant::now(),
+            grace,
+            process_alive,
+        ) {
+            eprintln!(
+                "no piifence claude session has used this gateway for {} s; shutting down",
+                grace.as_secs()
+            );
+            return;
+        }
+    }
 }
 
 /// Run `f` on this request's session, creating it on first use.
@@ -1122,6 +1205,27 @@ async fn proxy(
             Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
         };
     }
+    // `piifence claude` takes a lease before it starts Claude Code. A gateway started with `PIIF_EXIT_WHEN_UNUSED` runs while a live launcher holds one.
+    if path == "/control/lease" && method == Method::GET {
+        let Some(pid) = launcher_pid(&headers) else {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "missing or malformed x-piifence-launcher-pid",
+            );
+        };
+        return if take_lease(&mut state.leases.lock().unwrap(), &state.session, pid) {
+            json_response(StatusCode::OK, json!({"leased": true}))
+        } else {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "this gateway is shutting down",
+            )
+        };
+    }
+    // Control paths are for the launcher and its hooks, so none is ever forwarded to the provider.
+    if path.starts_with("/control/") {
+        return error_response(StatusCode::NOT_FOUND, "no such control endpoint");
+    }
 
     let outgoing = if is_scanned {
         match redact_request(&state, &body).await {
@@ -1223,6 +1327,7 @@ async fn main() -> anyhow::Result<()> {
         )?)
         .collect();
     let port: u16 = env_or("PIIF_PORT", 7788)?;
+    let exit_when_unused: u64 = env_or("PIIF_EXIT_WHEN_UNUSED", 0)?;
     let audit_path: String = env_or("PIIF_AUDIT_LOG", "/tmp/piifence-audit.log".to_string())?;
     let audit_body_path = (env_or("PIIF_AUDIT_BODY", 0u8)? == 1)
         .then(|| "/tmp/piifence-redacted-bodies.jsonl".to_string());
@@ -1268,6 +1373,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let leases = Arc::new(Mutex::new(Leases::default()));
     let state = AppState {
         detector_tx,
         client: reqwest::Client::builder()
@@ -1279,6 +1385,7 @@ async fn main() -> anyhow::Result<()> {
         audit_body: audit_body.map(|file| Arc::new(Mutex::new(file))),
         stats: Arc::new(Mutex::new(Stats::default())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        leases: leases.clone(),
         session: String::new(),
     };
 
@@ -1292,7 +1399,15 @@ async fn main() -> anyhow::Result<()> {
         "audit log: {audit_path} (body log: {})",
         audit_body_path.as_deref().unwrap_or("off")
     );
-    axum::serve(listener, app).await?;
+    let serve = axum::serve(listener, app);
+    if exit_when_unused > 0 {
+        eprintln!("exits {exit_when_unused} s after the last piifence claude session ends");
+        serve
+            .with_graceful_shutdown(until_unused(leases, Duration::from_secs(exit_when_unused)))
+            .await?;
+    } else {
+        serve.await?;
+    }
     Ok(())
 }
 
@@ -1332,6 +1447,7 @@ mod tests {
             audit_body: None,
             stats: Arc::new(Mutex::new(Stats::default())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            leases: Arc::new(Mutex::new(Leases::default())),
             session: "0123456789abcdef0123456789abcdef".to_string(),
         }
     }
@@ -1746,5 +1862,91 @@ mod tests {
         assert_eq!(stats.values, 25);
         assert_eq!(stats.recent.len(), 20);
         assert_eq!(stats.recent[0]["name"], "$PIIF_SECRET_6");
+    }
+
+    #[test]
+    fn a_closing_gateway_refuses_a_lease() {
+        let mut leases = Leases::default();
+        assert!(take_lease(&mut leases, "a", 10));
+        leases.closing = true;
+        assert!(!take_lease(&mut leases, "b", 11));
+        assert_eq!(leases.pids.len(), 1);
+    }
+
+    #[test]
+    fn leases_of_launchers_that_exited_are_dropped() {
+        let mut leases = Leases::default();
+        take_lease(&mut leases, "a", 10);
+        take_lease(&mut leases, "b", 11);
+        let closing = expire_leases(
+            &mut leases,
+            Instant::now(),
+            Duration::from_secs(10),
+            |pid| pid == 11,
+        );
+        assert!(!closing);
+        assert_eq!(leases.pids.len(), 1);
+        assert!(leases.pids.contains_key("b"));
+    }
+
+    #[test]
+    fn the_gateway_closes_only_after_the_grace_passes_with_no_lease() {
+        let grace = Duration::from_secs(10);
+        let start = Instant::now();
+        let mut leases = Leases::default();
+        assert!(!expire_leases(&mut leases, start, grace, |_| true));
+        assert!(!expire_leases(
+            &mut leases,
+            start + grace - Duration::from_millis(1),
+            grace,
+            |_| true
+        ));
+        assert!(expire_leases(&mut leases, start + grace, grace, |_| true));
+        assert!(leases.closing);
+    }
+
+    #[test]
+    fn a_new_lease_restarts_the_grace() {
+        let grace = Duration::from_secs(10);
+        let start = Instant::now();
+        let mut leases = Leases::default();
+        expire_leases(&mut leases, start, grace, |_| true);
+        take_lease(&mut leases, "a", 10);
+        assert!(!expire_leases(&mut leases, start + grace, grace, |_| true));
+        leases.pids.clear();
+        assert!(!expire_leases(&mut leases, start + grace, grace, |_| true));
+        assert!(!expire_leases(
+            &mut leases,
+            start + grace * 2 - Duration::from_millis(1),
+            grace,
+            |_| true
+        ));
+        assert!(expire_leases(&mut leases, start + grace * 2, grace, |_| {
+            true
+        }));
+    }
+
+    #[test]
+    fn this_process_is_alive_and_a_reaped_child_is_not() {
+        assert!(process_alive(std::process::id() as i32));
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id() as i32;
+        child.wait().unwrap();
+        assert!(!process_alive(pid));
+    }
+
+    #[test]
+    fn the_launcher_pid_header_must_be_a_positive_number() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(launcher_pid(&headers), None);
+        for (value, expected) in [
+            ("4242", Some(4242)),
+            ("0", None),
+            ("-5", None),
+            ("12x", None),
+        ] {
+            headers.insert(LAUNCHER_HEADER, value.parse().unwrap());
+            assert_eq!(launcher_pid(&headers), expected, "{value}");
+        }
     }
 }

@@ -215,6 +215,7 @@ Inline `gitleaks:allow` comments and `.gitleaksignore` files have no effect on t
 | `PIIF_CACHE_DIR` | `~/.cache/piifence` | Where the detection cache is kept. |
 | `PIIF_STATE_DIR` | `~/.local/state/piifence` | Where each conversation's encrypted names are kept, in `names/`. |
 | `PIIF_GATEWAY_LOG` | `$TMPDIR/piifence-gateway.log` | The gateway's own log. |
+| `PIIF_EXIT_WHEN_UNUSED` | `10` | Seconds a gateway started by `piifence claude` keeps running after the last `piifence claude` that used it exits. `0` keeps it running until you stop it. |
 | `PIIF_AUDIT_LOG` | `/tmp/piifence-audit.log` | One line per replacement: kind, position, name and masked preview. |
 | `PIIF_AUDIT_BODY` | unset | Set to `1` to also log each rewritten request body. |
 | `PIIF_PREFIX` | `~/.local` | Install prefix, read by `install.sh`. |
@@ -228,7 +229,7 @@ A value that is set but can't be parsed, such as `PIIF_PORT=abc`, is an error.
 <details>
 <summary><b>Upgrading</b></summary>
 
-1. Quit every `piifence claude` session. `piifence claude` reuses a gateway that is already running, so an old gateway keeps serving until it stops.
+1. Quit every `piifence claude` session. A gateway that `piifence claude` started exits by itself about 10 seconds after its last session ends; until then, a new `piifence claude` reuses it.
 2. Run `brew upgrade piifence`, or the install script again.
 3. Check that no old gateway is left with `pgrep -fl piifence-gateway`, and stop any you find with `pkill -f piifence-gateway`.
 
@@ -242,6 +243,7 @@ A value that is set but can't be parsed, such as `PIIF_PORT=abc`, is an error.
 - **A config error**, such as `unknown field` or `invalid allow pattern`. Older versions had settings like `categories` and `auto_approve`, and those are now errors. Keep only `allow` in `~/.config/piifence/config.toml`, or delete the file.
 - **`no upstream configured`**: set `PIIF_UPSTREAM`, or `ANTHROPIC_BASE_URL` in your shell or Claude Code settings.
 - **`a gateway on … forwards to …`**: another session's gateway is using the port with a different provider. Quit that session, or set `PIIF_PORT` to a free port.
+- **`cannot hold a lease`**: a gateway from an older piifence is still running on the port. Quit the sessions that use it, or stop it with `pkill -f piifence-gateway`.
 
 </details>
 

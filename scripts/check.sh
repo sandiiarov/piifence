@@ -18,6 +18,7 @@ run gitleaks dir tests/secrets --no-banner
 if [ "${1:-}" != "--no-suite" ]; then
   : "${PIIF_MODEL_DIR:?set PIIF_MODEL_DIR to the model directory, or pass --no-suite}"
   run python3 -I tests/secrets/stats_check.py
+  run python3 -I tests/secrets/lifecycle_check.py
   run python3 -I tests/secrets/run.py --model-dir "$PIIF_MODEL_DIR"
 fi
 echo "check: all passed"

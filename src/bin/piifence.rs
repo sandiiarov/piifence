@@ -3,7 +3,7 @@
 //! Usage:
 //!   piifence claude [claude arguments...]
 //!
-//! It starts the gateway if it is not already healthy (upstream derived from the user's current Claude Code settings), points this Claude Code session at it with a temporary `--settings` override, runs Claude Code, then tears the gateway down if this process started it. The user's settings file is never modified.
+//! It starts the gateway if it is not already healthy (upstream derived from the user's current Claude Code settings), points this Claude Code session at it with a temporary `--settings` override, takes a lease on the gateway, and runs Claude Code. It never stops a gateway: one it started exits by itself once no `piifence claude` has held a lease for `PIIF_EXIT_WHEN_UNUSED` seconds (10 by default). The user's settings file is never modified.
 //!
 //! The override also adds two hooks. `SessionStart` runs `piifence session-start`: it tells the agent what `$PIIF_SECRET_<N>` names are, sends the gateway Claude Code's conversation id so a resumed conversation gets its old names back, and adds a line to Claude Code's `CLAUDE_ENV_FILE`, which Claude Code sources before every Bash command. That line runs `piifence env`, which exports this session's values from the gateway, so a command that names `$PIIF_SECRET_1` gets the real value. `PreToolUse` runs `piifence restore` on every other tool call: it puts the real values into the tool's input, so a file the agent writes or an MCP argument holds the value, not the name.
 //!
@@ -13,6 +13,7 @@ use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -22,6 +23,8 @@ use anyhow::{bail, Context, Result};
 
 const DEFAULT_PORT: u16 = 7788;
 const GATEWAY_START_TIMEOUT: Duration = Duration::from_secs(45);
+/// Seconds a gateway started by `piifence claude` keeps running after the last lease ends, unless `PIIF_EXIT_WHEN_UNUSED` is set.
+const DEFAULT_EXIT_WHEN_UNUSED: u64 = 10;
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -99,6 +102,16 @@ fn port() -> Result<u16> {
     }
 }
 
+/// `PIIF_EXIT_WHEN_UNUSED`: the seconds a gateway this launcher starts keeps running without a lease (0: until stopped).
+fn exit_when_unused() -> Result<u64> {
+    match env::var("PIIF_EXIT_WHEN_UNUSED") {
+        Ok(raw) => raw.parse().with_context(|| {
+            format!("PIIF_EXIT_WHEN_UNUSED={raw:?} is not a whole number of seconds")
+        }),
+        Err(_) => Ok(DEFAULT_EXIT_WHEN_UNUSED),
+    }
+}
+
 fn run_claude(args: &[String]) -> Result<i32> {
     if args
         .iter()
@@ -115,28 +128,71 @@ fn run_claude(args: &[String]) -> Result<i32> {
         "no upstream configured: set PIIF_UPSTREAM to your provider's base URL, or ANTHROPIC_BASE_URL in your shell or Claude settings",
     )?;
 
-    let mut gateway_child: Option<Child> = None;
-    match running_gateway_upstream(port) {
-        // Reuse only a gateway that forwards to the same place this launch would. Reusing another one would send this session's credentials elsewhere.
-        Some(running) if running == upstream => {
-            eprintln!("piifence: using existing gateway on {gateway_url} (upstream {upstream})");
-        }
-        Some(running) => bail!(
-            "a gateway on {gateway_url} forwards to {running:?}, but this launch wants {upstream}. Stop that gateway or set PIIF_PORT to a free port."
-        ),
-        None => gateway_child = Some(start_gateway(&data, port, &upstream)?),
-    }
-
-    let result = run_session(&gateway_url, port, &plugin, args);
-    if let Some(mut child) = gateway_child {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    result
+    let session_id = new_session_id().context("cannot create a session id")?;
+    ensure_gateway(&data, port, &upstream, &session_id)?;
+    run_session(&gateway_url, port, &plugin, args, &session_id)
 }
 
-/// Start the gateway and wait until it is healthy. Claude Code is never launched without one (fail closed).
-fn start_gateway(data: &Path, port: u16, upstream: &str) -> Result<Child> {
+/// Make sure a gateway that forwards to `upstream` runs on `port`, starting one if none answers, and lease it so it keeps running while this launcher does. A gateway that is shutting down is waited out and replaced. The launcher never stops a gateway: one it started exits by itself after the last lease ends.
+fn ensure_gateway(data: &Path, port: u16, upstream: &str, session_id: &str) -> Result<()> {
+    let gateway_url = format!("http://127.0.0.1:{port}");
+    for _ in 0..2 {
+        match running_gateway_upstream(port) {
+            // Reuse only a gateway that forwards to the same place this launch would. Reusing another one would send this session's credentials elsewhere.
+            Some(running) if running == upstream => {
+                eprintln!("piifence: using existing gateway on {gateway_url} (upstream {upstream})");
+            }
+            Some(running) => bail!(
+                "a gateway on {gateway_url} forwards to {running:?}, but this launch wants {upstream}. Stop that gateway or set PIIF_PORT to a free port."
+            ),
+            None => start_gateway(data, port, upstream)?,
+        }
+        if lease(port, session_id)? {
+            return Ok(());
+        }
+        wait_until_closed(port)?;
+    }
+    bail!("the gateway on {gateway_url} shut down twice while this launch tried to use it; refusing to launch Claude Code (fail closed)")
+}
+
+/// Ask the gateway on `port` to keep running while this process runs session `session_id`. False when the gateway is shutting down (503) or no longer answers. Any other answer means the gateway predates leases.
+fn lease(port: u16, session_id: &str) -> Result<bool> {
+    let headers = format!(
+        "x-piifence-session: {session_id}\r\nx-piifence-launcher-pid: {}\r\n",
+        std::process::id()
+    );
+    let Ok(response) = http_get(port, "/control/lease", &headers, Duration::from_secs(5)) else {
+        return Ok(false);
+    };
+    if response.starts_with("HTTP/1.1 200") {
+        return Ok(true);
+    }
+    if response.starts_with("HTTP/1.1 503") {
+        return Ok(false);
+    }
+    let status = response.lines().next().unwrap_or_default();
+    bail!(
+        "the gateway on port {port} cannot hold a lease ({status}); it is probably from an older piifence. Quit the sessions that use it, or stop it with `pkill -f piifence-gateway`, and run again."
+    )
+}
+
+/// Wait until the gateway on `port`, which is shutting down, stops answering.
+fn wait_until_closed(port: u16) -> Result<()> {
+    let deadline = Instant::now() + GATEWAY_START_TIMEOUT;
+    while running_gateway_upstream(port).is_some() {
+        if Instant::now() >= deadline {
+            bail!(
+                "the gateway on port {port} did not shut down in {} s",
+                GATEWAY_START_TIMEOUT.as_secs()
+            );
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    Ok(())
+}
+
+/// Start a gateway that exits by itself once no launcher holds a lease, and wait until a gateway that forwards to `upstream` is healthy. Claude Code is never launched without one (fail closed).
+fn start_gateway(data: &Path, port: u16, upstream: &str) -> Result<()> {
     let exe = real_exe()?;
     let gateway_bin = existing(exe.with_file_name("piifence-gateway"), "the gateway binary")?;
     let model_dir = existing(data.join("model"), "the secret model")?;
@@ -144,6 +200,7 @@ fn start_gateway(data: &Path, port: u16, upstream: &str) -> Result<Child> {
         Ok(path) => PathBuf::from(path),
         Err(_) => env::temp_dir().join("piifence-gateway.log"),
     };
+    let exit_when_unused = exit_when_unused()?;
     let gateway_url = format!("http://127.0.0.1:{port}");
     eprintln!("piifence: starting gateway on {gateway_url} (upstream {upstream})");
     let log = fs::OpenOptions::new()
@@ -151,17 +208,20 @@ fn start_gateway(data: &Path, port: u16, upstream: &str) -> Result<Child> {
         .append(true)
         .open(&gateway_log)
         .with_context(|| format!("cannot open the gateway log {}", gateway_log.display()))?;
+    // Its own process group, so closing this terminal does not stop a gateway that other sessions use.
     let mut child = Command::new(&gateway_bin)
         .env("PIIF_UPSTREAM", upstream)
         .env("PIIF_MODEL_DIR", &model_dir)
         .env("PIIF_PORT", port.to_string())
+        .env("PIIF_EXIT_WHEN_UNUSED", exit_when_unused.to_string())
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
         .spawn()
         .with_context(|| format!("could not start the gateway {}", gateway_bin.display()))?;
 
-    if let Err(err) = wait_healthy(port, &mut child) {
+    if let Err(err) = wait_healthy(port, upstream, &mut child) {
         let _ = child.kill();
         let _ = child.wait();
         let lines = match fs::read_to_string(&gateway_log) {
@@ -177,13 +237,18 @@ fn start_gateway(data: &Path, port: u16, upstream: &str) -> Result<Child> {
         );
     }
     eprintln!("piifence: gateway ready (log: {})", gateway_log.display());
-    Ok(child)
+    Ok(())
 }
 
 /// Run Claude Code against the gateway with the session's settings override and the notice plugin. Returns Claude Code's exit code.
-fn run_session(gateway_url: &str, port: u16, plugin: &Path, args: &[String]) -> Result<i32> {
-    let session_id = new_session_id().context("cannot create a session id")?;
-    let settings_path = write_settings_override(gateway_url, port, &session_id)
+fn run_session(
+    gateway_url: &str,
+    port: u16,
+    plugin: &Path,
+    args: &[String],
+    session_id: &str,
+) -> Result<i32> {
+    let settings_path = write_settings_override(gateway_url, port, session_id)
         .context("cannot write the session settings")?;
     let claude = env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
     let status = Command::new(&claude)
@@ -262,13 +327,19 @@ fn running_gateway_upstream(port: u16) -> Option<String> {
     })
 }
 
-fn wait_healthy(port: u16, child: &mut Child) -> Result<()> {
+/// Wait until a gateway that forwards to `upstream` answers on `port`. Another launcher may start a gateway at the same moment, and only one of the two gets the port; the other one's gateway is used when it forwards to the same upstream.
+fn wait_healthy(port: u16, upstream: &str, child: &mut Child) -> Result<()> {
     let deadline = Instant::now() + GATEWAY_START_TIMEOUT;
     while Instant::now() < deadline {
-        if running_gateway_upstream(port).is_some() {
-            return Ok(());
+        let exited = child.try_wait()?;
+        match running_gateway_upstream(port) {
+            Some(running) if running == upstream => return Ok(()),
+            Some(running) => bail!(
+                "a gateway that forwards to {running:?} took port {port} first, but this launch wants {upstream}. Set PIIF_PORT to a free port."
+            ),
+            None => {}
         }
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = exited {
             bail!("the gateway exited during startup ({status})");
         }
         thread::sleep(Duration::from_millis(250));
@@ -692,5 +763,46 @@ mod tests {
         );
         assert!(session_args(&["x; rm -rf /".to_string(), "7788".to_string()]).is_err());
         assert!(session_args(&ok[..1]).is_err());
+    }
+
+    /// The port of a one-request HTTP server on loopback that reads a whole request and answers `status` with an empty body.
+    fn answer_once(status: &'static str) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 512];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
+            let reply =
+                format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            stream.write_all(reply.as_bytes()).unwrap();
+        });
+        port
+    }
+
+    #[test]
+    fn a_lease_is_held_on_200_and_refused_on_503_or_no_answer() {
+        let session = "0".repeat(32);
+        assert!(lease(answer_once("200 OK"), &session).unwrap());
+        assert!(!lease(answer_once("503 Service Unavailable"), &session).unwrap());
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        assert!(!lease(closed, &session).unwrap());
+    }
+
+    #[test]
+    fn a_lease_on_a_gateway_that_predates_leases_is_an_error() {
+        let err = lease(answer_once("404 Not Found"), &"0".repeat(32)).unwrap_err();
+        assert!(format!("{err:#}").contains("older piifence"), "{err:#}");
     }
 }
