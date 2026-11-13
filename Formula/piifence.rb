@@ -50,5 +50,6 @@ class Piifence < Formula
     assert_path_exists pkgshare/"model/model.safetensors"
     assert_path_exists pkgshare/"plugin/piifence-notice/.claude-plugin/plugin.json"
     assert_path_exists pkgshare/"plugin/piifence-reveal/hooks/register.ts"
+    assert_path_exists pkgshare/"plugin/piifence-session/hooks/hooks.json"
   end
 end

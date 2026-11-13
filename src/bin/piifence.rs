@@ -5,7 +5,7 @@
 //!
 //! It starts the gateway if it is not already healthy (upstream derived from the user's current Claude Code settings), points this Claude Code session at it with a temporary `--settings` override, takes a lease on the gateway, and runs Claude Code. It never stops a gateway: one it started exits by itself once no `piifence claude` has held a lease for `PIIF_EXIT_WHEN_UNUSED` seconds (10 by default). The user's settings file is never modified.
 //!
-//! The override also adds two hooks. `SessionStart` runs `piifence session-start`: it tells the agent what `$PIIF_SECRET_<N>` names are, sends the gateway Claude Code's conversation id so a resumed conversation gets its old names back, and adds a line to Claude Code's `CLAUDE_ENV_FILE`, which Claude Code sources before every Bash command. That line runs `piifence env`, which exports this session's values from the gateway, so a command that names `$PIIF_SECRET_1` gets the real value. `PreToolUse` runs `piifence restore` on every tool call: it puts the real values into the tool's input, so a file the agent writes or an MCP argument holds the value, not the name; a backslash before a name's `$` counts as part of the name. In Bash and Monitor commands it fills in only the names the shell would not expand (single quotes, quoted heredocs, an escaped `$`), escaped for where they stand; PowerShell is skipped.
+//! The `piifence-session` plugin, which the launcher loads with `--plugin-dir`, adds two hooks; they ship in a plugin, not in the override, because a managed policy can drop the hooks of settings files while it still loads plugins. `SessionStart` runs `piifence session-start`: it tells the agent what `$PIIF_SECRET_<N>` names are, sends the gateway Claude Code's conversation id so a resumed conversation gets its old names back, and adds a line to Claude Code's `CLAUDE_ENV_FILE`, which Claude Code sources before every Bash command. That line runs `piifence env`, which exports this session's values from the gateway, so a command that names `$PIIF_SECRET_1` gets the real value. `PreToolUse` runs `piifence restore` on every tool call: it puts the real values into the tool's input, so a file the agent writes or an MCP argument holds the value, not the name; a backslash before a name's `$` counts as part of the name. In Bash and Monitor commands it fills in only the names the shell would not expand (single quotes, quoted heredocs, an escaped `$`), escaped for where they stand; PowerShell is skipped.
 //!
 //! Files: `$PIIF_DATA_DIR` (default `~/.local/share/piifence`, which `scripts/install.sh` sets) holds `model/` (the secret model) and `plugin/`, piifence's Claude Code plugins (`piifence-notice`, the notice, and `piifence-reveal`, which draws values in place of names on screen). The gateway binary sits next to this one. The hooks and the notice plugin reach the gateway on its control socket, `$PIIF_STATE_DIR/run/<port>.sock` (state dir `~/.local/state/piifence` by default), in a directory only the user can open; the gateway hands out no session data on TCP.
 
@@ -153,6 +153,7 @@ fn run_claude(args: &[String]) -> Result<i32> {
 fn plugins(data: &Path) -> Result<PathBuf> {
     existing(data.join("plugin/piifence-notice"), "the notice plugin")?;
     existing(data.join("plugin/piifence-reveal"), "the reveal plugin")?;
+    existing(data.join("plugin/piifence-session"), "the session plugin")?;
     Ok(data.join("plugin"))
 }
 
@@ -279,7 +280,7 @@ fn run_session(
     claude: &OsStr,
 ) -> Result<i32> {
     let socket = control_socket(port)?;
-    let settings_path = write_settings_override(gateway_url, port, session_id, headers, nested)
+    let settings_path = write_settings_override(gateway_url, session_id, headers)
         .context("cannot write the session settings")?;
     let status = Command::new(claude)
         .arg("--settings")
@@ -288,6 +289,7 @@ fn run_session(
         .arg(plugin)
         .args(args)
         .env("PIIF_GATEWAY_SOCKET", &socket)
+        .envs(hook_env(port, session_id, nested)?)
         .status();
     let _ = fs::remove_file(&settings_path);
     let status = status.with_context(|| format!("failed to run `{}`", claude.to_string_lossy()))?;
@@ -458,30 +460,21 @@ fn custom_headers(session_id: &str) -> Result<String> {
     )
 }
 
-/// The session's hooks, run by this binary's real path: `SessionStart` (`piifence session-start <session> <port>`, with a trailing `nested` for a `claude` started inside a session) sets the session up, and `PreToolUse` (`piifence restore <session> <port>`, every tool) puts real values back into tool input.
-fn session_hooks(port: u16, session_id: &str, nested: bool) -> Result<serde_json::Value> {
-    let exe = shell_quote(&real_exe()?.to_string_lossy());
-    let tail = if nested { " nested" } else { "" };
-    Ok(serde_json::json!({
-        "SessionStart": [{"hooks": [{
-            "type": "command",
-            "command": format!("{exe} session-start {session_id} {port}{tail}"),
-        }]}],
-        "PreToolUse": [{"matcher": "*", "hooks": [{
-            "type": "command",
-            "command": format!("{exe} restore {session_id} {port}"),
-        }]}]
-    }))
+/// The environment the `piifence-session` plugin's hooks read: `PIIF_BIN`, this binary's path, runs `session-start "$PIIF_SESSION" "$PIIF_SESSION_PORT" $PIIF_SESSION_NESTED` and `restore "$PIIF_SESSION" "$PIIF_SESSION_PORT"`. The hooks ship in a plugin rather than in the `--settings` override because a managed policy can drop the hooks of settings files while it still loads plugins. `PIIF_SESSION_NESTED` is set even when empty, so a `claude` started inside a session never keeps its parent's value.
+fn hook_env(port: u16, session_id: &str, nested: bool) -> Result<[(&'static str, String); 4]> {
+    Ok([
+        ("PIIF_BIN", real_exe()?.to_string_lossy().into_owned()),
+        ("PIIF_SESSION", session_id.to_string()),
+        ("PIIF_SESSION_PORT", port.to_string()),
+        (
+            "PIIF_SESSION_NESTED",
+            if nested { "nested" } else { "" }.to_string(),
+        ),
+    ])
 }
 
 /// Write the per-process settings override, with `headers` as `ANTHROPIC_CUSTOM_HEADERS`. The name holds the session id and a random id, and the file is created with `create_new`, so a file or symlink planted at a guessable /tmp path cannot make this write land somewhere else, and two processes on one session do not collide. Mode 0600 is set at creation.
-fn write_settings_override(
-    gateway_url: &str,
-    port: u16,
-    session_id: &str,
-    headers: &str,
-    nested: bool,
-) -> Result<PathBuf> {
+fn write_settings_override(gateway_url: &str, session_id: &str, headers: &str) -> Result<PathBuf> {
     use std::os::unix::fs::OpenOptionsExt;
     let nonce = new_session_id().context("cannot create a settings file name")?;
     let path = env::temp_dir().join(format!(
@@ -494,7 +487,6 @@ fn write_settings_override(
                 "ANTHROPIC_BASE_URL": gateway_url,
                 "ANTHROPIC_CUSTOM_HEADERS": headers,
             },
-            "hooks": session_hooks(port, session_id, nested)?,
         })
     );
     fs::OpenOptions::new()
@@ -710,7 +702,7 @@ fn find_claude(path: &OsStr, shim_dir: &Path) -> Option<PathBuf> {
     })
 }
 
-/// `piifence nested-claude [claude arguments...]`, what the `claude` shim runs. Inside a piifence session it runs the real `claude` on that session with the same hooks (see `session_hooks`), and refuses when it cannot (no gateway, or the arguments hold `--settings`). Outside one it runs the real `claude` unchanged. It starts no gateway and takes no lease.
+/// `piifence nested-claude [claude arguments...]`, what the `claude` shim runs. Inside a piifence session it runs the real `claude` on that session with the same hooks (see `hook_env`), and refuses when it cannot (no gateway, or the arguments hold `--settings`). Outside one it runs the real `claude` unchanged. It starts no gateway and takes no lease.
 fn run_nested_claude(args: &[String]) -> Result<i32> {
     let claude = match env::var_os("CLAUDE_BIN") {
         Some(bin) => PathBuf::from(bin),
@@ -1043,19 +1035,41 @@ mod tests {
     }
 
     #[test]
-    fn nested_hooks_skip_the_bind() {
+    fn hook_env_marks_only_nested_sessions() {
         let session = "a".repeat(32);
-        let plain = session_hooks(7788, &session, false).unwrap();
-        let nested = session_hooks(7788, &session, true).unwrap();
-        let start = |hooks: &serde_json::Value| {
-            hooks["SessionStart"][0]["hooks"][0]["command"]
+        let get = |env: &[(&str, String)], key: &str| {
+            env.iter().find(|(k, _)| *k == key).unwrap().1.clone()
+        };
+        let plain = hook_env(7788, &session, false).unwrap();
+        let nested = hook_env(7788, &session, true).unwrap();
+        assert_eq!(get(&plain, "PIIF_SESSION_NESTED"), "");
+        assert_eq!(get(&nested, "PIIF_SESSION_NESTED"), "nested");
+        assert_eq!(get(&plain, "PIIF_SESSION"), session);
+        assert_eq!(get(&plain, "PIIF_SESSION_PORT"), "7788");
+        assert!(Path::new(&get(&plain, "PIIF_BIN")).is_absolute());
+    }
+
+    #[test]
+    fn session_plugin_hooks_run_the_launcher_commands() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin/piifence-session/hooks/hooks.json");
+        let hooks: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        let command = |event: &str| {
+            hooks["hooks"][event][0]["hooks"][0]["command"]
                 .as_str()
                 .unwrap()
                 .to_string()
         };
-        assert!(start(&nested).ends_with(" nested"), "{}", start(&nested));
-        assert!(start(&plain).ends_with(" 7788"), "{}", start(&plain));
-        assert_eq!(nested["PreToolUse"], plain["PreToolUse"]);
+        assert_eq!(
+            command("SessionStart"),
+            r#""$PIIF_BIN" session-start "$PIIF_SESSION" "$PIIF_SESSION_PORT" $PIIF_SESSION_NESTED"#
+        );
+        assert_eq!(
+            command("PreToolUse"),
+            r#""$PIIF_BIN" restore "$PIIF_SESSION" "$PIIF_SESSION_PORT""#
+        );
+        assert_eq!(hooks["hooks"]["PreToolUse"][0]["matcher"], "*");
     }
 
     #[test]
@@ -1168,18 +1182,15 @@ mod tests {
         let session = "a".repeat(32);
         let headers = format!("X-Mine: 1\nx-piifence-session: {session}");
         let url = "http://127.0.0.1:7788";
-        let first = write_settings_override(url, 7788, &session, &headers, true).unwrap();
-        let second = write_settings_override(url, 7788, &session, &headers, true).unwrap();
+        let first = write_settings_override(url, &session, &headers).unwrap();
+        let second = write_settings_override(url, &session, &headers).unwrap();
         assert_ne!(first, second);
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&first).unwrap()).unwrap();
         fs::remove_file(&first).unwrap();
         fs::remove_file(&second).unwrap();
         assert_eq!(json["env"]["ANTHROPIC_CUSTOM_HEADERS"], headers.as_str());
-        assert!(json["hooks"]["SessionStart"][0]["hooks"][0]["command"]
-            .as_str()
-            .unwrap()
-            .ends_with(" nested"));
+        assert!(json.get("hooks").is_none());
     }
 
     #[test]

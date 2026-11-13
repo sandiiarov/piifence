@@ -78,7 +78,8 @@ def main():
         data = os.path.join(tmp, "data")
         os.makedirs(os.path.join(data, "plugin"))
         os.symlink(model_dir, os.path.join(data, "model"))
-        os.symlink(os.path.join(REPO, "plugin", "piifence-notice"), os.path.join(data, "plugin", "piifence-notice"))
+        for plugin in ("piifence-notice", "piifence-reveal", "piifence-session"):
+            os.symlink(os.path.join(REPO, "plugin", plugin), os.path.join(data, "plugin", plugin))
         script = os.path.join(tmp, "fake_claude.py")
         with open(script, "w") as f:
             f.write(FAKE_CLAUDE)

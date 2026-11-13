@@ -135,7 +135,7 @@ flowchart LR
     bash <-. "values for this session only" .-> gw
 ```
 
-`piifence claude` starts the gateway, gives the session a random id, and launches Claude Code with a temporary settings file and piifence's two plugins, the notice and the reveal plugin:
+`piifence claude` starts the gateway, gives the session a random id, and launches Claude Code with a temporary settings file and piifence's three plugins: the session hooks, the notice and the reveal plugin. The hooks come in a plugin, not in the settings file, because some managed Claude Code policies drop the hooks of settings files but still load plugins. If a policy drops plugin hooks too, the gateway refuses the session's agent requests with an error that says so, rather than letting the agent write names where values belong.
 
 - **The gateway** is a proxy on `127.0.0.1:7788`. It scans every outgoing request (prompt, tool output, files, system prompt) and replaces each secret with its `$PIIF_SECRET_*` name. It keeps the values in memory and hands them only to the session they belong to, and only on its control socket, `~/.local/state/piifence/run/7788.sock`, never on its TCP port. It also saves each conversation's names, encrypted, so a resumed conversation gets them back (see [Guarantees](#guarantees)).
 - **A `SessionStart` hook** gives the agent the note about `$PIIF_*` names, and tells the gateway which Claude Code conversation the session is. It also adds one line to the file that Claude Code loads before every Bash command (`CLAUDE_ENV_FILE`). That line runs `piifence env`, which fetches the session's values from the gateway and exports them.
@@ -304,6 +304,7 @@ PIIF_MODEL_DIR=/tmp/piifence-model scripts/check.sh    # every check, including 
 | [`docs/research/`](docs/research/README.md) | What other secret detectors, redaction proxies and papers do, and what piifence can take from them. |
 | [`plugin/piifence-notice/README.md`](plugin/piifence-notice/README.md) | The plugin that shows what was replaced. |
 | [`plugin/piifence-reveal/README.md`](plugin/piifence-reveal/README.md) | The plugin that draws values in place of names on screen. |
+| [`plugin/piifence-session/README.md`](plugin/piifence-session/README.md) | The plugin that holds the session hooks. |
 
 ## 📄 License
 

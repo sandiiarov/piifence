@@ -421,6 +421,33 @@ fn bind_conversation(state: &AppState, conversation: &str) -> anyhow::Result<usi
     Ok(stored.len())
 }
 
+/// How long an agent request waits for its session's `SessionStart` hook to bind the conversation before it is refused. Claude Code can send its first request while the hook still runs.
+const HOOKS_WAIT: Duration = Duration::from_secs(15);
+
+const HOOKS_MISSING: &str = "piifence refused this request: the session's SessionStart hook never reached the gateway, so piifence's hooks are not running in this Claude Code. Without them, files and tool calls would get $PIIF_SECRET_ names instead of real values. A managed policy that blocks plugin hooks (allowManagedHooksOnly, for example) causes this; piifence then needs its piifence-session plugin installed as a managed plugin.";
+
+/// Whether the session's `SessionStart` hook has bound it to a conversation, waiting up to `HOOKS_WAIT` for it. A `claude` started inside a session shares its parent's session id, which is already bound.
+async fn hooks_ran(state: &AppState) -> bool {
+    let deadline = Instant::now() + HOOKS_WAIT;
+    loop {
+        if with_session(state, |session| session.conversation.is_some()) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Whether a Messages request body offers the model tools: the agent's own turns do, while side requests such as a title or a quota check do not.
+fn offers_tools(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|payload| Some(!payload.get("tools")?.as_array()?.is_empty()))
+        .unwrap_or(false)
+}
+
 /// The conversation id in `headers`: Claude Code's session UUID, so 36 hex digits and dashes.
 fn conversation_id(headers: &HeaderMap) -> Option<String> {
     headers
@@ -1295,6 +1322,16 @@ async fn proxy(
     if path.starts_with("/control/") {
         return error_response(StatusCode::NOT_FOUND, "no such control endpoint");
     }
+    // Fail closed when piifence's hooks do not run: the agent would write names where values belong.
+    if path == "/v1/messages"
+        && method == Method::POST
+        && !with_session(&state, |session| session.conversation.is_some())
+        && offers_tools(&body)
+        && !hooks_ran(&state).await
+    {
+        let _ = audit_line(&state, json!({"event":"hooks_missing"}));
+        return error_response(StatusCode::BAD_REQUEST, HOOKS_MISSING);
+    }
 
     let outgoing = if is_scanned {
         match redact_request(&state, &body).await {
@@ -1496,6 +1533,16 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_agent_turns_offer_tools() {
+        assert!(offers_tools(
+            br#"{"tools":[{"name":"Write"}],"messages":[]}"#
+        ));
+        assert!(!offers_tools(br#"{"tools":[],"messages":[]}"#));
+        assert!(!offers_tools(br#"{"messages":[]}"#));
+        assert!(!offers_tools(b"not json"));
+    }
 
     /// An AppState in a session whose detector marks every `TOKEN` as a secret, so the block walker can be tested without model weights or gitleaks.
     fn fake_state() -> AppState {

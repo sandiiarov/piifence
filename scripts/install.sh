@@ -13,6 +13,7 @@
 #   share/piifence/model/                 the secret model (SporeLabs Scrub, about 70 MB)
 #   share/piifence/plugin/piifence-notice the Claude Code notice plugin
 #   share/piifence/plugin/piifence-reveal the plugin that draws values in place of names
+#   share/piifence/plugin/piifence-session the session hooks: values for Bash, values back into tool input
 set -euo pipefail
 
 if [ "$(uname -s)" != "Darwin" ]; then
@@ -80,7 +81,7 @@ for bin in piifence piifence-gateway; do
   rm -f "$LIBEXEC/$bin"
   cp "$REPO/target/release/$bin" "$LIBEXEC/$bin"
 done
-for plugin in piifence-notice piifence-reveal; do
+for plugin in piifence-notice piifence-reveal piifence-session; do
   rm -rf "$SHARE/plugin/$plugin"
   cp -R "$REPO/plugin/$plugin" "$SHARE/plugin/"
 done

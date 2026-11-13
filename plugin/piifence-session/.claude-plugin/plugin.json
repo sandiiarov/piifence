@@ -1,0 +1,9 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "piifence-session",
+  "version": "0.1.0",
+  "description": "piifence's session hooks: export the session's values to Bash and put real values back into tool input",
+  "author": {
+    "name": "piifence"
+  }
+}
