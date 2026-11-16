@@ -827,18 +827,7 @@ fn names_in(value: &serde_json::Value) -> bool {
     false
 }
 
-/// The first bare name in `text` that a letter, digit or `_` follows directly. A shell reads such a name as a longer, different variable, so the hook refuses it instead of guessing.
-fn glued_name(pattern: &regex::Regex, text: &str) -> Option<String> {
-    pattern.captures_iter(text).find_map(|caps| {
-        let number = caps.get(3)?;
-        let end = caps.get(0)?.end();
-        text[end..]
-            .starts_with(|c: char| c.is_alphanumeric() || c == '_')
-            .then(|| format!("PIIF_SECRET_{}", number.as_str()))
-    })
-}
-
-/// Replace every name in every string of `value` with its value. A name this session does not have is an error. So is a bare name that runs into a letter or `_` (`glued_name`).
+/// Replace every name in every string of `value` with its value. A name this session does not have is an error. A bare name that runs into a letter or `_` is filled too: its number is read whole, and no shell reads this input, so the name cannot be taken for a longer variable.
 fn fill_values(
     value: &mut serde_json::Value,
     values: &serde_json::Map<String, serde_json::Value>,
@@ -848,9 +837,6 @@ fn fill_values(
     while let Some(value) = stack.pop() {
         match value {
             serde_json::Value::String(s) => {
-                if let Some(name) = glued_name(&pattern, s) {
-                    bail!("${name} runs into the text after it, so a shell would read a longer variable name; write ${{{name}}} instead");
-                }
                 let mut missing = None;
                 let filled = pattern.replace_all(s, |caps: &regex::Captures| {
                     let number = caps.get(2).or(caps.get(3)).map_or("", |m| m.as_str());
@@ -978,17 +964,15 @@ mod tests {
     }
 
     #[test]
-    fn fill_values_rejects_a_bare_name_that_runs_into_a_letter_or_underscore() {
-        let values = serde_json::json!({"PIIF_SECRET_1": "one"});
+    fn fill_values_fills_a_bare_name_that_runs_into_a_letter_or_underscore() {
+        let values = serde_json::json!({"PIIF_SECRET_1": "one", "PIIF_SECRET_12": "twelve"});
         let values = values.as_object().unwrap();
-        for text in [format!("{}x", bare(1)), format!("{}_old", bare(1))] {
-            let mut input = serde_json::json!({ "content": text });
-            let err = fill_values(&mut input, values).unwrap_err();
-            assert!(err.to_string().contains(&braced(1)), "{err}");
-        }
-        let mut input = serde_json::json!({"content": format!("{}-x {}x", bare(1), braced(1))});
+        let mut input = serde_json::json!({"content": format!(
+            "{}x {}_old {}-x {}x {}s",
+            bare(1), bare(1), bare(1), braced(1), bare(12)
+        )});
         fill_values(&mut input, values).unwrap();
-        assert_eq!(input["content"], "one-x onex");
+        assert_eq!(input["content"], "onex one_old one-x onex twelves");
     }
 
     #[test]
