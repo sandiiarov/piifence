@@ -7,3 +7,4 @@ plugin/*/.claude-plugin/types/
 
 __pycache__/
 *.pyc
+.firecrawl/

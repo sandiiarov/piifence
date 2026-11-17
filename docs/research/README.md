@@ -105,3 +105,4 @@ Web pages (`web:<name>` in the files), read 2026-11-11:
 | langsmith-redact-secrets | https://docs.langchain.com/langsmith/redact-secrets |
 
 Not read: the Android secrets paper at https://jordansamhi.com/static/files/papers/secretloc.pdf (the PDF did not download).
+- [false-positives.md](false-positives.md): what piifence over-redacts in real sessions, how other scanners filter false positives, and the proposed filters.
