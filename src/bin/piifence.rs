@@ -1,46 +1,61 @@
-//! piifence CLI — launch Claude Code through the secret-redaction gateway.
+//! piifence CLI — route Claude Code through the secret-redaction gateway, and the commands piifence's hooks run.
 //!
 //! Usage:
-//!   piifence claude [claude arguments...]
+//!   piifence install [--upstream URL]
+//!   piifence uninstall
+//!   piifence status
+//!   piifence reveal --conversation UUID [--json]
 //!
-//! It starts the gateway if it is not already healthy (upstream derived from the user's current Claude Code settings), points this Claude Code session at it with a temporary `--settings` override, takes a lease on the gateway, and runs Claude Code. It never stops a gateway: one it started exits by itself once no `piifence claude` has held a lease for `PIIF_EXIT_WHEN_UNUSED` seconds (10 by default). The user's settings file is never modified.
+//! `install` does three things, in this order, so Claude Code is never pointed at a gateway that is not running: it runs the gateway as a launchd agent that launchd keeps alive and starts at login (`start_agent`), installs piifence's Claude Code plugins at user scope from a local marketplace it writes into the state dir (`write_marketplace`), and sets `env.ANTHROPIC_BASE_URL` to the gateway in the user's Claude Code settings. Every Claude Code that reads those settings (the CLI, `claude -p`, the IDE extensions, the desktop app) then sends its model requests through the gateway, which tells sessions apart by the session id Claude Code sends with each request. `uninstall` undoes the three in the opposite order and puts back the base URL the settings had before.
 //!
-//! The `piifence-session` plugin, which the launcher loads with `--plugin-dir`, adds two hooks; they ship in a plugin, not in the override, because a managed policy can drop the hooks of settings files while it still loads plugins. `SessionStart` runs `piifence session-start`: it tells the agent what `$PIIF_SECRET_<N>` names are, sends the gateway Claude Code's conversation id so a resumed conversation gets its old names back, and adds a line to Claude Code's `CLAUDE_ENV_FILE`, which Claude Code sources before every Bash command. That line runs `piifence env`, which exports this session's values from the gateway, so a command that names `$PIIF_SECRET_1` gets the real value. `PreToolUse` runs `piifence restore` on every tool call: it puts the real values into the tool's input, so a file the agent writes or an MCP argument holds the value, not the name; a backslash before a name's `$` counts as part of the name. In Bash and Monitor commands it fills in only the names the shell would not expand (single quotes, quoted heredocs, an escaped `$`), escaped for where they stand; PowerShell is skipped.
+//! The `piifence-session` plugin adds two hooks; they ship in a plugin, not in the settings file, because a managed policy can drop the hooks of settings files while it still loads plugins. `SessionStart` runs `piifence session-start <port>`: it tells the agent what `$PIIF_SECRET_<N>` names are, binds Claude Code's session id on the gateway so a resumed conversation gets its old names back, and adds a line to Claude Code's `CLAUDE_ENV_FILE`, which Claude Code sources before every Bash command. That line runs `piifence env`, which exports this session's values from the gateway, so a command that names a variable gets the real value. `PreToolUse` runs `piifence restore <port>` on every tool call: it puts the real values into the tool's input, so a file the agent writes or an MCP argument holds the value, not the name; a backslash before a name's `$` counts as part of the name. In Bash and Monitor commands it fills in only the names the shell would not expand (single quotes, quoted heredocs, an escaped `$`), escaped for where they stand; PowerShell is skipped.
 //!
-//! Files: `$PIIF_DATA_DIR` (default `~/.local/share/piifence`, which `scripts/install.sh` sets) holds `model/` (the secret model) and `plugin/`, piifence's Claude Code plugins (`piifence-notice`, the notice, and `piifence-reveal`, which draws values in place of names on screen). The gateway binary sits next to this one. The hooks and the notice plugin reach the gateway on its control socket, `$PIIF_STATE_DIR/run/<port>.sock` (state dir `~/.local/state/piifence` by default), in a directory only the user can open; the gateway hands out no session data on TCP.
+//! Files: `$PIIF_DATA_DIR` (default `~/.local/share/piifence`, which `scripts/install.sh` sets) holds `model/` (the secret model) and `plugin/`, the sources of piifence's Claude Code plugins (`piifence-session`, the hooks; `piifence-notice`, the notice; and `piifence-reveal`, which draws values in place of names on screen). The gateway binary sits next to this one. The hooks and the notice plugin reach the gateway on its control socket, `$PIIF_STATE_DIR/run/<port>.sock` (state dir `~/.local/state/piifence` by default), in a directory only the user can open; the gateway hands out no session data on TCP.
 
 use std::env;
-use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use serde_json::{json, Value};
 
 const DEFAULT_PORT: u16 = 7788;
 const GATEWAY_START_TIMEOUT: Duration = Duration::from_secs(45);
-/// Seconds a gateway started by `piifence claude` keeps running after the last lease ends, unless `PIIF_EXIT_WHEN_UNUSED` is set.
-const DEFAULT_EXIT_WHEN_UNUSED: u64 = 10;
+/// The marketplace piifence's plugins are installed from.
+const MARKETPLACE: &str = "piifence";
+
+/// piifence's Claude Code plugins, in `plugin/` of the data dir.
+const PLUGINS: &[&str] = &["piifence-session", "piifence-notice", "piifence-reveal"];
+
+/// Where the gateway forwards when nothing else names a provider: where Claude Code itself sends requests by default.
+const DEFAULT_UPSTREAM: &str = "https://api.anthropic.com";
+
+/// Variables `install` passes on to the gateway agent when they are set, so a gateway installed for a test keeps its state, cache, config and logs where the test put them.
+const PASSED_TO_GATEWAY: &[&str] = &[
+    "PIIF_STATE_DIR",
+    "PIIF_CACHE_DIR",
+    "PIIF_CONFIG",
+    "PIIF_AUDIT_LOG",
+    "PIIF_AUDIT_BODY",
+];
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
-        Some("claude") => run_claude(&args[1..]),
-        // Run by Claude Code, not by people: the hook and the line it writes.
+        Some("install") => install(&args[1..]),
+        Some("uninstall") => uninstall(&args[1..]),
+        Some("status") => status(&args[1..]),
+        Some("reveal") => reveal(&args[1..]),
+        // Run by Claude Code, not by people: the hooks and the line the session-start hook writes.
         Some("session-start") => session_start(&args[1..]),
         Some("env") => print_env(&args[1..]),
         Some("restore") => restore(&args[1..]),
-        Some("nested-claude") => run_nested_claude(&args[1..]),
-        // For apps that run Claude Code themselves (docs/embedding.md).
-        Some("gateway") => run_gateway(&args[1..]),
-        Some("session") => new_session(&args[1..]),
-        Some("reveal") => reveal(&args[1..]),
         Some("-h") | Some("--help") | Some("help") | None => {
             usage();
             Ok(0)
@@ -63,18 +78,19 @@ fn main() {
 fn usage() {
     println!(
         "piifence — run Claude Code with local secret redaction\n\n\
-         Usage:\n  piifence claude [claude arguments...]\n\n\
-         Starts the redaction gateway if needed, points this Claude Code session at\n\
-         it, and streams responses back untouched. The gateway forwards redacted requests\n\
-         to PIIF_UPSTREAM, else the ANTHROPIC_BASE_URL set in your shell or Claude Code\n\
-         settings. No default provider is assumed; one of these must be set.\n\n\
-         For programs that embed Claude Code (docs/embedding.md):\n  \
-         piifence gateway [--upstream URL] [--pid PID]\n      \
-         Reuse or start the gateway; prints {{\"url\",\"port\",\"upstream\"}}.\n  \
-         piifence session [--session ID] [--qualify-foreign]\n      \
-         Prints {{\"session\",\"port\",\"settings\"}}: env and hooks for one session.\n  \
-         piifence reveal [--session ID | --conversation UUID] [--json]\n      \
-         Prints stdin with names replaced by their values, read only."
+         Usage:\n  \
+         piifence install [--upstream URL]\n      \
+         Run the gateway as a launchd agent, send every Claude Code through it\n      \
+         (env.ANTHROPIC_BASE_URL in ~/.claude/settings.json) and enable piifence's\n      \
+         plugins. The upstream is --upstream, else PIIF_UPSTREAM, else the one an\n      \
+         earlier install used, else the base URL your settings name, else\n      \
+         {DEFAULT_UPSTREAM}.\n  \
+         piifence uninstall\n      \
+         Undo install: the setting first, then the plugins, then the agent.\n  \
+         piifence status\n      \
+         Print {{\"installed\",\"routed\",\"running\",\"upstream\",\"url\",\"port\"}}.\n  \
+         piifence reveal --conversation UUID [--json]\n      \
+         Print stdin with the conversation's names replaced by their values."
     );
 }
 
@@ -119,213 +135,47 @@ fn port() -> Result<u16> {
     }
 }
 
-/// `PIIF_EXIT_WHEN_UNUSED`: the seconds a gateway this launcher starts keeps running without a lease (0: until stopped).
-fn exit_when_unused() -> Result<u64> {
-    match env::var("PIIF_EXIT_WHEN_UNUSED") {
-        Ok(raw) => raw.parse().with_context(|| {
-            format!("PIIF_EXIT_WHEN_UNUSED={raw:?} is not a whole number of seconds")
-        }),
-        Err(_) => Ok(DEFAULT_EXIT_WHEN_UNUSED),
-    }
-}
-
-fn run_claude(args: &[String]) -> Result<i32> {
-    if args
-        .iter()
-        .any(|a| a == "--settings" || a.starts_with("--settings="))
-    {
-        bail!("do not pass --settings to `piifence claude`; piifence supplies the gateway override itself");
-    }
-
-    let port = port()?;
-    let gateway_url = format!("http://127.0.0.1:{port}");
-    let data = data_dir()?;
-    let plugin = plugins(&data)?;
-    let upstream = resolve_upstream(&gateway_url)?.context(
-        "no upstream configured: set PIIF_UPSTREAM to your provider's base URL, or ANTHROPIC_BASE_URL in your shell or Claude settings",
-    )?;
-
-    let session_id = new_session_id().context("cannot create a session id")?;
-    ensure_gateway(
-        &data,
-        port,
-        &upstream,
-        &session_id,
-        std::process::id() as i32,
-    )?;
-    let claude = env::var_os("CLAUDE_BIN").unwrap_or_else(|| "claude".into());
-    run_session(
-        &gateway_url,
-        port,
-        &plugin,
-        args,
-        &session_id,
-        &custom_headers(&session_id)?,
-        false,
-        &claude,
-    )
-}
-
-/// The folder that holds piifence's Claude Code plugins, `plugin/` in `data`, after checking both are there. `--plugin-dir` loads each child of it.
+/// The folder that holds the sources of piifence's Claude Code plugins, `plugin/` in `data`, after checking each is there.
 fn plugins(data: &Path) -> Result<PathBuf> {
-    existing(data.join("plugin/piifence-notice"), "the notice plugin")?;
-    existing(data.join("plugin/piifence-reveal"), "the reveal plugin")?;
-    existing(data.join("plugin/piifence-session"), "the session plugin")?;
+    for name in PLUGINS {
+        existing(
+            data.join("plugin").join(name),
+            &format!("the {name} plugin"),
+        )?;
+    }
     Ok(data.join("plugin"))
 }
 
-/// Make sure a gateway that forwards to `upstream` runs on `port`, starting one if none answers, and lease it so it keeps running while this launcher does. A gateway that is shutting down is waited out and replaced. The launcher never stops a gateway: one it started exits by itself after the last lease ends.
-fn ensure_gateway(
-    data: &Path,
-    port: u16,
-    upstream: &str,
-    session_id: &str,
-    pid: i32,
-) -> Result<()> {
-    let gateway_url = format!("http://127.0.0.1:{port}");
-    let socket = control_socket(port)?;
-    for _ in 0..2 {
-        match running_gateway_upstream(port, &socket)? {
-            // Reuse only a gateway that forwards to the same place this launch would. Reusing another one would send this session's credentials elsewhere.
-            Some(running) if running == upstream => {
-                eprintln!("piifence: using existing gateway on {gateway_url} (upstream {upstream})");
-            }
-            Some(running) => bail!(
-                "a gateway on {gateway_url} forwards to {running:?}, but this launch wants {upstream}. Stop that gateway or set PIIF_PORT to a free port."
-            ),
-            None => start_gateway(data, port, &socket, upstream)?,
-        }
-        if lease(&socket, session_id, pid)? {
-            return Ok(());
-        }
-        wait_until_closed(port)?;
-    }
-    bail!("the gateway on {gateway_url} shut down twice while this launch tried to use it; refusing to launch Claude Code (fail closed)")
+fn gateway_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}")
 }
 
-/// Ask the gateway whose control socket is `socket` to keep running while this process runs session `session_id`. False when the gateway is shutting down (503) or no longer answers. Any other answer means the gateway predates leases.
-fn lease(socket: &Path, session_id: &str, pid: i32) -> Result<bool> {
-    let headers = format!("x-piifence-session: {session_id}\r\nx-piifence-launcher-pid: {pid}\r\n");
-    let Ok(response) = control_get(socket, "/control/lease", &headers, Duration::from_secs(5))
-    else {
-        return Ok(false);
+/// Whether `base`, a base URL, is the gateway at `url`.
+fn is_gateway(base: &str, url: &str) -> bool {
+    base.trim_end_matches('/') == url
+}
+
+/// The launchd label of the gateway agent on `port`.
+fn agent_label(port: u16) -> String {
+    if port == DEFAULT_PORT {
+        "com.piifence.gateway".to_string()
+    } else {
+        format!("com.piifence.gateway.{port}")
+    }
+}
+
+/// The agent's plist: in `$PIIF_LAUNCH_AGENTS_DIR`, default `~/Library/LaunchAgents`, where launchd loads it again at every login.
+fn agent_plist(port: u16) -> Result<PathBuf> {
+    let dir = match env::var("PIIF_LAUNCH_AGENTS_DIR") {
+        Ok(dir) => PathBuf::from(dir),
+        Err(_) => home()?.join("Library/LaunchAgents"),
     };
-    if response.starts_with("HTTP/1.1 200") {
-        return Ok(true);
-    }
-    if response.starts_with("HTTP/1.1 503") {
-        return Ok(false);
-    }
-    let status = response.lines().next().unwrap_or_default();
-    let socket = socket.display();
-    bail!(
-        "the gateway at {socket} cannot hold a lease ({status}); it is probably from an older piifence. Quit the sessions that use it, or stop it with `pkill -f piifence-gateway`, and run again."
-    )
+    Ok(dir.join(format!("{}.plist", agent_label(port))))
 }
 
-/// Wait until the gateway on `port`, which is shutting down, stops answering.
-fn wait_until_closed(port: u16) -> Result<()> {
-    let deadline = Instant::now() + GATEWAY_START_TIMEOUT;
-    while tcp_answers(port) {
-        if Instant::now() >= deadline {
-            bail!(
-                "the gateway on port {port} did not shut down in {} s",
-                GATEWAY_START_TIMEOUT.as_secs()
-            );
-        }
-        thread::sleep(Duration::from_millis(250));
-    }
-    Ok(())
-}
-
-/// Start a gateway that exits by itself once no launcher holds a lease, and wait until a gateway that forwards to `upstream` is healthy. Claude Code is never launched without one (fail closed).
-fn start_gateway(data: &Path, port: u16, socket: &Path, upstream: &str) -> Result<()> {
-    let exe = real_exe()?;
-    let gateway_bin = existing(exe.with_file_name("piifence-gateway"), "the gateway binary")?;
-    let model_dir = existing(data.join("model"), "the secret model")?;
-    let gateway_log = match env::var("PIIF_GATEWAY_LOG") {
-        Ok(path) => PathBuf::from(path),
-        Err(_) => env::temp_dir().join("piifence-gateway.log"),
-    };
-    let exit_when_unused = exit_when_unused()?;
-    let gateway_url = format!("http://127.0.0.1:{port}");
-    eprintln!("piifence: starting gateway on {gateway_url} (upstream {upstream})");
-    let log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&gateway_log)
-        .with_context(|| format!("cannot open the gateway log {}", gateway_log.display()))?;
-    // Its own process group, so closing this terminal does not stop a gateway that other sessions use.
-    let mut child = Command::new(&gateway_bin)
-        .env("PIIF_UPSTREAM", upstream)
-        .env("PIIF_MODEL_DIR", &model_dir)
-        .env("PIIF_PORT", port.to_string())
-        .env("PIIF_EXIT_WHEN_UNUSED", exit_when_unused.to_string())
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .with_context(|| format!("could not start the gateway {}", gateway_bin.display()))?;
-
-    if let Err(err) = wait_healthy(port, socket, upstream, &mut child) {
-        let _ = child.kill();
-        let _ = child.wait();
-        let lines = match fs::read_to_string(&gateway_log) {
-            Ok(text) => {
-                let lines: Vec<&str> = text.lines().collect();
-                lines[lines.len().saturating_sub(15)..].join("\n  ")
-            }
-            Err(read) => format!("cannot read it: {read}"),
-        };
-        bail!(
-            "{err}; refusing to launch Claude Code (fail closed). Last gateway log lines ({}):\n  {lines}",
-            gateway_log.display()
-        );
-    }
-    eprintln!("piifence: gateway ready (log: {})", gateway_log.display());
-    Ok(())
-}
-
-/// Run Claude Code against the gateway with the session's settings override and piifence's plugins. Returns Claude Code's exit code.
-#[allow(clippy::too_many_arguments)]
-fn run_session(
-    gateway_url: &str,
-    port: u16,
-    plugin: &Path,
-    args: &[String],
-    session_id: &str,
-    headers: &str,
-    nested: bool,
-    claude: &OsStr,
-) -> Result<i32> {
-    let socket = control_socket(port)?;
-    let settings_path = write_settings_override(gateway_url, session_id, headers)
-        .context("cannot write the session settings")?;
-    let status = Command::new(claude)
-        .arg("--settings")
-        .arg(&settings_path)
-        .arg("--plugin-dir")
-        .arg(plugin)
-        .args(args)
-        .env("PIIF_GATEWAY_SOCKET", &socket)
-        .envs(hook_env(port, session_id, nested)?)
-        .status();
-    let _ = fs::remove_file(&settings_path);
-    let status = status.with_context(|| format!("failed to run `{}`", claude.to_string_lossy()))?;
-    Ok(status.code().unwrap_or(1))
-}
-
-/// Upstream = the provider Claude Code is already configured for, so the gateway is a drop-in hop in front of the user's real endpoint. Order: PIIF_UPSTREAM, the shell's ANTHROPIC_BASE_URL, then the Claude settings file. None when nothing is set: no provider is assumed, so the launcher refuses to run. A value that already points at a gateway (ours, from an earlier run) is ignored.
-fn resolve_upstream(gateway_url: &str) -> Result<Option<String>> {
-    if let Ok(upstream) = env::var("PIIF_UPSTREAM") {
-        return Ok((!upstream.is_empty()).then_some(upstream));
-    }
-    let settings_base = user_settings_env("ANTHROPIC_BASE_URL")?;
-    Ok([env::var("ANTHROPIC_BASE_URL").ok(), settings_base]
-        .into_iter()
-        .flatten()
-        .find(|base| !base.is_empty() && !base.starts_with(gateway_url)))
+/// What `install` did, kept in the state dir so `uninstall` can undo it: the upstream, and the base URL the settings had before.
+fn install_record(port: u16) -> Result<PathBuf> {
+    Ok(piifence::control::state_dir()?.join(format!("install-{port}.json")))
 }
 
 fn claude_settings_path() -> Result<PathBuf> {
@@ -335,17 +185,573 @@ fn claude_settings_path() -> Result<PathBuf> {
     Ok(home()?.join(".claude/settings.json"))
 }
 
-/// `env.<name>` in the user's Claude Code settings. None when the file or the key is absent; a file that cannot be read or parsed is an error.
-fn user_settings_env(name: &str) -> Result<Option<String>> {
-    let path = claude_settings_path()?;
-    if !path.exists() {
-        return Ok(None);
+/// The JSON object in `path`; an empty object when the file is missing or empty. Anything but an object is an error.
+fn read_json(path: &Path) -> Result<Value> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(json!({})),
+        Err(err) => return Err(err).with_context(|| format!("cannot read {}", path.display())),
+    };
+    if text.trim().is_empty() {
+        return Ok(json!({}));
     }
-    let data =
-        fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
-    let json: serde_json::Value = serde_json::from_str(&data)
+    let value: Value = serde_json::from_str(&text)
         .with_context(|| format!("invalid JSON in {}", path.display()))?;
-    Ok(json["env"][name].as_str().map(str::to_string))
+    if !value.is_object() {
+        bail!("{} does not hold a JSON object", path.display());
+    }
+    Ok(value)
+}
+
+/// Write `value` to `path` as JSON, through a temporary file renamed over it, so Claude Code never reads half a settings file. An existing file keeps its permissions.
+fn write_json(path: &Path, value: &Value) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    }
+    let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    fs::write(&temp, format!("{}\n", serde_json::to_string_pretty(value)?))
+        .with_context(|| format!("cannot write {}", temp.display()))?;
+    if let Ok(meta) = fs::metadata(path) {
+        fs::set_permissions(&temp, meta.permissions())
+            .with_context(|| format!("cannot set the permissions of {}", temp.display()))?;
+    }
+    fs::rename(&temp, path).with_context(|| format!("cannot replace {}", path.display()))
+}
+
+/// `env.ANTHROPIC_BASE_URL` in Claude Code settings.
+fn settings_base_url(settings: &Value) -> Option<String> {
+    settings["env"]["ANTHROPIC_BASE_URL"]
+        .as_str()
+        .map(str::to_string)
+}
+
+/// `settings` with `env.ANTHROPIC_BASE_URL` set to `base`, or removed when `base` is None. An `env` left empty is removed.
+fn with_base_url(mut settings: Value, base: Option<&str>) -> Value {
+    let Some(object) = settings.as_object_mut() else {
+        return settings;
+    };
+    let env = object.entry("env").or_insert_with(|| json!({}));
+    if !env.is_object() {
+        *env = json!({});
+    }
+    let vars = env.as_object_mut().expect("an object");
+    match base {
+        Some(base) => {
+            vars.insert("ANTHROPIC_BASE_URL".to_string(), base.into());
+        }
+        None => {
+            vars.shift_remove("ANTHROPIC_BASE_URL");
+        }
+    }
+    if vars.is_empty() {
+        object.shift_remove("env");
+    }
+    settings
+}
+
+/// The settings keys `claude plugin` adds for piifence's plugins and leaves behind as `{}` when it removes them.
+const PLUGIN_SETTINGS: &[&str] = &["enabledPlugins", "extraKnownMarketplaces"];
+
+/// `settings` without those of `keys` that hold an empty object.
+fn without_empty(mut settings: Value, keys: &[&str]) -> Value {
+    if let Some(object) = settings.as_object_mut() {
+        for key in keys {
+            if object
+                .get(*key)
+                .is_some_and(|v| v.as_object().is_some_and(|o| o.is_empty()))
+            {
+                object.shift_remove(*key);
+            }
+        }
+    }
+    settings
+}
+
+/// The upstream for `install`: `flag` (`--upstream`), else `from_env` (`PIIF_UPSTREAM`), else `recorded` (what an earlier install used), else `settings_base` (the base URL the settings name now) unless that is this gateway, else `DEFAULT_UPSTREAM`.
+fn choose_upstream(
+    flag: Option<&str>,
+    from_env: Option<&str>,
+    recorded: Option<&str>,
+    settings_base: Option<&str>,
+    url: &str,
+) -> String {
+    [
+        flag,
+        from_env,
+        recorded,
+        settings_base.filter(|base| !is_gateway(base, url)),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|upstream| !upstream.is_empty())
+    .unwrap_or(DEFAULT_UPSTREAM)
+    .to_string()
+}
+
+/// The user's numeric id, for launchd's `gui/<uid>` domain.
+fn uid() -> Result<String> {
+    let out = Command::new("id")
+        .arg("-u")
+        .output()
+        .context("cannot run id -u")?;
+    let uid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || uid.is_empty() || !uid.bytes().all(|b| b.is_ascii_digit()) {
+        bail!("cannot read the user id from id -u");
+    }
+    Ok(uid)
+}
+
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// The launchd plist that runs `gateway` with the environment `vars` as `label`, started at login and again whenever it exits, logging to `log`.
+fn launchd_plist(label: &str, gateway: &Path, vars: &[(String, String)], log: &Path) -> String {
+    let vars: String = vars
+        .iter()
+        .map(|(name, value)| {
+            format!(
+                "    <key>{}</key><string>{}</string>\n",
+                xml_escape(name),
+                xml_escape(value)
+            )
+        })
+        .collect();
+    let label = xml_escape(label);
+    let gateway = xml_escape(&gateway.to_string_lossy());
+    let log = xml_escape(&log.to_string_lossy());
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{label}</string>
+  <key>ProgramArguments</key><array><string>{gateway}</string></array>
+  <key>EnvironmentVariables</key>
+  <dict>
+{vars}  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
+</dict>
+</plist>
+"#
+    )
+}
+
+fn launchctl(args: &[&str]) -> Result<std::process::Output> {
+    Command::new("launchctl")
+        .args(args)
+        .output()
+        .context("cannot run launchctl")
+}
+
+/// launchd's name for the gateway agent on `port`.
+fn agent_target(port: u16) -> Result<String> {
+    Ok(format!("gui/{}/{}", uid()?, agent_label(port)))
+}
+
+/// Whether launchd has the gateway agent on `port` loaded.
+fn agent_loaded(port: u16) -> Result<bool> {
+    Ok(launchctl(&["print", &agent_target(port)?])?
+        .status
+        .success())
+}
+
+/// Stop the gateway agent on `port` and unload it, when it is loaded, and wait until the port is free.
+fn stop_agent(port: u16) -> Result<()> {
+    if !agent_loaded(port)? {
+        return Ok(());
+    }
+    let out = launchctl(&["bootout", &agent_target(port)?])?;
+    if !out.status.success() && agent_loaded(port)? {
+        bail!(
+            "launchctl bootout {} failed: {}",
+            agent_target(port)?,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    wait_until_closed(port)
+}
+
+/// The last `n` lines of the file at `path`, joined for an error message.
+fn tail(path: &Path, n: usize) -> String {
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            let lines: Vec<&str> = text.lines().collect();
+            lines[lines.len().saturating_sub(n)..].join("\n  ")
+        }
+        Err(err) => format!("cannot read it: {err}"),
+    }
+}
+
+/// Run `gateway` as the launchd agent for `port`, replacing an agent piifence loaded before, and wait until it forwards to `upstream`. Fails, and unloads the agent again, when the gateway does not come up; fails before loading anything when another program holds the port.
+fn start_agent(
+    port: u16,
+    gateway: &Path,
+    vars: &[(String, String)],
+    log: &Path,
+    upstream: &str,
+) -> Result<()> {
+    stop_agent(port)?;
+    if tcp_answers(port) {
+        bail!(
+            "something else already answers on 127.0.0.1:{port}: a gateway that an older `piifence claude` started, or another program. Stop it, or set PIIF_PORT to a free port, and run `piifence install` again."
+        );
+    }
+    let plist = agent_plist(port)?;
+    if let Some(dir) = plist.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    }
+    if let Some(dir) = log.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    }
+    fs::write(
+        &plist,
+        launchd_plist(&agent_label(port), gateway, vars, log),
+    )
+    .with_context(|| format!("cannot write {}", plist.display()))?;
+    let domain = format!("gui/{}", uid()?);
+    let out = launchctl(&["bootstrap", &domain, &plist.to_string_lossy()])?;
+    if !out.status.success() {
+        bail!(
+            "launchctl bootstrap {domain} {} failed: {}",
+            plist.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    if let Err(err) = wait_for_gateway(port, upstream) {
+        let _ = launchctl(&["bootout", &agent_target(port)?]);
+        bail!(
+            "{err:#}; the agent was unloaded again. Last lines of its log ({}):\n  {}",
+            log.display(),
+            tail(log, 15)
+        );
+    }
+    Ok(())
+}
+
+/// Wait until a gateway that forwards to `upstream` answers on `port`. Loading the secret model takes a few seconds.
+fn wait_for_gateway(port: u16, upstream: &str) -> Result<()> {
+    let socket = control_socket(port)?;
+    let deadline = Instant::now() + GATEWAY_START_TIMEOUT;
+    while Instant::now() < deadline {
+        match running_gateway_upstream(port, &socket) {
+            Ok(Some(running)) if running == upstream => return Ok(()),
+            Ok(Some(running)) => {
+                bail!("the gateway on port {port} forwards to {running:?}, not {upstream}")
+            }
+            // Not up yet, or up on TCP and not yet on its control socket.
+            _ => thread::sleep(Duration::from_millis(250)),
+        }
+    }
+    bail!(
+        "no gateway answered on port {port} within {} s",
+        GATEWAY_START_TIMEOUT.as_secs()
+    )
+}
+
+/// Copy the directory `from` into `to`, files and subdirectories.
+fn copy_dir(from: &Path, to: &Path) -> Result<()> {
+    fs::create_dir_all(to).with_context(|| format!("cannot create {}", to.display()))?;
+    for entry in fs::read_dir(from).with_context(|| format!("cannot list {}", from.display()))? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            fs::copy(entry.path(), &target)
+                .with_context(|| format!("cannot copy {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// A plugin's `hooks.json` with its placeholders filled in: `@PIIFENCE@` becomes this binary's path and `@SOCKET@` the gateway's control socket, both quoted for a shell, and `@PORT@` the gateway's port.
+fn fill_hooks(text: &str, exe: &Path, socket: &Path, port: u16) -> Result<String> {
+    let mut hooks: Value = serde_json::from_str(text).context("hooks.json is not JSON")?;
+    let exe = shell_quote(&exe.to_string_lossy());
+    let socket = shell_quote(&socket.to_string_lossy());
+    let mut stack = vec![&mut hooks];
+    while let Some(value) = stack.pop() {
+        match value {
+            Value::String(s) => {
+                *s = s
+                    .replace("@PIIFENCE@", &exe)
+                    .replace("@SOCKET@", &socket)
+                    .replace("@PORT@", &port.to_string());
+            }
+            Value::Array(items) => stack.extend(items.iter_mut()),
+            Value::Object(map) => stack.extend(map.values_mut()),
+            _ => {}
+        }
+    }
+    Ok(format!("{}\n", serde_json::to_string_pretty(&hooks)?))
+}
+
+/// A mod's source with `@PIIFENCE_PATH@` (inside a single-quoted string) replaced by this binary's path and `@PORT@` by the gateway's port.
+fn fill_module(text: &str, exe: &Path, port: u16) -> String {
+    let path = exe
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'");
+    text.replace("@PIIFENCE_PATH@", &path)
+        .replace("@PORT@", &port.to_string())
+}
+
+/// Write the marketplace piifence's plugins are installed from, `marketplace/` in `state`: the plugins copied from `source` with their placeholders filled in (`fill_hooks`, `fill_module`), and a catalog that lists them. Returns its path.
+fn write_marketplace(state: &Path, source: &Path, exe: &Path, port: u16) -> Result<PathBuf> {
+    let dir = state.join("marketplace");
+    if dir.exists() {
+        fs::remove_dir_all(&dir).with_context(|| format!("cannot remove {}", dir.display()))?;
+    }
+    let socket = control_socket(port)?;
+    let mut listed = Vec::new();
+    for name in PLUGINS {
+        let target = dir.join("plugins").join(name);
+        copy_dir(&source.join(name), &target)?;
+        let hooks = target.join("hooks/hooks.json");
+        if hooks.exists() {
+            let filled = fill_hooks(&fs::read_to_string(&hooks)?, exe, &socket, port)?;
+            fs::write(&hooks, filled)?;
+        }
+        let module = target.join("hooks/register.ts");
+        if module.exists() {
+            let filled = fill_module(&fs::read_to_string(&module)?, exe, port);
+            fs::write(&module, filled)?;
+        }
+        let manifest = read_json(&target.join(".claude-plugin/plugin.json"))?;
+        listed.push(json!({
+            "name": name,
+            "source": format!("./plugins/{name}"),
+            "description": manifest["description"],
+            "version": manifest["version"],
+        }));
+    }
+    write_json(
+        &dir.join(".claude-plugin/marketplace.json"),
+        &json!({"name": MARKETPLACE, "owner": {"name": "piifence"}, "plugins": listed}),
+    )?;
+    Ok(dir)
+}
+
+/// Run `claude plugin <args>` with the `claude` in `$CLAUDE_BIN`, else the one on PATH.
+fn claude_plugin(args: &[&str]) -> Result<()> {
+    let claude = env::var_os("CLAUDE_BIN").unwrap_or_else(|| "claude".into());
+    let out = Command::new(&claude)
+        .arg("plugin")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("cannot run `{} plugin`", claude.to_string_lossy()))?;
+    if !out.status.success() {
+        let said = format!(
+            "{} {}",
+            String::from_utf8_lossy(&out.stdout).trim(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        bail!("`claude plugin {}` failed: {}", args.join(" "), said.trim());
+    }
+    Ok(())
+}
+
+/// Uninstall piifence's plugins and remove its marketplace. Returns what failed, which is expected for what was not installed.
+fn remove_plugins() -> Vec<String> {
+    let mut failed = Vec::new();
+    for name in PLUGINS {
+        let id = format!("{name}@{MARKETPLACE}");
+        if let Err(err) = claude_plugin(&["uninstall", &id, "--scope", "user"]) {
+            failed.push(format!("{err:#}"));
+        }
+    }
+    if let Err(err) = claude_plugin(&["marketplace", "remove", MARKETPLACE]) {
+        failed.push(format!("{err:#}"));
+    }
+    failed
+}
+
+/// Install piifence's plugins at user scope from the marketplace at `dir`, replacing any earlier install, so Claude Code picks up the files just written.
+fn install_plugins(dir: &Path) -> Result<()> {
+    remove_plugins();
+    claude_plugin(&["marketplace", "add", &dir.to_string_lossy()])?;
+    for name in PLUGINS {
+        claude_plugin(&[
+            "install",
+            &format!("{name}@{MARKETPLACE}"),
+            "--scope",
+            "user",
+        ])?;
+    }
+    Ok(())
+}
+
+/// Remove `bin/claude` from the state dir when it is the shim an older piifence installed, which runs a command this piifence no longer has.
+fn remove_old_shim(state: &Path) -> Result<()> {
+    let shim = state.join("bin/claude");
+    if fs::read_to_string(&shim).is_ok_and(|text| text.contains(" nested-claude ")) {
+        fs::remove_file(&shim).with_context(|| format!("cannot remove {}", shim.display()))?;
+        eprintln!("piifence: removed the old claude shim {}", shim.display());
+    }
+    Ok(())
+}
+
+/// `piifence install [--upstream <url>]`: run the gateway as a launchd agent, install piifence's plugins, then point Claude Code's user settings at the gateway, in that order, so the settings never name a gateway that is not running. Running it again replaces all three.
+fn install(args: &[String]) -> Result<i32> {
+    let opts = options(args, &["--upstream"], &[])?;
+    let port = port()?;
+    let url = gateway_url(port);
+    let data = data_dir()?;
+    let exe = real_exe()?;
+    let gateway = existing(exe.with_file_name("piifence-gateway"), "the gateway binary")?;
+    let model = existing(data.join("model"), "the secret model")?;
+    let source = plugins(&data)?;
+    let state = piifence::control::state_dir()?;
+    let settings_path = claude_settings_path()?;
+    let record_path = install_record(port)?;
+    let record = read_json(&record_path)?;
+    let current = settings_base_url(&read_json(&settings_path)?);
+    let previous = if record.get("port").is_some() {
+        record["previous_base_url"].as_str().map(str::to_string)
+    } else {
+        current.clone().filter(|base| !is_gateway(base, &url))
+    };
+    let upstream = choose_upstream(
+        opts.get("--upstream").map(String::as_str),
+        env::var("PIIF_UPSTREAM").ok().as_deref(),
+        record["upstream"].as_str(),
+        current.as_deref(),
+        &url,
+    );
+    if is_gateway(&upstream, &url) {
+        bail!("the upstream cannot be the gateway itself ({url})");
+    }
+    write_json(
+        &record_path,
+        &json!({"port": port, "upstream": upstream, "previous_base_url": previous}),
+    )?;
+
+    let log = state.join(format!("gateway-{port}.log"));
+    let mut vars = vec![
+        ("PIIF_UPSTREAM".to_string(), upstream.clone()),
+        (
+            "PIIF_MODEL_DIR".to_string(),
+            model.to_string_lossy().into_owned(),
+        ),
+        ("PIIF_PORT".to_string(), port.to_string()),
+        // The gateway runs gitleaks, so it needs the PATH this install sees, not launchd's bare one.
+        ("PATH".to_string(), env::var("PATH").unwrap_or_default()),
+    ];
+    for name in PASSED_TO_GATEWAY {
+        if let Ok(value) = env::var(name) {
+            vars.push((name.to_string(), value));
+        }
+    }
+    start_agent(port, &gateway, &vars, &log, &upstream)?;
+    eprintln!(
+        "piifence: the launchd agent {} runs the gateway on {url} (upstream {upstream}, log {})",
+        agent_label(port),
+        log.display()
+    );
+
+    let market = write_marketplace(&state, &source, &exe, port)?;
+    install_plugins(&market)?;
+    eprintln!(
+        "piifence: installed the plugins {} at user scope",
+        PLUGINS.join(", ")
+    );
+
+    let settings = with_base_url(read_json(&settings_path)?, Some(&url));
+    write_json(&settings_path, &settings)?;
+    eprintln!(
+        "piifence: {} now sends Claude Code to {url}",
+        settings_path.display()
+    );
+    remove_old_shim(&state)?;
+    status(&[])
+}
+
+/// `piifence uninstall`: undo `install` in the opposite order. The settings go first, so no Claude Code starts against a gateway that is about to stop; the base URL they had before install comes back. Settings that no longer name the gateway are left alone.
+fn uninstall(args: &[String]) -> Result<i32> {
+    options(args, &[], &[])?;
+    let port = port()?;
+    let url = gateway_url(port);
+    let settings_path = claude_settings_path()?;
+    let record_path = install_record(port)?;
+    let record = read_json(&record_path)?;
+    let settings = read_json(&settings_path)?;
+    if settings_base_url(&settings).is_some_and(|base| is_gateway(&base, &url)) {
+        let previous = record["previous_base_url"].as_str();
+        write_json(&settings_path, &with_base_url(settings, previous))?;
+        match previous {
+            Some(base) => eprintln!(
+                "piifence: {} sends Claude Code to {base} again",
+                settings_path.display()
+            ),
+            None => eprintln!(
+                "piifence: removed ANTHROPIC_BASE_URL from {}",
+                settings_path.display()
+            ),
+        }
+    } else {
+        eprintln!(
+            "piifence: {} does not send Claude Code to {url}; left it alone",
+            settings_path.display()
+        );
+    }
+    for failed in remove_plugins() {
+        eprintln!("piifence: note: {failed}");
+    }
+    let settings = read_json(&settings_path)?;
+    let tidied = without_empty(settings.clone(), PLUGIN_SETTINGS);
+    if tidied != settings {
+        write_json(&settings_path, &tidied)?;
+    }
+    stop_agent(port)?;
+    let plist = agent_plist(port)?;
+    if plist.exists() {
+        fs::remove_file(&plist).with_context(|| format!("cannot remove {}", plist.display()))?;
+    }
+    let market = piifence::control::state_dir()?.join("marketplace");
+    if market.exists() {
+        fs::remove_dir_all(&market)
+            .with_context(|| format!("cannot remove {}", market.display()))?;
+    }
+    if record_path.exists() {
+        fs::remove_file(&record_path)
+            .with_context(|| format!("cannot remove {}", record_path.display()))?;
+    }
+    eprintln!("piifence: uninstalled; the stored names in the state dir are kept");
+    Ok(0)
+}
+
+/// `piifence status`: whether piifence is installed, whether Claude Code's settings send it to the gateway, and whether the gateway runs, as JSON.
+fn status(args: &[String]) -> Result<i32> {
+    options(args, &[], &[])?;
+    let port = port()?;
+    let url = gateway_url(port);
+    let routed = settings_base_url(&read_json(&claude_settings_path()?)?)
+        .is_some_and(|base| is_gateway(&base, &url));
+    let upstream = running_gateway_upstream(port, &control_socket(port)?)
+        .ok()
+        .flatten();
+    println!(
+        "{}",
+        json!({
+            "installed": install_record(port)?.exists(),
+            "routed": routed,
+            "running": upstream.is_some(),
+            "upstream": upstream,
+            "url": url,
+            "port": port,
+        })
+    );
+    Ok(0)
 }
 
 /// Raw HTTP response to `GET path` on the loopback port, with `headers` (`Name: value` lines).
@@ -435,97 +841,19 @@ fn running_gateway_upstream(port: u16, socket: &Path) -> Result<Option<String>> 
     Ok(Some(upstream))
 }
 
-/// Wait until a gateway that forwards to `upstream` answers on `port`. Another launcher may start a gateway at the same moment, and only one of the two gets the port; the other one's gateway is used when it forwards to the same upstream.
-fn wait_healthy(port: u16, socket: &Path, upstream: &str, child: &mut Child) -> Result<()> {
+/// Wait until the gateway on `port`, which is shutting down, stops answering.
+fn wait_until_closed(port: u16) -> Result<()> {
     let deadline = Instant::now() + GATEWAY_START_TIMEOUT;
-    while Instant::now() < deadline {
-        let exited = child.try_wait()?;
-        match running_gateway_upstream(port, socket)? {
-            Some(running) if running == upstream => return Ok(()),
-            Some(running) => bail!(
-                "a gateway that forwards to {running:?} took port {port} first, but this launch wants {upstream}. Set PIIF_PORT to a free port."
-            ),
-            None => {}
-        }
-        if let Some(status) = exited {
-            bail!("the gateway exited during startup ({status})");
+    while tcp_answers(port) {
+        if Instant::now() >= deadline {
+            bail!(
+                "the gateway on port {port} did not shut down in {} s",
+                GATEWAY_START_TIMEOUT.as_secs()
+            );
         }
         thread::sleep(Duration::from_millis(250));
     }
-    bail!(
-        "the gateway did not become healthy in {} s",
-        GATEWAY_START_TIMEOUT.as_secs()
-    )
-}
-
-/// A random 32-hex-digit id for this Claude Code session. The gateway keys the session's `$PIIF_…` values on it, and hands values only to a caller that knows it, so it comes from the OS random source.
-fn new_session_id() -> std::io::Result<String> {
-    let mut bytes = [0u8; 16];
-    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// `ANTHROPIC_CUSTOM_HEADERS` for the session: the user's own (shell, else Claude Code settings, the order Claude Code uses) plus the session id header. The override replaces the user's value, so theirs is carried over.
-fn custom_headers(session_id: &str) -> Result<String> {
-    let existing = match env::var("ANTHROPIC_CUSTOM_HEADERS") {
-        Ok(headers) => Some(headers),
-        Err(_) => user_settings_env("ANTHROPIC_CUSTOM_HEADERS")?,
-    };
-    Ok(with_session_header(existing.as_deref(), session_id))
-}
-
-/// `existing` headers without any piifence header, which a shell inside another piifence session carries, plus this session's id header.
-fn with_session_header(existing: Option<&str>, session_id: &str) -> String {
-    let mut lines: Vec<&str> = existing
-        .unwrap_or("")
-        .lines()
-        .filter(|line| {
-            let name = line.split_once(':').map_or(*line, |(name, _)| name);
-            !line.trim().is_empty() && !name.trim().to_ascii_lowercase().starts_with("x-piifence-")
-        })
-        .collect();
-    let ours = format!("x-piifence-session: {session_id}");
-    lines.push(&ours);
-    lines.join("\n")
-}
-
-/// The environment the `piifence-session` plugin's hooks read: `PIIF_BIN`, this binary's path, runs `session-start "$PIIF_SESSION" "$PIIF_SESSION_PORT" $PIIF_SESSION_NESTED` and `restore "$PIIF_SESSION" "$PIIF_SESSION_PORT"`. The hooks ship in a plugin rather than in the `--settings` override because a managed policy can drop the hooks of settings files while it still loads plugins. `PIIF_SESSION_NESTED` is set even when empty, so a `claude` started inside a session never keeps its parent's value.
-fn hook_env(port: u16, session_id: &str, nested: bool) -> Result<[(&'static str, String); 4]> {
-    Ok([
-        ("PIIF_BIN", real_exe()?.to_string_lossy().into_owned()),
-        ("PIIF_SESSION", session_id.to_string()),
-        ("PIIF_SESSION_PORT", port.to_string()),
-        (
-            "PIIF_SESSION_NESTED",
-            if nested { "nested" } else { "" }.to_string(),
-        ),
-    ])
-}
-
-/// Write the per-process settings override, with `headers` as `ANTHROPIC_CUSTOM_HEADERS`. The name holds the session id and a random id, and the file is created with `create_new`, so a file or symlink planted at a guessable /tmp path cannot make this write land somewhere else, and two processes on one session do not collide. Mode 0600 is set at creation.
-fn write_settings_override(gateway_url: &str, session_id: &str, headers: &str) -> Result<PathBuf> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let nonce = new_session_id().context("cannot create a settings file name")?;
-    let path = env::temp_dir().join(format!(
-        "piifence-claude-settings-{session_id}-{nonce}.json"
-    ));
-    let content = format!(
-        "{}\n",
-        serde_json::json!({
-            "env": {
-                "ANTHROPIC_BASE_URL": gateway_url,
-                "ANTHROPIC_CUSTOM_HEADERS": headers,
-            },
-        })
-    );
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-        .and_then(|mut file| file.write_all(content.as_bytes()))
-        .with_context(|| format!("cannot write {}", path.display()))?;
-    Ok(path)
+    Ok(())
 }
 
 /// What `$PIIF_SECRET_<N>` names are, given to the agent when the session starts (and again after `/clear` or a compaction, which start it again). Without it the agent meets a name in tool output with no idea what it is: it warns that a secret leaked, or decides the variable holds its own name, and does not know it can use it.
@@ -540,39 +868,67 @@ This session runs through piifence, which keeps secrets (API keys, tokens, passw
 - Files, environment variables and command output on the user's machine hold the real value; only what is sent to you shows the name. A value you see as a `$PIIF_…` name was not exposed to you or the provider: do not warn that it leaked or suggest rotating it on that account.
 - When a command prints a value, you see its name again: `echo $PIIF_SECRET_1` shows you `$PIIF_SECRET_1` although the variable holds the real value. Do not conclude from that that the variable is wrong or holds its own name, and do not try to print, decode or otherwise reveal the values.";
 
-/// `<session> <port>` from a hook's or `env`'s arguments.
-fn session_args(args: &[String]) -> Result<(&str, u16)> {
+/// A Claude Code session id, the UUID Claude Code sends with each request and gives each hook, in lower case.
+fn session_uuid(id: &str) -> Result<String> {
+    if !piifence::names::is_conversation_id(id) {
+        bail!("{id:?} is not a Claude Code session id");
+    }
+    Ok(id.to_ascii_lowercase())
+}
+
+fn port_arg(port: &str) -> Result<u16> {
+    port.parse()
+        .with_context(|| format!("{port:?} is not a port"))
+}
+
+/// `<session> <port>` from `env`'s arguments.
+fn session_args(args: &[String]) -> Result<(String, u16)> {
     let [session, port] = args else {
         bail!("expected <session> <port>");
     };
-    if session.len() != 32 || !session.bytes().all(|b| b.is_ascii_hexdigit()) {
-        bail!("the session id is not 32 hex digits");
-    }
-    let port = port
-        .parse()
-        .with_context(|| format!("{port:?} is not a port"))?;
-    Ok((session.as_str(), port))
+    Ok((session_uuid(session)?, port_arg(port)?))
 }
 
-/// `piifence session-start <session> <port> [nested]`, the `SessionStart` hook. Installs the `claude` shim, adds the line that runs `piifence env` to `CLAUDE_ENV_FILE` (once per file), binds the session to Claude Code's conversation id (see `bind_conversation`), and answers with VARIABLES_NOTE as context for the agent. A nested session, the hook of a `claude` started inside a piifence session, does not bind, so it does not take over its parent's conversation. A failure exits non-zero, so Claude Code shows it.
-fn session_start(args: &[String]) -> Result<i32> {
+/// A hook's `<port>` argument and its JSON input on stdin.
+fn hook_input(args: &[String]) -> Result<(u16, Value)> {
+    let [port] = args else {
+        bail!("expected <port>");
+    };
+    let port = port_arg(port)?;
     let mut input = String::new();
     std::io::stdin()
         .read_to_string(&mut input)
         .context("read the hook input")?;
-    let (args, qualify) = split_flag(args, "qualify");
-    let (args, nested) = split_nested(args);
-    let (session, port) = session_args(args)?;
-    let hook: serde_json::Value =
-        serde_json::from_str(&input).context("the hook input is not JSON")?;
-    let conversation = hook["session_id"]
-        .as_str()
-        .context("the hook input has no session_id")?;
-    let exe = real_exe()?;
-    install_shim(&shim_dir()?, &exe).context("cannot install the claude shim")?;
+    let hook: Value = serde_json::from_str(&input).context("the hook input is not JSON")?;
+    Ok((port, hook))
+}
+
+/// The session id in a hook's input.
+fn hook_session(hook: &Value) -> Result<String> {
+    session_uuid(
+        hook["session_id"]
+            .as_str()
+            .context("the hook input has no session_id")?,
+    )
+}
+
+/// Whether this Claude Code asks the gateway to qualify names from other conversations, which an embedding app does by adding `x-piifence-qualify-foreign` to `ANTHROPIC_CUSTOM_HEADERS`.
+fn qualifies_foreign() -> bool {
+    env::var("ANTHROPIC_CUSTOM_HEADERS").is_ok_and(|headers| {
+        headers
+            .to_ascii_lowercase()
+            .contains("x-piifence-qualify-foreign")
+    })
+}
+
+/// `piifence session-start <port>`, the `SessionStart` hook. Binds the session on the gateway (see `bind_session`), adds the line that runs `piifence env` to `CLAUDE_ENV_FILE`, and answers with VARIABLES_NOTE as context for the agent. A failure exits non-zero, so Claude Code shows it.
+fn session_start(args: &[String]) -> Result<i32> {
+    let (port, hook) = hook_input(args)?;
+    let session = hook_session(&hook)?;
+    bind_session(&session, port)?;
     let line = format!(
         "eval \"$({} env {session} {port})\"\n",
-        shell_quote(&exe.to_string_lossy())
+        shell_quote(&real_exe()?.to_string_lossy())
     );
     let path = env::var("CLAUDE_ENV_FILE")
         .context("CLAUDE_ENV_FILE is not set, so Bash commands cannot get $PIIF_* values")?;
@@ -585,17 +941,14 @@ fn session_start(args: &[String]) -> Result<i32> {
     if updated != existing {
         fs::write(&path, updated).with_context(|| format!("cannot write {path}"))?;
     }
-    if !nested {
-        bind_conversation(session, port, conversation)?;
-    }
-    let note = if qualify {
+    let note = if qualifies_foreign() {
         format!("{VARIABLES_NOTE}\n{QUALIFIED_NOTE}")
     } else {
         VARIABLES_NOTE.to_string()
     };
     println!(
         "{}",
-        serde_json::json!({
+        json!({
             "hookSpecificOutput": {
                 "hookEventName": "SessionStart",
                 "additionalContext": note,
@@ -605,20 +958,12 @@ fn session_start(args: &[String]) -> Result<i32> {
     Ok(0)
 }
 
-/// Added to VARIABLES_NOTE for a session started with `piifence session --qualify-foreign`.
+/// Added to VARIABLES_NOTE for a session whose Claude Code sends `x-piifence-qualify-foreign`.
 const QUALIFIED_NOTE: &str = "- Text from another conversation's transcript shows its names as `[[piif:<8 hex>:<n>]]`. Each stands for a value from that other conversation, kept on this machine. Write it exactly as it appears when you mention it, and never put it in a command or a tool argument: nothing fills it in there.";
-
-/// `args` without a trailing `flag`, and whether it was there.
-fn split_flag<'a>(args: &'a [String], flag: &str) -> (&'a [String], bool) {
-    match args {
-        [rest @ .., last] if last == flag => (rest, true),
-        _ => (args, false),
-    }
-}
 
 /// `existing` env file content with every earlier `piifence env` line dropped and `line` added. A resumed conversation keeps its env file, so without this it would also run the lines of its earlier sessions, some through a binary an upgrade has removed.
 fn env_file_with(existing: &str, line: &str) -> String {
-    let ours = regex::Regex::new(r#"^eval "\$\('[^']*' env [0-9a-f]{32} [0-9]+\)"$"#)
+    let ours = regex::Regex::new(r#"^eval "\$\('[^']*' env [0-9a-f-]{32,36} [0-9]+\)"$"#)
         .expect("valid pattern");
     let mut kept: String = existing
         .lines()
@@ -629,18 +974,18 @@ fn env_file_with(existing: &str, line: &str) -> String {
     kept
 }
 
-/// Tell the gateway which Claude Code conversation this session is, so it loads the names a resumed conversation already uses and stores new ones (encrypted, with a key kept in the Keychain).
-fn bind_conversation(session: &str, port: u16, conversation: &str) -> Result<()> {
+/// Tell the gateway that `session` has started, so it loads the names a resumed conversation already uses and stores new ones (encrypted, with a key kept in the Keychain).
+fn bind_session(session: &str, port: u16) -> Result<()> {
     let socket = control_socket(port)?;
     let response = control_get(
         &socket,
-        "/control/conversation",
-        &format!("x-piifence-session: {session}\r\nx-piifence-conversation: {conversation}\r\n"),
+        "/control/bind",
+        &format!("x-piifence-session: {session}\r\n"),
         Duration::from_secs(30),
     )
     .with_context(|| {
         format!(
-            "the gateway's control socket {} did not answer",
+            "the gateway's control socket {} did not answer; is piifence installed (`piifence status`)?",
             socket.display()
         )
     })?;
@@ -651,141 +996,11 @@ fn bind_conversation(session: &str, port: u16, conversation: &str) -> Result<()>
     Ok(())
 }
 
-/// `piifence env <session> <port>`: a line that puts the `claude` shim first on `PATH`, then this session's values from the gateway as `export NAME='value'` lines, for the `eval` Claude Code runs before every Bash command. A gateway that does not answer is an error on stderr; the command then runs without the values.
+/// `piifence env <session> <port>`: this session's values from the gateway as `export NAME='value'` lines, for the `eval` Claude Code runs before every Bash command. A gateway that does not answer is an error on stderr; the command then runs without the values.
 fn print_env(args: &[String]) -> Result<i32> {
     let (session, port) = session_args(args)?;
-    print!("{}", path_line(&shim_dir()?));
-    print!("{}", export_lines(&session_values(session, port)?));
+    print!("{}", export_lines(&session_values(&session, port)?));
     Ok(0)
-}
-
-/// A shell line that puts `dir` first on `PATH` unless it is already there, so running it twice adds it once. `piifence env` prints it, so a `claude` that a command starts by name is the shim.
-fn path_line(dir: &Path) -> String {
-    let dir = shell_quote(&dir.to_string_lossy());
-    format!("case \":$PATH:\" in *:{dir}:*) ;; *) PATH={dir}:\"$PATH\"; export PATH ;; esac\n")
-}
-
-/// Where `piifence session-start` puts the `claude` shim: `bin` in piifence's state directory.
-fn shim_dir() -> Result<PathBuf> {
-    Ok(piifence::control::state_dir()?.join("bin"))
-}
-
-/// The `claude` shim, which runs `piifence nested-claude` through `exe`.
-fn shim_script(exe: &Path) -> String {
-    format!(
-        "#!/bin/sh\nexec {} nested-claude \"$@\"\n",
-        shell_quote(&exe.to_string_lossy())
-    )
-}
-
-/// Make `dir/claude` the shim for `exe`, leaving it alone when it already is. The shim is written under a temporary name and renamed, so several sessions starting at once never see a half-written file.
-fn install_shim(dir: &Path, exe: &Path) -> Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .with_context(|| format!("cannot create {}", dir.display()))?;
-    let script = shim_script(exe);
-    let target = dir.join("claude");
-    if fs::read_to_string(&target).is_ok_and(|current| current == script) {
-        return Ok(());
-    }
-    let temp = dir.join(format!("claude.{}.tmp", std::process::id()));
-    fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o755)
-        .open(&temp)
-        .and_then(|mut file| file.write_all(script.as_bytes()))
-        .with_context(|| format!("cannot write {}", temp.display()))?;
-    fs::rename(&temp, &target).with_context(|| format!("cannot replace {}", target.display()))?;
-    Ok(())
-}
-
-/// `args` without a trailing `nested`, and whether it was there. The hook of a `claude` started inside a piifence session passes it, so that session does not take over the parent's conversation binding.
-fn split_nested(args: &[String]) -> (&[String], bool) {
-    match args {
-        [rest @ .., last] if last == "nested" => (rest, true),
-        _ => (args, false),
-    }
-}
-
-/// The session id and port of the piifence session named by `ANTHROPIC_CUSTOM_HEADERS` (`headers`) and `ANTHROPIC_BASE_URL` (`base_url`), or None when they do not name one.
-fn nested_session(headers: Option<&str>, base_url: Option<&str>) -> Option<(String, u16)> {
-    let session = headers?.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.trim()
-            .eq_ignore_ascii_case("x-piifence-session")
-            .then(|| value.trim())
-    })?;
-    if session.len() != 32 || !session.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let base_url = base_url?;
-    let base_url = base_url.strip_suffix('/').unwrap_or(base_url);
-    let port = base_url.strip_prefix("http://127.0.0.1:")?.parse().ok()?;
-    Some((session.to_string(), port))
-}
-
-/// The first executable `claude` on `path` (a `PATH` value) that is not in `shim_dir`, comparing directories by their real paths.
-fn find_claude(path: &OsStr, shim_dir: &Path) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    let shim_dir = fs::canonicalize(shim_dir).ok();
-    let shim = shim_dir.as_ref().map(|dir| dir.join("claude"));
-    env::split_paths(path).find_map(|dir| {
-        if shim_dir.is_some() && fs::canonicalize(&dir).ok() == shim_dir {
-            return None;
-        }
-        let candidate = dir.join("claude");
-        let real = fs::canonicalize(&candidate).ok()?;
-        if Some(&real) == shim.as_ref() {
-            return None;
-        }
-        let meta = fs::metadata(&candidate).ok()?;
-        (meta.is_file() && meta.permissions().mode() & 0o111 != 0).then_some(candidate)
-    })
-}
-
-/// `piifence nested-claude [claude arguments...]`, what the `claude` shim runs. Inside a piifence session it runs the real `claude` on that session with the same hooks (see `hook_env`), and refuses when it cannot (no gateway, or the arguments hold `--settings`). Outside one it runs the real `claude` unchanged. It starts no gateway and takes no lease.
-fn run_nested_claude(args: &[String]) -> Result<i32> {
-    let claude = match env::var_os("CLAUDE_BIN") {
-        Some(bin) => PathBuf::from(bin),
-        None => find_claude(&env::var_os("PATH").unwrap_or_default(), &shim_dir()?)
-            .context("cannot find the real `claude` on PATH")?,
-    };
-    let headers = env::var("ANTHROPIC_CUSTOM_HEADERS").ok();
-    let Some((session, port)) = nested_session(
-        headers.as_deref(),
-        env::var("ANTHROPIC_BASE_URL").ok().as_deref(),
-    ) else {
-        let status = Command::new(&claude)
-            .args(args)
-            .status()
-            .with_context(|| format!("failed to run `{}`", claude.display()))?;
-        return Ok(status.code().unwrap_or(1));
-    };
-    if args
-        .iter()
-        .any(|a| a == "--settings" || a.starts_with("--settings="))
-    {
-        bail!("piifence cannot add its hooks to a claude that is given --settings inside a piifence session; drop --settings");
-    }
-    session_values(&session, port).context(
-        "the piifence gateway for this session does not answer, so a claude started here would run without piifence's hooks",
-    )?;
-    let plugin = plugins(&data_dir()?)?;
-    run_session(
-        &format!("http://127.0.0.1:{port}"),
-        port,
-        &plugin,
-        args,
-        &session,
-        headers.as_deref().unwrap_or_default(),
-        true,
-        claude.as_os_str(),
-    )
 }
 
 /// Options from `args`: `--name value` or `--name=value` for the names in `with_value`, and bare `--name` for those in `flags`. Anything else is an error.
@@ -819,80 +1034,6 @@ fn options(
     Ok(found)
 }
 
-/// A session id given on the command line: 32 hex digits.
-fn session_option(id: &str) -> Result<String> {
-    if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
-        bail!("--session must be 32 hex digits");
-    }
-    Ok(id.to_ascii_lowercase())
-}
-
-/// `piifence gateway [--upstream <url>] [--pid <pid>]`: make sure a gateway runs, starting one detached when none answers, and print `{"url", "port", "upstream"}`. The gateway is leased for process `--pid`, by default the caller (this command's parent), so it keeps running while that process lives. A gateway on the port that forwards elsewhere is an error, as for `piifence claude`.
-fn run_gateway(args: &[String]) -> Result<i32> {
-    let opts = options(args, &["--upstream", "--pid"], &[])?;
-    let port = port()?;
-    let url = format!("http://127.0.0.1:{port}");
-    let upstream = match opts.get("--upstream") {
-        Some(upstream) if !upstream.is_empty() => upstream.clone(),
-        _ => resolve_upstream(&url)?.context(
-            "no upstream configured: pass --upstream, or set PIIF_UPSTREAM or ANTHROPIC_BASE_URL in your shell or Claude settings",
-        )?,
-    };
-    let pid = match opts.get("--pid") {
-        Some(pid) => pid
-            .parse::<i32>()
-            .ok()
-            .filter(|p| *p > 0)
-            .context("--pid must be a process id")?,
-        None => std::os::unix::process::parent_id() as i32,
-    };
-    let lease_id = new_session_id().context("cannot create a lease id")?;
-    ensure_gateway(&data_dir()?, port, &upstream, &lease_id, pid)?;
-    println!(
-        "{}",
-        serde_json::json!({"url": url, "port": port, "upstream": upstream})
-    );
-    Ok(0)
-}
-
-/// `piifence session [--session <id>] [--qualify-foreign]`: a session for an app that runs Claude Code itself. Prints `{"session", "port", "settings"}`, where `settings` is a Claude Code settings object: the gateway URL, the user's own `ANTHROPIC_CUSTOM_HEADERS` plus the session header, and the `SessionStart` and `PreToolUse` hooks that `piifence claude` gets from the `piifence-session` plugin. `--qualify-foreign` also sends `x-piifence-qualify-foreign`, so the gateway writes other conversations' names as `[[piif:<8 hex>:<n>]]`, and adds a line about them to the session-start note. Start the gateway first with `piifence gateway`.
-fn new_session(args: &[String]) -> Result<i32> {
-    let opts = options(args, &["--session"], &["--qualify-foreign"])?;
-    let port = port()?;
-    let session = match opts.get("--session") {
-        Some(id) => session_option(id)?,
-        None => new_session_id().context("cannot create a session id")?,
-    };
-    let qualify = opts.contains_key("--qualify-foreign");
-    let mut headers = custom_headers(&session)?;
-    if qualify {
-        headers.push_str("\nx-piifence-qualify-foreign: 1");
-    }
-    let exe = shell_quote(&real_exe()?.to_string_lossy());
-    let tail = if qualify { " qualify" } else { "" };
-    let settings = serde_json::json!({
-        "env": {
-            "ANTHROPIC_BASE_URL": format!("http://127.0.0.1:{port}"),
-            "ANTHROPIC_CUSTOM_HEADERS": headers,
-        },
-        "hooks": {
-            "SessionStart": [{"hooks": [{
-                "type": "command",
-                "command": format!("{exe} session-start {session} {port}{tail}"),
-            }]}],
-            "PreToolUse": [{"matcher": "*", "hooks": [{
-                "type": "command",
-                "command": format!("{exe} restore {session} {port}"),
-            }]}],
-        },
-    });
-    println!(
-        "{}",
-        serde_json::json!({"session": session, "port": port, "settings": settings})
-    );
-    Ok(0)
-}
-
 /// The stored table of `conversation` as `{name: value}`, read without changing it. None when there is no Keychain key yet; an empty map when the conversation has no table.
 fn stored_values(
     names_dir: &Path,
@@ -910,29 +1051,17 @@ fn stored_values(
     ))
 }
 
-/// `piifence reveal [--session <id> | --conversation <uuid>] [--json]`: the text on stdin with real values in place of names, on stdout. Own names (`$PIIF_SECRET_<n>`, `${PIIF_SECRET_<n>}`) come from the live session through the gateway (`--session`), or from a conversation's stored table (`--conversation`). A qualified name, `[[piif:<8 hex>:<n>]]`, comes from the stored table of the one conversation whose id starts with those 8 hex digits. Stored tables are only read, never saved again. A name that does not resolve stays as it is; `--json` prints `{"text", "unresolved"}` with those names. Values are never logged.
+/// `piifence reveal --conversation <uuid> [--json]`: the text on stdin with real values in place of names, on stdout. Own names (`$PIIF_SECRET_<n>`, `${PIIF_SECRET_<n>}`) come from the conversation `--conversation`, a Claude Code session id: from the running gateway when it answers, else from the conversation's stored table. A qualified name, `[[piif:<8 hex>:<n>]]`, comes from the stored table of the one conversation whose id starts with those 8 hex digits. Stored tables are only read, never saved again. A name that does not resolve stays as it is; `--json` prints `{"text", "unresolved"}` with those names. Values are never logged.
 fn reveal(args: &[String]) -> Result<i32> {
-    let opts = options(args, &["--session", "--conversation"], &["--json"])?;
-    if opts.contains_key("--session") && opts.contains_key("--conversation") {
-        bail!("pass --session or --conversation, not both");
-    }
+    let opts = options(args, &["--conversation"], &["--json"])?;
     let mut text = String::new();
     std::io::stdin()
         .read_to_string(&mut text)
         .context("read stdin")?;
     let names_dir = piifence::control::state_dir()?.join("names");
-    let own: std::collections::HashMap<String, String> = if let Some(id) = opts.get("--session") {
-        session_values(&session_option(id)?, port()?)?
-            .into_iter()
-            .filter_map(|(name, value)| Some((name, value.as_str()?.to_string())))
-            .collect()
-    } else if let Some(conversation) = opts.get("--conversation") {
-        if !piifence::names::is_conversation_id(conversation) {
-            bail!("--conversation must be a Claude Code conversation id");
-        }
-        stored_values(&names_dir, conversation)?.unwrap_or_default()
-    } else {
-        Default::default()
+    let own = match opts.get("--conversation") {
+        Some(id) => conversation_values(&names_dir, &session_uuid(id)?, port()?)?,
+        None => Default::default(),
     };
     let mut unresolved: Vec<String> = Vec::new();
     let mut miss = |name: &str| {
@@ -992,10 +1121,25 @@ fn reveal(args: &[String]) -> Result<i32> {
     Ok(0)
 }
 
+/// The `{name: value}` table of `conversation`: the running gateway's, which also holds names not stored yet, when a gateway answers on `port`; else the stored one.
+fn conversation_values(
+    names_dir: &Path,
+    conversation: &str,
+    port: u16,
+) -> Result<std::collections::HashMap<String, String>> {
+    if tcp_answers(port) {
+        return Ok(session_values(conversation, port)?
+            .into_iter()
+            .filter_map(|(name, value)| Some((name, value.as_str()?.to_string())))
+            .collect());
+    }
+    Ok(stored_values(names_dir, conversation)?.unwrap_or_default())
+}
+
 /// Tools whose input a shell reads, which expands `$PIIF_SECRET_<N>` itself from the exported variables, so the hook fills in only the names the shell would not expand (`piifence::shellfill`). The hook leaves `PowerShell` commands alone.
 const SHELL_TOOLS: &[&str] = &["Bash", "Monitor"];
 
-/// `piifence restore <session> <port>`, the `PreToolUse` hook. The agent only ever sees names, so it writes `$PIIF_SECRET_<N>` into file contents, edits, and MCP tool arguments, where no shell expands it. This puts each known name's real value back into the tool's input before the tool runs. A backslash that escapes a name's `$` goes with the name. In `Bash` and `Monitor` commands only the names the shell would not expand are filled in, escaped for where they stand (`SHELL_TOOLS`). `PowerShell` and inputs without a name are left alone. A failure exits 2, which blocks the call, so a tool never runs with a name where a value belongs.
+/// `piifence restore <port>`, the `PreToolUse` hook. The agent only ever sees names, so it writes `$PIIF_SECRET_<N>` into file contents, edits, and MCP tool arguments, where no shell expands it. This puts each known name's real value back into the tool's input before the tool runs. A backslash that escapes a name's `$` goes with the name. In `Bash` and `Monitor` commands only the names the shell would not expand are filled in, escaped for where they stand (`SHELL_TOOLS`). `PowerShell` and inputs without a name are left alone. A failure exits 2, which blocks the call, so a tool never runs with a name where a value belongs.
 fn restore(args: &[String]) -> Result<i32> {
     match restored_input(args) {
         Ok(Some(input)) => {
@@ -1017,13 +1161,8 @@ fn restore(args: &[String]) -> Result<i32> {
 
 /// The hook's tool input with names replaced by values (in a shell command, only the names the shell would not expand), or None when nothing changes.
 fn restored_input(args: &[String]) -> Result<Option<serde_json::Value>> {
-    let (session, port) = session_args(args)?;
-    let mut input = String::new();
-    std::io::stdin()
-        .read_to_string(&mut input)
-        .context("read the hook input")?;
-    let hook: serde_json::Value =
-        serde_json::from_str(&input).context("the hook input is not JSON")?;
+    let (port, hook) = hook_input(args)?;
+    let session = hook_session(&hook)?;
     let tool = hook["tool_name"]
         .as_str()
         .context("the hook input has no tool_name")?;
@@ -1041,7 +1180,7 @@ fn restored_input(args: &[String]) -> Result<Option<serde_json::Value>> {
         if !name_pattern().is_match(command) {
             return Ok(None);
         }
-        let values = session_values(session, port)?;
+        let values = session_values(&session, port)?;
         let value_of = |var: &str| values.get(var).and_then(|v| v.as_str()).map(str::to_string);
         let Some(command) = piifence::shellfill::fill_command(command, &value_of)? else {
             return Ok(None);
@@ -1052,7 +1191,7 @@ fn restored_input(args: &[String]) -> Result<Option<serde_json::Value>> {
     if !names_in(&tool_input) {
         return Ok(None);
     }
-    let values = session_values(session, port)?;
+    let values = session_values(&session, port)?;
     fill_values(&mut tool_input, &values)?;
     Ok(Some(tool_input))
 }
@@ -1243,108 +1382,19 @@ mod tests {
 
     #[test]
     fn env_file_keeps_only_the_current_piifence_line() {
-        let old = format!("eval \"$('/gone/piifence' env {} 7788)\"\n", "a".repeat(32));
-        let line = format!("eval \"$('/opt/piifence' env {} 7788)\"\n", "b".repeat(32));
-        let existing = format!("export OTHER=1\n{old}{old}");
+        let older = format!("eval \"$('/gone/piifence' env {} 7788)\"\n", "a".repeat(32));
+        let old = "eval \"$('/gone/piifence' env 0f0f0f0f-1111-2222-3333-444444444444 7788)\"\n";
+        let line = "eval \"$('/opt/piifence' env 0f0f0f0f-5555-6666-7777-888888888888 7788)\"\n";
+        let existing = format!("export OTHER=1\n{older}{old}{old}");
         assert_eq!(
-            env_file_with(&existing, &line),
+            env_file_with(&existing, line),
             format!("export OTHER=1\n{line}")
         );
         assert_eq!(
-            env_file_with(&format!("export OTHER=1\n{line}"), &line),
+            env_file_with(&format!("export OTHER=1\n{line}"), line),
             format!("export OTHER=1\n{line}")
         );
-        assert_eq!(env_file_with("", &line), line);
-    }
-
-    #[test]
-    fn split_nested_takes_a_trailing_nested() {
-        let strings = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let with = strings(&["s", "p", "nested"]);
-        assert_eq!(split_nested(&with), (&with[..2], true));
-        let without = strings(&["s", "p"]);
-        assert_eq!(split_nested(&without), (&without[..], false));
-        let first = strings(&["nested", "s", "p"]);
-        assert_eq!(split_nested(&first), (&first[..], false));
-    }
-
-    #[test]
-    fn hook_env_marks_only_nested_sessions() {
-        let session = "a".repeat(32);
-        let get = |env: &[(&str, String)], key: &str| {
-            env.iter().find(|(k, _)| *k == key).unwrap().1.clone()
-        };
-        let plain = hook_env(7788, &session, false).unwrap();
-        let nested = hook_env(7788, &session, true).unwrap();
-        assert_eq!(get(&plain, "PIIF_SESSION_NESTED"), "");
-        assert_eq!(get(&nested, "PIIF_SESSION_NESTED"), "nested");
-        assert_eq!(get(&plain, "PIIF_SESSION"), session);
-        assert_eq!(get(&plain, "PIIF_SESSION_PORT"), "7788");
-        assert!(Path::new(&get(&plain, "PIIF_BIN")).is_absolute());
-    }
-
-    #[test]
-    fn session_plugin_hooks_run_the_launcher_commands() {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin/piifence-session/hooks/hooks.json");
-        let hooks: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-        let command = |event: &str| {
-            hooks["hooks"][event][0]["hooks"][0]["command"]
-                .as_str()
-                .unwrap()
-                .to_string()
-        };
-        assert_eq!(
-            command("SessionStart"),
-            r#""$PIIF_BIN" session-start "$PIIF_SESSION" "$PIIF_SESSION_PORT" $PIIF_SESSION_NESTED"#
-        );
-        assert_eq!(
-            command("PreToolUse"),
-            r#""$PIIF_BIN" restore "$PIIF_SESSION" "$PIIF_SESSION_PORT""#
-        );
-        assert_eq!(hooks["hooks"]["PreToolUse"][0]["matcher"], "*");
-    }
-
-    #[test]
-    fn nested_session_reads_the_parent_session() {
-        let session = "a".repeat(32);
-        let url = Some("http://127.0.0.1:7788/");
-        let headers = format!("X-Other: 1\nx-piifence-session: {session}");
-        assert_eq!(
-            nested_session(Some(&headers), url),
-            Some((session.clone(), 7788))
-        );
-        let headers = format!("X-Piifence-Session: {session}");
-        assert_eq!(
-            nested_session(Some(&headers), url),
-            Some((session.clone(), 7788))
-        );
-        let short = format!("x-piifence-session: {}", "a".repeat(31));
-        assert_eq!(nested_session(Some(&short), url), None);
-        assert_eq!(
-            nested_session(Some(&headers), Some("https://api.anthropic.com")),
-            None
-        );
-        assert_eq!(nested_session(None, url), None);
-        assert_eq!(nested_session(Some(&headers), None), None);
-    }
-
-    #[test]
-    fn session_headers_drop_inherited_piifence_headers() {
-        let session = "b".repeat(32);
-        let parent = format!(
-            "X-Mine: 1\nx-piifence-session: {}\nX-Piifence-Qualify-Foreign: 1\n",
-            "a".repeat(32)
-        );
-        assert_eq!(
-            with_session_header(Some(&parent), &session),
-            format!("X-Mine: 1\nx-piifence-session: {session}")
-        );
-        assert_eq!(
-            with_session_header(None, &session),
-            format!("x-piifence-session: {session}")
-        );
+        assert_eq!(env_file_with("", line), line);
     }
 
     #[test]
@@ -1382,87 +1432,6 @@ mod tests {
     }
 
     #[test]
-    fn find_claude_skips_the_shim() {
-        let root = test_dir("find");
-        let (shim, real, plain, link) = (
-            root.join("shim"),
-            root.join("real"),
-            root.join("plain"),
-            root.join("link"),
-        );
-        write_file(&shim.join("claude"), "#!/bin/sh\n", 0o755);
-        write_file(&real.join("claude"), "#!/bin/sh\n", 0o755);
-        write_file(&plain.join("claude"), "#!/bin/sh\n", 0o644);
-        fs::create_dir_all(&link).unwrap();
-        std::os::unix::fs::symlink(shim.join("claude"), link.join("claude")).unwrap();
-
-        let path = env::join_paths([&shim, &plain, &real]).unwrap();
-        assert_eq!(find_claude(&path, &shim), Some(real.join("claude")));
-        let path = env::join_paths([&link, &real]).unwrap();
-        assert_eq!(find_claude(&path, &shim), Some(real.join("claude")));
-        let path = env::join_paths([&shim, &plain]).unwrap();
-        assert_eq!(find_claude(&path, &shim), None);
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn install_shim_writes_once() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = test_dir("shim");
-        let dir = root.join("bin");
-        let exe = Path::new("/opt/piifence/bin/piifence");
-        install_shim(&dir, exe).unwrap();
-        let target = dir.join("claude");
-        let meta = fs::metadata(&target).unwrap();
-        assert_eq!(meta.permissions().mode() & 0o777, 0o755);
-        assert_eq!(fs::read_to_string(&target).unwrap(), shim_script(exe));
-
-        install_shim(&dir, exe).unwrap();
-        assert_eq!(
-            fs::metadata(&target).unwrap().modified().unwrap(),
-            meta.modified().unwrap()
-        );
-
-        let other = Path::new("/opt/other/piifence");
-        install_shim(&dir, other).unwrap();
-        assert_eq!(fs::read_to_string(&target).unwrap(), shim_script(other));
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn path_line_adds_the_directory_once() {
-        let line = path_line(Path::new("/tmp/piif test/bin"));
-        for shell in ["/bin/sh", "/bin/zsh"] {
-            let out = Command::new(shell)
-                .arg("-c")
-                .arg(format!("PATH=/usr/bin; {line}{line}printf %s \"$PATH\""))
-                .output()
-                .unwrap();
-            assert_eq!(
-                String::from_utf8_lossy(&out.stdout),
-                "/tmp/piif test/bin:/usr/bin",
-                "{shell}"
-            );
-        }
-    }
-
-    #[test]
-    fn nested_settings_keep_the_headers() {
-        let session = "a".repeat(32);
-        let headers = format!("X-Mine: 1\nx-piifence-session: {session}");
-        let url = "http://127.0.0.1:7788";
-        let first = write_settings_override(url, &session, &headers).unwrap();
-        let second = write_settings_override(url, &session, &headers).unwrap();
-        assert_ne!(first, second);
-        let json: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&first).unwrap()).unwrap();
-        fs::remove_file(&first).unwrap();
-        fs::remove_file(&second).unwrap();
-        assert_eq!(json["env"]["ANTHROPIC_CUSTOM_HEADERS"], headers.as_str());
-        assert!(json.get("hooks").is_none());
-    }
-
-    #[test]
     fn names_in_ignores_other_variables() {
         assert!(!names_in(
             &serde_json::json!({"command": "echo $HOME $PIIF_SECRET_X"})
@@ -1484,20 +1453,6 @@ mod tests {
             out,
             "export PIIF_SECRET_1='it'\\''s $HOME `x`'\nexport PIIF_SECRET_12='a@b.io'\n"
         );
-    }
-
-    #[test]
-    fn session_args_are_checked() {
-        let ok = vec![
-            "0123456789abcdef0123456789abcdef".to_string(),
-            "7788".to_string(),
-        ];
-        assert_eq!(
-            session_args(&ok).unwrap(),
-            ("0123456789abcdef0123456789abcdef", 7788)
-        );
-        assert!(session_args(&["x; rm -rf /".to_string(), "7788".to_string()]).is_err());
-        assert!(session_args(&ok[..1]).is_err());
     }
 
     /// Read one whole HTTP request from `stream`, then answer with `head` (a status line, optionally followed by header lines, joined by `\r\n`) and an empty body. Answering before the request is read can reset the connection and make a test flaky.
@@ -1545,30 +1500,6 @@ mod tests {
     }
 
     #[test]
-    fn a_lease_is_held_on_200_and_refused_on_503_or_no_answer() {
-        let session = "0".repeat(32);
-        assert!(lease(&socket_answering("HTTP/1.1 200 OK"), &session, 1).unwrap());
-        assert!(!lease(
-            &socket_answering("HTTP/1.1 503 Service Unavailable"),
-            &session,
-            1
-        )
-        .unwrap());
-        assert!(!lease(&unused_socket_path(), &session, 1).unwrap());
-    }
-
-    #[test]
-    fn a_lease_on_a_gateway_that_predates_leases_is_an_error() {
-        let err = lease(
-            &socket_answering("HTTP/1.1 404 Not Found"),
-            &"0".repeat(32),
-            1,
-        )
-        .unwrap_err();
-        assert!(format!("{err:#}").contains("older piifence"), "{err:#}");
-    }
-
-    #[test]
     fn a_gateway_is_trusted_only_when_its_control_socket_answers() {
         let closed = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -1594,5 +1525,182 @@ mod tests {
             running_gateway_upstream(port, &socket).unwrap().as_deref(),
             Some("http://upstream.test")
         );
+    }
+
+    #[test]
+    fn session_args_are_checked() {
+        let id = "0F0F0F0F-1111-2222-3333-444444444444";
+        let ok = vec![id.to_string(), "7788".to_string()];
+        assert_eq!(session_args(&ok).unwrap(), (id.to_ascii_lowercase(), 7788));
+        assert!(session_args(&["x; rm -rf /".to_string(), "7788".to_string()]).is_err());
+        assert!(session_args(&["a".repeat(32), "7788".to_string()]).is_err());
+        assert!(session_args(&[id.to_string(), "port".to_string()]).is_err());
+        assert!(session_args(&ok[..1]).is_err());
+    }
+
+    #[test]
+    fn session_plugin_hooks_are_filled_for_this_install() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin");
+        let exe = Path::new("/opt/pf dir/piifence");
+        let socket = Path::new("/tmp/run/7797.sock");
+        let filled = |plugin: &str| -> serde_json::Value {
+            let text = fs::read_to_string(source.join(plugin).join("hooks/hooks.json")).unwrap();
+            serde_json::from_str(&fill_hooks(&text, exe, socket, 7797).unwrap()).unwrap()
+        };
+        let hooks = filled("piifence-session");
+        let command = |event: &str| {
+            hooks["hooks"][event][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            command("SessionStart"),
+            "'/opt/pf dir/piifence' session-start 7797"
+        );
+        assert_eq!(command("PreToolUse"), "'/opt/pf dir/piifence' restore 7797");
+        assert_eq!(hooks["hooks"]["PreToolUse"][0]["matcher"], "*");
+        let notice = filled("piifence-notice").to_string();
+        assert!(
+            notice.contains("PIIF_GATEWAY_SOCKET='/tmp/run/7797.sock'"),
+            "{notice}"
+        );
+        for plugin in PLUGINS {
+            let hooks = source.join(plugin).join("hooks/hooks.json");
+            if hooks.exists() {
+                let text = filled(plugin).to_string();
+                assert!(
+                    !text.contains("@PIIFENCE@")
+                        && !text.contains("@PORT@")
+                        && !text.contains("@SOCKET@"),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fill_module_writes_the_path_into_a_quoted_string() {
+        assert_eq!(
+            fill_module(
+                "const PIIFENCE = '@PIIFENCE_PATH@'\nconst PORT = @PORT@\n",
+                Path::new("/a/it's\\x"),
+                7788
+            ),
+            "const PIIFENCE = '/a/it\\'s\\\\x'\nconst PORT = 7788\n"
+        );
+    }
+
+    #[test]
+    fn the_marketplace_holds_every_plugin_filled_in() {
+        let state = test_dir("marketplace");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin");
+        let dir = write_marketplace(&state, &source, Path::new("/opt/piifence"), 7797).unwrap();
+        let catalog = read_json(&dir.join(".claude-plugin/marketplace.json")).unwrap();
+        assert_eq!(catalog["name"], MARKETPLACE);
+        let listed: Vec<&str> = catalog["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(listed, PLUGINS);
+        let mut stack = vec![dir.clone()];
+        while let Some(path) = stack.pop() {
+            if path.is_dir() {
+                stack.extend(fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+            } else if path.extension().is_some_and(|ext| ext != "md") {
+                let text = fs::read_to_string(&path).unwrap();
+                for mark in ["@PIIFENCE@", "@PORT@", "@SOCKET@", "@PIIFENCE_PATH@"] {
+                    assert!(!text.contains(mark), "{} still has {mark}", path.display());
+                }
+            }
+        }
+        let module =
+            fs::read_to_string(dir.join("plugins/piifence-reveal/hooks/register.ts")).unwrap();
+        assert!(module.contains("'/opt/piifence'"), "{module}");
+        fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
+    fn the_base_url_is_set_and_removed_without_touching_other_settings() {
+        let settings = serde_json::json!({"model": "opus", "env": {"A": "1"}, "hooks": {}});
+        let set = with_base_url(settings.clone(), Some("http://127.0.0.1:7788"));
+        assert_eq!(
+            serde_json::to_string(&set).unwrap(),
+            r#"{"model":"opus","env":{"A":"1","ANTHROPIC_BASE_URL":"http://127.0.0.1:7788"},"hooks":{}}"#
+        );
+        assert_eq!(
+            settings_base_url(&set).as_deref(),
+            Some("http://127.0.0.1:7788")
+        );
+        assert_eq!(with_base_url(set, None), settings);
+        let only = serde_json::json!({"env": {"ANTHROPIC_BASE_URL": "http://x"}});
+        assert_eq!(with_base_url(only, None), serde_json::json!({}));
+        let restored = with_base_url(serde_json::json!({}), Some("http://proxy.test"));
+        assert_eq!(
+            settings_base_url(&restored).as_deref(),
+            Some("http://proxy.test")
+        );
+        let left = serde_json::json!({"model": "opus", "enabledPlugins": {}, "extraKnownMarketplaces": {"other": {}}});
+        assert_eq!(
+            without_empty(left, PLUGIN_SETTINGS),
+            serde_json::json!({"model": "opus", "extraKnownMarketplaces": {"other": {}}})
+        );
+    }
+
+    #[test]
+    fn the_upstream_falls_back_in_order() {
+        let url = "http://127.0.0.1:7788";
+        let pick = |flag, from_env, recorded, settings| {
+            choose_upstream(flag, from_env, recorded, settings, url)
+        };
+        assert_eq!(pick(Some("f"), Some("e"), Some("r"), Some("s")), "f");
+        assert_eq!(pick(None, Some("e"), Some("r"), Some("s")), "e");
+        assert_eq!(pick(None, None, Some("r"), Some("s")), "r");
+        assert_eq!(pick(None, None, None, Some("s")), "s");
+        assert_eq!(
+            pick(None, None, None, Some("http://127.0.0.1:7788/")),
+            DEFAULT_UPSTREAM
+        );
+        assert_eq!(pick(None, Some(""), None, None), DEFAULT_UPSTREAM);
+    }
+
+    #[test]
+    fn the_agent_plist_escapes_its_values() {
+        let plist = launchd_plist(
+            "com.piifence.gateway",
+            Path::new("/opt/a&b/piifence-gateway"),
+            &[(
+                "PIIF_UPSTREAM".to_string(),
+                "http://x/?a=1&b=<2>".to_string(),
+            )],
+            Path::new("/tmp/gw.log"),
+        );
+        assert!(plist.contains("<string>/opt/a&amp;b/piifence-gateway</string>"));
+        assert!(plist
+            .contains("<key>PIIF_UPSTREAM</key><string>http://x/?a=1&amp;b=&lt;2&gt;</string>"));
+        assert!(plist.contains("<key>KeepAlive</key><true/>"));
+        assert_eq!(agent_label(DEFAULT_PORT), "com.piifence.gateway");
+        assert_eq!(agent_label(7797), "com.piifence.gateway.7797");
+    }
+
+    #[test]
+    fn json_files_are_replaced_whole_and_keep_their_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_dir("write-json");
+        let path = dir.join("settings.json");
+        assert_eq!(read_json(&path).unwrap(), serde_json::json!({}));
+        write_file(&path, "{\"a\": 1}", 0o600);
+        write_json(&path, &serde_json::json!({"a": 2})).unwrap();
+        assert_eq!(read_json(&path).unwrap(), serde_json::json!({"a": 2}));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        write_file(&path, "[1]", 0o600);
+        assert!(read_json(&path).is_err());
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

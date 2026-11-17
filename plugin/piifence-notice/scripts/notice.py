@@ -3,7 +3,7 @@
 
 Asks the local gateway's /stats endpoint how many distinct secrets were replaced, and emits a user-visible message when a secret was replaced for the first time since the last turn. Only metadata is shown (kinds, counts, `$PIIF_SECRET_<N>` names, masked previews), never a value or the text around it. It prints nothing unless PIIF_NOTICE=on.
 
-`piifence claude` loads this plugin and sets PIIF_GATEWAY_SOCKET, the gateway's control socket: a Unix socket in a directory only the user can open, and the only place the gateway serves /stats. A gateway that does not answer is an error: the hook exits non-zero, so Claude Code shows it.
+`piifence install` writes PIIF_GATEWAY_SOCKET, the gateway's control socket, into this hook's command. It is a Unix socket in a directory only the user can open, and the only place the gateway serves /stats. A gateway that does not answer is an error: the hook exits non-zero, so Claude Code shows it.
 
 Env:
   PIIF_GATEWAY_SOCKET  required, e.g. ~/.local/state/piifence/run/7788.sock

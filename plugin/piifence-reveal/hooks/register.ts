@@ -2,6 +2,9 @@ import type { EngineInterface, Register } from 'claude-code'
 
 const NAME = /\$\{(PIIF_SECRET_\d+)\}|\$(PIIF_SECRET_\d+)/g
 const EXPORT = /^export (PIIF_SECRET_\d+)='((?:[^']|'\\'')*)'$/gm
+const PIIFENCE = '@PIIFENCE_PATH@'
+const PORT = '@PORT@'
+const SESSION = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const RELOAD_AFTER_MS = 2000
 const RETRY_MS = 1000
 const RETRIES = 30
@@ -40,27 +43,11 @@ export function revealDeep(value: unknown, known: ReadonlyMap<string, string>): 
   return value
 }
 
-export function sessionOf(
-  headers: string | undefined,
-  baseUrl: string | undefined,
-): { id: string; port: string } | undefined {
-  const id = headers
-    ?.split('\n')
-    .map(line => line.split(':'))
-    .find(([name]) => name?.trim().toLowerCase() === 'x-piifence-session')?.[1]
-    ?.trim()
-  const port = baseUrl?.replace(/\/$/, '').match(/^http:\/\/127\.0\.0\.1:(\d+)$/)?.[1]
-  return id && /^[0-9a-f]{32}$/i.test(id) && port ? { id, port } : undefined
-}
-
 async function load($: EngineInterface): Promise<void> {
   if ((await $.env.get('PIIF_REVEAL')) === 'off') return
-  const session = sessionOf(
-    await $.env.get('ANTHROPIC_CUSTOM_HEADERS'),
-    await $.env.get('ANTHROPIC_BASE_URL'),
-  )
-  if (!session) return
-  const run = await $.process.run(['piifence', 'env', session.id, session.port], {
+  const session = await $.session.id()
+  if (!SESSION.test(session)) return
+  const run = await $.process.run([PIIFENCE, 'env', session, PORT], {
     timeoutMs: 5000,
   })
   if (run.exitCode !== 0) return

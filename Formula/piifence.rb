@@ -44,6 +44,12 @@ class Piifence < Formula
     (bin/"piifence").write_env_script opt_libexec/"bin/piifence", PIIF_DATA_DIR: opt_pkgshare
   end
 
+  def caveats
+    <<~EOS
+      Run `piifence install` to send Claude Code through piifence, and run it again after each upgrade so the gateway restarts on the new version. `piifence uninstall` undoes it.
+    EOS
+  end
+
   test do
     assert_match "piifence", shell_output("#{bin}/piifence --help")
     assert_path_exists libexec/"bin/piifence-gateway"

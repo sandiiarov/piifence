@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/notice.py\""
+            "command": "PIIF_GATEWAY_SOCKET=@SOCKET@ python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/notice.py\""
           }
         ]
       }
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/notice.py\""
+            "command": "PIIF_GATEWAY_SOCKET=@SOCKET@ python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/notice.py\""
           }
         ]
       }

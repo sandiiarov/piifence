@@ -63,15 +63,23 @@ Use one of the two. If both are installed, the one that comes first in your `PAT
 
 ## 🚀 Use
 
-Start Claude Code through piifence and tell it where your provider is:
+Turn piifence on once:
 
 ```bash
-PIIF_UPSTREAM=https://api.anthropic.com piifence claude
+piifence install
 ```
 
-If `ANTHROPIC_BASE_URL` is already set in your shell or in your Claude Code settings, run `piifence claude` without `PIIF_UPSTREAM`. Every argument after `claude` goes to Claude Code as usual, so `piifence claude -c` continues your last conversation.
+From then on every Claude Code you start goes through piifence: `claude`, `claude -p`, the IDE extensions and the desktop app. `piifence install` does three things, in this order:
 
-There is nothing to switch on. Every secret found is replaced.
+1. It runs the gateway as a launchd agent (`com.piifence.gateway`), which starts at login and starts again if it stops.
+2. It installs piifence's three Claude Code plugins at user scope: the session hooks, the notice and the reveal plugin.
+3. It sets `env.ANTHROPIC_BASE_URL` in `~/.claude/settings.json` to the gateway, `http://127.0.0.1:7788`.
+
+The gateway forwards to `https://api.anthropic.com`. If your settings already named another `ANTHROPIC_BASE_URL`, such as a company proxy, the gateway forwards there instead, and `piifence uninstall` puts it back. Pass `--upstream URL` to choose the provider yourself.
+
+`piifence status` tells you whether piifence is installed, whether your settings point at the gateway, and whether the gateway runs. `piifence uninstall` undoes all three steps, the setting first.
+
+There is nothing else to switch on. Every secret found is replaced.
 
 ### How the agent works with a secret it can't see
 
@@ -84,7 +92,7 @@ There is nothing to switch on. Every secret found is replaced.
 | **The agent's instructions** | When the session starts, the agent gets a short note: `$PIIF_*` names stand for real values kept on your machine, and a value it sees only as a name was not exposed. Without the note, an agent that sees `$PIIF_SECRET_1` in output tends to warn you that a secret leaked. |
 
 > [!IMPORTANT]
-> The gateway serves only `piifence claude` sessions. Plain `claude` pointed at the gateway is refused, because its requests lack the session id that `piifence claude` adds.
+> The gateway serves only Claude Code. It tells sessions apart by the session id Claude Code sends with every request, and refuses a request that has none.
 >
 > The gateway hands a session's values only to your own account. `piifence env`, the `PreToolUse` hook and the notice reach it on a Unix socket in `~/.local/state/piifence/run/`, a directory only you can open. Its TCP port, which every account on the Mac can reach, serves only the proxy and a health check.
 
@@ -135,13 +143,13 @@ flowchart LR
     bash <-. "values for this session only" .-> gw
 ```
 
-`piifence claude` starts the gateway, gives the session a random id, and launches Claude Code with a temporary settings file and piifence's three plugins: the session hooks, the notice and the reveal plugin. The hooks come in a plugin, not in the settings file, because some managed Claude Code policies drop the hooks of settings files but still load plugins. If a policy drops plugin hooks too, the gateway refuses the session's agent requests with an error that says so, rather than letting the agent write names where values belong.
+`piifence install` runs the gateway, installs piifence's three plugins (the session hooks, the notice and the reveal plugin) and points Claude Code's settings at the gateway. The gateway keeps each session apart by Claude Code's own session id, which Claude Code sends with every request and gives to every hook. The hooks come in a plugin, not in the settings file, because some managed Claude Code policies drop the hooks of settings files but still load plugins. If a policy drops plugin hooks too, the gateway refuses the session's agent requests with an error that says so, rather than letting the agent write names where values belong.
 
 - **The gateway** is a proxy on `127.0.0.1:7788`. It scans every outgoing request (prompt, tool output, files, system prompt) and replaces each secret with its `$PIIF_SECRET_*` name. It keeps the values in memory and hands them only to the session they belong to, and only on its control socket, `~/.local/state/piifence/run/7788.sock`, never on its TCP port. It also saves each conversation's names, encrypted, so a resumed conversation gets them back (see [Guarantees](#guarantees)).
-- **A `SessionStart` hook** gives the agent the note about `$PIIF_*` names, and tells the gateway which Claude Code conversation the session is. It also adds one line to the file that Claude Code loads before every Bash command (`CLAUDE_ENV_FILE`). That line runs `piifence env`, which fetches the session's values from the gateway and exports them.
+- **A `SessionStart` hook** gives the agent the note about `$PIIF_*` names, and tells the gateway the session has started, so a resumed conversation gets its saved names back. It also adds one line to the file that Claude Code loads before every Bash command (`CLAUDE_ENV_FILE`). That line runs `piifence env`, which fetches the session's values from the gateway and exports them.
 - **A `PreToolUse` hook** runs `piifence restore` before every tool call. When the tool's input holds a `$PIIF_SECRET_*` name, it fetches the session's values and puts each value in place of its name; a backslash right before the name's `$` counts as part of the name. In Bash and Monitor commands it fills in a value only where the shell would not expand the name itself (single quotes, quoted heredocs, an escaped `$`), and PowerShell commands are left alone. If the gateway doesn't answer or a name is unknown, the hook blocks the call instead of letting the tool run with a name where a value belongs.
-- **A `claude` started inside the session gets the same hooks.** `piifence env` puts a small `claude` script from `~/.local/state/piifence/bin` first on `PATH`, so a command or script that runs `claude -p …` starts it with the session's hooks. That session shares the parent's names and does not take over the parent's saved names.
-- **The reveal plugin** draws the value in place of each `$PIIF_SECRET_*` name everywhere Claude Code draws one on your screen: the agent's replies, your prompts, tool rows and their output, slash-command output and question dialogs. Only the drawing changes: the transcript file and what the model reads keep the names. Set `PIIF_REVEAL=off` before `piifence claude` to see the names instead, for example while you share your screen.
+- **A `claude` started inside the session gets its own hooks.** It reads the same settings, so a command or script that runs `claude -p …` goes through the gateway as a session of its own, with its own names.
+- **The reveal plugin** draws the value in place of each `$PIIF_SECRET_*` name everywhere Claude Code draws one on your screen: the agent's replies, your prompts, tool rows and their output, slash-command output and question dialogs. Only the drawing changes: the transcript file and what the model reads keep the names. Set `PIIF_REVEAL=off` in your shell, or in the `env` of your Claude Code settings, to see the names instead, for example while you share your screen.
 
 Here is what happens when the agent finds a secret in a file and then uses it:
 
@@ -162,11 +170,11 @@ sequenceDiagram
 
 - 🏠 **Everything stays local.** Detection runs on your machine. Nothing is sent anywhere except the redacted request.
 - 🔁 **Names are stable.** The same value gets the same name on every turn, so the conversation stays consistent and prompt caching keeps working.
-- ⏯️ **Names survive a restart.** The agent's own messages, and scripts it wrote, hold names like `$PIIF_SECRET_39`. So the gateway saves each conversation's name→value table, and `piifence claude -c` or `--resume` loads it back, even after the gateway restarted. The table is a file in `~/.local/state/piifence/names/`, named after the conversation id, readable only by you, and encrypted (XChaCha20-Poly1305) with a random key kept in your macOS login Keychain (service `piifence`, account `names-key`). A table nobody has resumed for 30 days is deleted.
+- ⏯️ **Names survive a restart.** The agent's own messages, and scripts it wrote, hold names like `$PIIF_SECRET_39`. So the gateway saves each conversation's name→value table, and `claude -c` or `--resume` loads it back, even after the gateway restarted. The table is a file in `~/.local/state/piifence/names/`, named after the conversation id, readable only by you, and encrypted (XChaCha20-Poly1305) with a random key kept in your macOS login Keychain (service `piifence`, account `names-key`). A table nobody has resumed for 30 days is deleted.
 - 🙈 **No raw values are written in the clear.** Apart from that encrypted table, values live only in the gateway's memory, in the environment of the commands the agent runs, and in the tool inputs the `PreToolUse` hook fills in on your machine. Logs and the notice hold only kinds, counts and masked previews.
 - 👤 **Other accounts on your Mac can't read the values.** Any account can connect to the gateway's TCP port, so the gateway serves only the proxy there. It hands out values, saved names and the notice's previews only on a Unix socket in `~/.local/state/piifence/run/`, a directory only you can open.
 - 🛡️ **A value put back never goes out.** Before detection, the gateway replaces every value it has named in the session with its name, everywhere in the request. After detection it sweeps the whole request again, so a value first found late in a request is also replaced where it appeared earlier, and in fields that are not scanned. So a value that comes back in a file the agent reads, or in command output, leaves your machine as its name. Only thinking blocks (signed by the provider, so they can't be changed), base64 attachments and the request's `metadata` are left as they are.
-- 🚫 **It fails closed.** If a request can't be fully scanned, it is blocked, not sent. If the gateway can't start, Claude Code isn't launched.
+- 🚫 **It fails closed.** If a request can't be fully scanned, it is blocked, not sent. If the gateway can't start, `piifence install` stops before it points Claude Code at it.
 
 <details>
 <summary><b>Inside the gateway: the steps for each piece of text</b></summary>
@@ -213,21 +221,19 @@ Inline `gitleaks:allow` comments and `.gitleaksignore` files have no effect on t
 
 | Variable | Default | What it does |
 |---|---|---|
-| `PIIF_UPSTREAM` | `ANTHROPIC_BASE_URL` from your shell, then from Claude Code settings | The provider the gateway forwards to. |
+| `PIIF_UPSTREAM` | the upstream an earlier `piifence install` used, then the `ANTHROPIC_BASE_URL` your Claude Code settings named, then `https://api.anthropic.com` | The provider the gateway forwards to, read by `piifence install`. `--upstream` overrides it. |
 | `PIIF_PORT` | `7788` | The gateway's port on `127.0.0.1`. |
 | `PIIF_CONFIG` | `~/.config/piifence/config.toml` | The config file. |
 | `PIIF_DATA_DIR` | `~/.local/share/piifence` (Homebrew: `$(brew --prefix)/opt/piifence/share/piifence`) | Where the model and the plugins are installed. |
-| `PIIF_REVEAL` | on | `off` keeps the `$PIIF_SECRET_*` names on screen instead of drawing their values. |
-| `PIIF_NOTICE` | off | `on` shows a notice after each turn that replaced a secret, with its name and a masked preview. |
+| `PIIF_REVEAL` (Claude Code's environment) | on | `off` keeps the `$PIIF_SECRET_*` names on screen instead of drawing their values. |
+| `PIIF_NOTICE` (Claude Code's environment) | off | `on` shows a notice after each turn that replaced a secret, with its name and a masked preview. |
 | `PIIF_CACHE_DIR` | `~/.cache/piifence` | Where the detection cache is kept. |
-| `PIIF_STATE_DIR` | `~/.local/state/piifence` | Where each conversation's encrypted names are kept, in `names/`, and the gateway's control socket, in `run/`. |
-| `PIIF_GATEWAY_LOG` | `$TMPDIR/piifence-gateway.log` | The gateway's own log. |
-| `PIIF_EXIT_WHEN_UNUSED` | `10` | Seconds a gateway started by `piifence claude` keeps running after the last `piifence claude` that used it exits. `0` keeps it running until you stop it. |
+| `PIIF_STATE_DIR` | `~/.local/state/piifence` | Where each conversation's encrypted names are kept, in `names/`, the gateway's control socket, in `run/`, and the gateway's log, `gateway-7788.log`. |
 | `PIIF_AUDIT_LOG` | `/tmp/piifence-audit.log` | One line per replacement: kind, position, name and masked preview. |
 | `PIIF_AUDIT_BODY` | unset | Set to `1` to also log each rewritten request body. |
 | `PIIF_PREFIX` | `~/.local` | Install prefix, read by `install.sh`. |
 
-A value that is set but can't be parsed, such as `PIIF_PORT=abc`, is an error.
+`piifence install` passes `PIIF_UPSTREAM`, `PIIF_PORT`, `PIIF_CONFIG`, `PIIF_CACHE_DIR`, `PIIF_STATE_DIR`, `PIIF_AUDIT_LOG` and `PIIF_AUDIT_BODY` on to the gateway agent, so change them by running `piifence install` again with the new value. A value that is set but can't be parsed, such as `PIIF_PORT=abc`, is an error.
 
 </details>
 
@@ -236,22 +242,18 @@ A value that is set but can't be parsed, such as `PIIF_PORT=abc`, is an error.
 <details>
 <summary><b>Upgrading</b></summary>
 
-1. Quit every `piifence claude` session. A gateway that `piifence claude` started exits by itself about 10 seconds after its last session ends; until then, a new `piifence claude` reuses it.
-2. Run `brew upgrade piifence`, or the install script again.
-3. Check that no old gateway is left with `pgrep -fl piifence-gateway`, and stop any you find with `pkill -f piifence-gateway`.
+1. Run `brew upgrade piifence`, or the install script again.
+2. Run `piifence install` again. It restarts the gateway on the new version and reinstalls the plugins; Claude Code sessions that are running pick the new gateway up on their next request.
 
 </details>
 
 <details>
 <summary><b>The gateway doesn't start</b></summary>
 
-`piifence claude` prints the error and the path of the gateway log. Common causes:
+`piifence install` prints the error and the last lines of the gateway log, `~/.local/state/piifence/gateway-7788.log`. Common causes:
 
 - **A config error**, such as `unknown field` or `invalid allow pattern`. Older versions had settings like `categories` and `auto_approve`, and those are now errors. Keep only `allow` in `~/.config/piifence/config.toml`, or delete the file.
-- **`no upstream configured`**: set `PIIF_UPSTREAM`, or `ANTHROPIC_BASE_URL` in your shell or Claude Code settings.
-- **`a gateway on … forwards to …`**: another session's gateway is using the port with a different provider. Quit that session, or set `PIIF_PORT` to a free port.
-- **`no piifence gateway answers on …`**: something answers on the port, but it is not a gateway this piifence can reach: another program, another account's gateway, a gateway from a piifence older than the control socket, or one started with a different `PIIF_STATE_DIR`. Stop it, or set `PIIF_PORT` to a free port.
-- **`cannot hold a lease`**: a gateway from an older piifence is still running on the port. Quit the sessions that use it, or stop it with `pkill -f piifence-gateway`.
+- **`… already answers on 127.0.0.1:7788`**: another program holds the port, often a gateway that an older `piifence claude` started. Stop it, or set `PIIF_PORT` to a free port, and run `piifence install` again.
 
 </details>
 
@@ -266,14 +268,14 @@ The name has no value in this session. This happens to a conversation that was l
 <summary><b>Uninstalling</b></summary>
 
 ```bash
-pkill -f piifence-gateway
+piifence uninstall
 brew uninstall piifence && brew untap sandiiarov/piifence    # if installed with Homebrew
 rm -rf ~/.local/bin/piifence ~/.local/libexec/piifence ~/.local/share/piifence    # if installed with the script
 rm -rf ~/.local/state/piifence ~/.cache/piifence ~/.config/piifence
 security delete-generic-password -s piifence -a names-key
 ```
 
-piifence never edits `~/.claude/settings.json`, so there's nothing to undo in Claude Code.
+`piifence uninstall` puts back the `ANTHROPIC_BASE_URL` your settings had before, or removes the key, then uninstalls the plugins and stops the gateway agent.
 
 </details>
 
@@ -285,7 +287,8 @@ piifence never edits `~/.claude/settings.json`, so there's nothing to undo in Cl
 - **Names last 30 days.** A conversation resumed after 30 days unused has lost its saved names, so a `$PIIF_SECRET_N` the agent wrote before then has no value.
 - **The agent can use every secret it comes across** in commands, including sending it somewhere.
 - **Secrets that look like ids get through.** For example, a hex key right after a word like `commit` or `sha256` is read as a hash and sent as it is, and so is a secret in a URL query parameter whose name doesn't say it is secret.
-- **A `claude` started some other way runs without the hooks.** That is a `claude` started by its full path, by a shell alias that doesn't go through `PATH`, or by the Agent SDK. It still goes through the gateway, but it writes a `$PIIF_SECRET_<N>` name in a file as text.
+- **A Claude Code that doesn't read your user settings isn't covered.** That is one started with `--setting-sources` that leaves out `user`, with its own `ANTHROPIC_BASE_URL`, or with plugins turned off, or one run through the Agent SDK without the user settings. Without the base URL it talks to the provider directly; without the plugins the gateway refuses its agent requests.
+- **A forked or cleared conversation starts with no names.** `--fork-session` and `/clear` give the conversation a new session id, so a `$PIIF_SECRET_<N>` the agent wrote before has no value there.
 - **It runs on macOS only, with Claude Code only.**
 
 ## 🧑‍💻 Development
@@ -300,7 +303,7 @@ PIIF_MODEL_DIR=/tmp/piifence-model scripts/check.sh    # every check, including 
 |---|---|
 | [`CLAUDE.md`](CLAUDE.md) | Architecture, module ownership and contracts. |
 | [`tests/secrets/README.md`](tests/secrets/README.md) | The end-to-end secret suite: 943 cases through the real gateway. |
-| [`docs/embedding.md`](docs/embedding.md) | `piifence gateway`, `session` and `reveal`, for programs that run Claude Code themselves. |
+| [`docs/embedding.md`](docs/embedding.md) | Running Claude Code from another program, and `piifence reveal`. |
 | [`docs/model-options.md`](docs/model-options.md) | Why piifence uses SporeLabs Scrub, with the benchmarks. |
 | [`docs/research/`](docs/research/README.md) | What other secret detectors, redaction proxies and papers do, and what piifence can take from them. |
 | [`plugin/piifence-notice/README.md`](plugin/piifence-notice/README.md) | The plugin that shows what was replaced. |

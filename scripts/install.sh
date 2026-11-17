@@ -100,4 +100,4 @@ case ":$PATH:" in
   *":$PREFIX/bin:"*) ;;
   *) echo "Add it to your PATH:  export PATH=\"$PREFIX/bin:\$PATH\"" ;;
 esac
-echo "Then set the upstream (PIIF_UPSTREAM, or ANTHROPIC_BASE_URL) and run: piifence claude"
+echo "Then run: piifence install   (it sends every Claude Code through the gateway; piifence uninstall undoes it)"

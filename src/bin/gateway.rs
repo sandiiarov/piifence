@@ -1,14 +1,13 @@
 //! piifence gateway — keeps secrets out of what Claude Code sends to the model provider.
 //!
-//!   1. `piifence claude` points Claude Code at it (`ANTHROPIC_BASE_URL=http://127.0.0.1:7788`) and gives the session an id, sent on every request in the `x-piifence-session` header.
+//!   1. `piifence install` runs it as a launchd agent and sets `env.ANTHROPIC_BASE_URL=http://127.0.0.1:7788` in the user's Claude Code settings, so every Claude Code sends its model requests here. Claude Code names its session on each request in the `x-claude-code-session-id` header (and in `metadata.user_id`); the gateway keys everything on that id.
 //!   2. `POST /v1/messages` and `/v1/messages/count_tokens` bodies are scanned (system, tool descriptions, message text, tool_result, tool_use / server_tool_use / mcp_tool_use input, mcp_tool_result, web fetch results, documents, search results) by the shared Detector (secret model + key rule + gitleaks + guards). Each secret becomes an environment variable name, `$PIIF_SECRET_<N>`, numbered once per value per session, so re-sent history is rewritten identically every turn.
 //!   3. The rewritten request is forwarded to `PIIF_UPSTREAM` with the original auth headers.
 //!   4. The response is streamed back byte for byte. Names are never replaced back: the provider never sees the value, and the agent uses the name. `piifence env` hands the values to the session's Bash commands, so `$PIIF_SECRET_1` expands to the real value on the user's machine.
-//!   5. The session-start hook sends Claude Code's conversation id to `/control/conversation`. The gateway then keeps that conversation's names in a file encrypted with a key from the macOS Keychain, and loads them back when the conversation is resumed, so names the agent already wrote keep their values across restarts.
-//!   6. `piifence claude` takes a lease on `/control/lease` (its session id and process id) before it starts Claude Code. Started with `PIIF_EXIT_WHEN_UNUSED=<seconds>`, as the launcher does, the gateway exits once no live launcher has held a lease for that long. Any other `/control/` path is answered 404 and never forwarded.
-//!   7. `/stats`, every `/control/` path and the `/health` answer that names the upstream are served only on the control socket, `$PIIF_STATE_DIR/run/<port>.sock`, in a directory only the user can open (see `piifence::control`). Any account on the machine can connect to the TCP port, so there those paths get 404 and `/health` leaves the upstream out.
+//!   5. The session-start hook binds the session on `/control/bind`. The gateway then keeps the session's names in a file encrypted with a key from the macOS Keychain, named by the session id, which is also the conversation id `claude --resume` takes. It loads them back when the conversation is resumed, and on the first request of a session it has not seen since it started, so names the agent already wrote keep their values across restarts of Claude Code and of the gateway. Any other `/control/` path is answered 404 and never forwarded.
+//!   6. `/stats`, every `/control/` path and the `/health` answer that names the upstream are served only on the control socket, `$PIIF_STATE_DIR/run/<port>.sock`, in a directory only the user can open (see `piifence::control`). Any account on the machine can connect to the TCP port, so there those paths get 404 and `/health` leaves the upstream out.
 //!
-//! Env: PIIF_UPSTREAM (required: provider base URL), PIIF_MODEL_DIR (required: the model directory, or several joined with ':', each a Scrub or cbx model), PIIF_PORT (7788), PIIF_EXIT_WHEN_UNUSED (seconds; above 0, exit once no launcher has held a lease that long; unset or 0, run until stopped), PIIF_AUDIT_LOG (/tmp/piifence-audit.log), PIIF_AUDIT_BODY=1 (also log the rewritten request bodies), PIIF_CACHE_DIR (~/.cache/piifence: detection results kept across restarts, as offsets per text hash, never the text or values), PIIF_STATE_DIR (~/.local/state/piifence: `names/` holds each conversation's names, encrypted with a key kept in the macOS Keychain, and `run/<port>.sock` is the control socket).
+//! Env: PIIF_UPSTREAM (required: provider base URL), PIIF_MODEL_DIR (required: the model directory, or several joined with ':', each a Scrub or cbx model), PIIF_PORT (7788), PIIF_AUDIT_LOG (/tmp/piifence-audit.log), PIIF_AUDIT_BODY=1 (also log the rewritten request bodies), PIIF_CACHE_DIR (~/.cache/piifence: detection results kept across restarts, as offsets per text hash, never the text or values), PIIF_STATE_DIR (~/.local/state/piifence: `names/` holds each conversation's names, encrypted with a key kept in the macOS Keychain, and `run/<port>.sock` is the control socket).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
@@ -60,9 +59,7 @@ struct AppState {
     stats: Arc<Mutex<Stats>>,
     /// Per-session `$PIIF_…` values (see `Session`).
     sessions: Arc<Mutex<HashMap<String, Session>>>,
-    /// The launchers using this gateway (see `Leases`).
-    leases: Arc<Mutex<Leases>>,
-    /// This request's session id (`x-piifence-session`), `""` outside a request or without one.
+    /// This request's Claude Code session id (see `session_id`), `""` outside a request or without one.
     session: String,
 }
 
@@ -188,19 +185,19 @@ impl EnvValues {
     }
 }
 
-/// Per-session state, keyed by the `x-piifence-session` id the launcher gives each Claude Code session.
+/// Per-session state, keyed by Claude Code's session id, which is also the conversation id `claude --resume` takes.
 #[derive(Default)]
 struct Session {
     env: EnvValues,
-    /// Claude Code's conversation id, once the session-start hook has sent it. Only then is the table stored.
-    conversation: Option<String>,
+    /// Set once the session-start hook has bound the session, or its stored table was loaded. Only then is the table stored.
+    bound: bool,
     /// The table's `counter` when it was last saved; None when it must be saved.
     saved: Option<usize>,
     /// Set once a request carries `QUALIFY_HEADER`: names from other conversations in tool results are rewritten (`qualify_tool_results`).
     qualify_foreign: bool,
 }
 
-/// The header a session sends (through `ANTHROPIC_CUSTOM_HEADERS`, set by `piifence session --qualify-foreign`) to have names from other conversations rewritten as `[[piif:<8 hex>:<n>]]`. It is stripped before forwarding.
+/// The header a session sends (through `ANTHROPIC_CUSTOM_HEADERS`, set by the program that runs Claude Code) to have names from other conversations rewritten as `[[piif:<8 hex>:<n>]]`. It is stripped before forwarding.
 const QUALIFY_HEADER: &str = "x-piifence-qualify-foreign";
 
 /// Rewrite, in every `tool_result` text of `payload`, each name that belongs to another conversation than `own` as `[[piif:<8 hex>:<n>]]` (`piifence::qualify`). Runs before redaction, so it sees only the names the tool output itself held.
@@ -239,8 +236,8 @@ static NAMES_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// A table nobody has resumed for this long is deleted when a gateway starts.
 const NAMES_KEPT_DAYS: u64 = 30;
 
-/// The header the session-start hook sends Claude Code's conversation id in.
-const CONVERSATION_HEADER: &str = "x-piifence-conversation";
+/// The header the hooks and `piifence env` name the session in on the control socket.
+const SESSION_HEADER: &str = "x-piifence-session";
 
 use piifence::names::{read_key, KEY_ACCOUNT, KEY_SERVICE, SECURITY_TOOL};
 
@@ -311,9 +308,13 @@ fn save_names(state: &AppState) -> anyhow::Result<()> {
     use chacha20poly1305::aead::{Aead, KeyInit, Payload};
     use std::os::unix::fs::OpenOptionsExt;
     let pending = with_session(state, |session| {
-        let conversation = session.conversation.clone()?;
-        (session.saved != Some(session.env.counter))
-            .then(|| (conversation, session.env.stored(), session.env.counter))
+        (session.bound && session.saved != Some(session.env.counter)).then(|| {
+            (
+                state.session.clone(),
+                session.env.stored(),
+                session.env.counter,
+            )
+        })
     });
     let Some((conversation, table, counter)) = pending else {
         return Ok(());
@@ -368,28 +369,41 @@ fn prepare_names_dir(dir: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Bind this session to Claude Code's conversation: merge in the names the conversation already uses and save the result. Returns how many were stored.
-fn bind_conversation(state: &AppState, conversation: &str) -> anyhow::Result<usize> {
-    let stored = load_names(conversation)?;
+/// Bind this session: merge in the names its conversation already uses and save the result. Returns how many were stored.
+fn bind_session(state: &AppState) -> anyhow::Result<usize> {
+    let stored = load_names(&state.session)?;
     with_session(state, |session| {
         session.env.merge(&stored);
-        session.conversation = Some(conversation.to_string());
+        session.bound = true;
         session.saved = None;
     });
     save_names(state)?;
     Ok(stored.len())
 }
 
-/// How long an agent request waits for its session's `SessionStart` hook to bind the conversation before it is refused. Claude Code can send its first request while the hook still runs.
+/// Bind a session this gateway has not seen bound when its conversation has a stored table. The hook stored one when it first bound the session, so a session that outlives a gateway restart gets its names back on its next request, without running its hook again.
+fn load_stored(state: &AppState) -> anyhow::Result<()> {
+    if state.session.is_empty() || with_session(state, |session| session.bound) {
+        return Ok(());
+    }
+    if names_path(&state.session)?.exists() {
+        bind_session(state)?;
+    }
+    Ok(())
+}
+
+/// How long an agent request waits for its session's `SessionStart` hook to bind the session before it is refused. Claude Code can send its first request while the hook still runs.
 const HOOKS_WAIT: Duration = Duration::from_secs(15);
 
-const HOOKS_MISSING: &str = "piifence refused this request: the session's SessionStart hook never reached the gateway, so piifence's hooks are not running in this Claude Code. Without them, files and tool calls would get $PIIF_SECRET_ names instead of real values. A managed policy that blocks plugin hooks (allowManagedHooksOnly, for example) causes this; piifence then needs its piifence-session plugin installed as a managed plugin.";
+const HOOKS_MISSING: &str = "piifence refused this request: the session's SessionStart hook never reached the gateway, so piifence's hooks are not running in this Claude Code. Without them, files and tool calls would get names instead of real values. Run `piifence install` to enable the piifence plugins. A managed policy that blocks plugin hooks (allowManagedHooksOnly, for example) also causes this; piifence then needs its piifence-session plugin installed as a managed plugin.";
 
-/// Whether the session's `SessionStart` hook has bound it to a conversation, waiting up to `HOOKS_WAIT` for it. A `claude` started inside a session shares its parent's session id, which is already bound.
+const SESSION_MISSING: &str = "piifence refused this request: it names no Claude Code session (no x-claude-code-session-id header and no session_id in metadata.user_id), so piifence cannot keep its secrets apart from other sessions'. Only Claude Code can use this gateway.";
+
+/// Whether the session's `SessionStart` hook has bound it, waiting up to `HOOKS_WAIT` for it. Subagents send their parent's session id, which is already bound.
 async fn hooks_ran(state: &AppState) -> bool {
     let deadline = Instant::now() + HOOKS_WAIT;
     loop {
-        if with_session(state, |session| session.conversation.is_some()) {
+        if with_session(state, |session| session.bound) {
             return true;
         }
         if Instant::now() >= deadline {
@@ -407,105 +421,33 @@ fn offers_tools(body: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-/// The conversation id in `headers`: Claude Code's session UUID, so 36 hex digits and dashes.
-fn conversation_id(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(CONVERSATION_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .filter(|id| id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'))
-        .map(str::to_string)
+/// The header Claude Code names its session in on every model request.
+const CC_SESSION_HEADER: &str = "x-claude-code-session-id";
+
+/// `id` when it is a Claude Code session id (a UUID), lowercased.
+fn session_uuid(id: &str) -> Option<String> {
+    piifence::names::is_conversation_id(id).then(|| id.to_ascii_lowercase())
 }
 
-/// The header carrying the session id: Claude Code sends it on every request (the launcher sets `ANTHROPIC_CUSTOM_HEADERS`), and `piifence env` on its call for the values. It is stripped before forwarding.
-const SESSION_HEADER: &str = "x-piifence-session";
-
-/// The session id in `headers`, or `""` when it is missing or not 32 hex digits. The id is also what lets `piifence env` fetch values, so only a well-formed one counts.
-fn session_id(headers: &HeaderMap) -> String {
-    headers
-        .get(SESSION_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .filter(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
-        .map(str::to_string)
+/// The session a request belongs to, or `""` when it names none. A control request (from the hooks, `piifence env` or `piifence reveal`) names it in `x-piifence-session`. A model request comes from Claude Code, which sends `x-claude-code-session-id`, and also the session id inside the JSON string `metadata.user_id`, read when the header is missing.
+fn session_id(path: &str, headers: &HeaderMap, body: &[u8]) -> String {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(session_uuid)
+    };
+    if path.starts_with("/control/") {
+        return header(SESSION_HEADER).unwrap_or_default();
+    }
+    header(CC_SESSION_HEADER)
+        .or_else(|| {
+            let payload: Value = serde_json::from_slice(body).ok()?;
+            let user: Value =
+                serde_json::from_str(payload["metadata"]["user_id"].as_str()?).ok()?;
+            session_uuid(user["session_id"].as_str()?)
+        })
         .unwrap_or_default()
-}
-
-/// The header carrying the process id of the `piifence claude` launcher that takes a lease.
-const LAUNCHER_HEADER: &str = "x-piifence-launcher-pid";
-
-/// How often a gateway started with `PIIF_EXIT_WHEN_UNUSED` checks that its launchers are still running.
-const LEASE_CHECK: Duration = Duration::from_secs(1);
-
-/// The `piifence claude` launchers using this gateway, as process ids by session id, and whether the gateway has started to shut down.
-#[derive(Default)]
-struct Leases {
-    pids: HashMap<String, i32>,
-    empty_since: Option<Instant>,
-    closing: bool,
-}
-
-/// The launcher process id in `headers`, or None when it is missing or not a positive number.
-fn launcher_pid(headers: &HeaderMap) -> Option<i32> {
-    headers
-        .get(LAUNCHER_HEADER)?
-        .to_str()
-        .ok()?
-        .parse()
-        .ok()
-        .filter(|pid| *pid > 0)
-}
-
-/// Record that launcher `pid` runs `session` on this gateway. False when the gateway is shutting down: the launcher then waits for it to close and starts a new one.
-fn take_lease(leases: &mut Leases, session: &str, pid: i32) -> bool {
-    if leases.closing {
-        return false;
-    }
-    leases.pids.insert(session.to_string(), pid);
-    leases.empty_since = None;
-    true
-}
-
-/// Drop the leases whose launcher process is gone, and mark the gateway as closing once no lease has been held for `grace`. Returns whether it is closing.
-fn expire_leases(
-    leases: &mut Leases,
-    now: Instant,
-    grace: Duration,
-    alive: impl Fn(i32) -> bool,
-) -> bool {
-    leases.pids.retain(|_, pid| alive(*pid));
-    if !leases.pids.is_empty() {
-        leases.empty_since = None;
-        return false;
-    }
-    let since = *leases.empty_since.get_or_insert(now);
-    if now.duration_since(since) >= grace {
-        leases.closing = true;
-    }
-    leases.closing
-}
-
-/// Whether process `pid` exists. Signal 0 is never delivered: `kill` only checks the process, and EPERM means it exists but belongs to another user.
-fn process_alive(pid: i32) -> bool {
-    (unsafe { libc::kill(pid, 0) == 0 })
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// Finish once no launcher has held a lease for `grace`. `main` then removes the control socket and returns, which closes both listeners and ends the gateway.
-async fn until_unused(leases: Arc<Mutex<Leases>>, grace: Duration) {
-    loop {
-        tokio::time::sleep(LEASE_CHECK).await;
-        if expire_leases(
-            &mut leases.lock().unwrap(),
-            Instant::now(),
-            grace,
-            process_alive,
-        ) {
-            eprintln!(
-                "no piifence claude session has used this gateway for {} s; shutting down",
-                grace.as_secs()
-            );
-            return;
-        }
-    }
 }
 
 /// The listener a request came in on.
@@ -1159,9 +1101,9 @@ fn sweep(
 async fn redact_request(state: &AppState, body: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut payload: Value = serde_json::from_slice(body).context("request body is not JSON")?;
     let started = std::time::Instant::now();
-    let (qualify, own) = with_session(state, |s| (s.qualify_foreign, s.conversation.clone()));
+    let (qualify, bound) = with_session(state, |s| (s.qualify_foreign, s.bound));
     if qualify {
-        qualify_tool_results(&mut payload, own.as_deref());
+        qualify_tool_results(&mut payload, bound.then_some(state.session.as_str()));
     }
     let mut audit = redact_payload(state, &mut payload).await?;
     audit.append(&mut sweep_values(state, &mut payload)?);
@@ -1199,16 +1141,16 @@ async fn proxy(
             "piifence only accepts local, non-browser requests",
         );
     }
+    let path = uri.path();
     let state = AppState {
-        session: session_id(&headers),
+        session: session_id(path, &headers, &body),
         ..state
     };
     if !state.session.is_empty() && headers.contains_key(QUALIFY_HEADER) {
         with_session(&state, |session| session.qualify_foreign = true);
     }
-    let path = uri.path();
     if path == "/health" {
-        // The launcher reads this header on the control socket and compares it to its own upstream before reusing a gateway. `tcp_only` removes it from the answer on TCP.
+        // `piifence install` and `piifence status` read this header on the control socket. `tcp_only` removes it from the answer on TCP.
         return Response::builder()
             .status(StatusCode::OK)
             .header(UPSTREAM_HEADER, state.upstream.as_str())
@@ -1242,11 +1184,33 @@ async fn proxy(
             "this endpoint is not redacted; request blocked",
         );
     }
-    // Secrets become the session's `$PIIF_…` names, so a scanned request and the control endpoint need a session.
-    if (is_scanned || path.starts_with("/control/")) && state.session.is_empty() {
+    // Secrets become the session's `$PIIF_…` names, so a scanned request and the control endpoints need a session.
+    if path.starts_with("/control/") && state.session.is_empty() {
         return error_response(
             StatusCode::FORBIDDEN,
-            "missing x-piifence-session: run Claude Code with `piifence claude`",
+            "missing or malformed x-piifence-session: a Claude Code session id",
+        );
+    }
+    if is_scanned && state.session.is_empty() {
+        let _ = audit_line(&state, json!({"event":"session_missing"}));
+        return error_response(StatusCode::FORBIDDEN, SESSION_MISSING);
+    }
+    // The session-start hook binds the session, so a resumed conversation gets back the names it already uses, and new names are stored.
+    if path == "/control/bind" && method == Method::GET {
+        return match bind_session(&state) {
+            Ok(loaded) => json_response(StatusCode::OK, json!({"loaded": loaded})),
+            Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
+        };
+    }
+    if let Err(err) = load_stored(&state) {
+        // Fail closed: a session whose stored names cannot be read would get new names for old values.
+        let _ = audit_line(
+            &state,
+            json!({"event":"load_error","error":format!("{err:#}")}),
+        );
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("piifence could not load this session's names: {err:#}"),
         );
     }
     // `piifence env` runs before every Bash command (Claude Code sources the line the session-start hook wrote) and exports these, so commands get the real values behind the `$PIIF_…` names. Values go only to the session they belong to.
@@ -1254,44 +1218,14 @@ async fn proxy(
         let values = with_session(&state, |session| session.env.all());
         return json_response(StatusCode::OK, json!({"values": values}));
     }
-    // The session-start hook sends Claude Code's conversation id, so a resumed conversation gets back the names it already uses.
-    if path == "/control/conversation" && method == Method::GET {
-        let Some(conversation) = conversation_id(&headers) else {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "missing or malformed x-piifence-conversation",
-            );
-        };
-        return match bind_conversation(&state, &conversation) {
-            Ok(loaded) => json_response(StatusCode::OK, json!({"loaded": loaded})),
-            Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
-        };
-    }
-    // `piifence claude` takes a lease before it starts Claude Code. A gateway started with `PIIF_EXIT_WHEN_UNUSED` runs while a live launcher holds one.
-    if path == "/control/lease" && method == Method::GET {
-        let Some(pid) = launcher_pid(&headers) else {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "missing or malformed x-piifence-launcher-pid",
-            );
-        };
-        return if take_lease(&mut state.leases.lock().unwrap(), &state.session, pid) {
-            json_response(StatusCode::OK, json!({"leased": true}))
-        } else {
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "this gateway is shutting down",
-            )
-        };
-    }
-    // Control paths are for the launcher and its hooks, so none is ever forwarded to the provider.
+    // Control paths are for piifence's hooks and commands, so none is ever forwarded to the provider.
     if path.starts_with("/control/") {
         return error_response(StatusCode::NOT_FOUND, "no such control endpoint");
     }
     // Fail closed when piifence's hooks do not run: the agent would write names where values belong.
     if path == "/v1/messages"
         && method == Method::POST
-        && !with_session(&state, |session| session.conversation.is_some())
+        && !with_session(&state, |session| session.bound)
         && offers_tools(&body)
         && !hooks_ran(&state).await
     {
@@ -1404,7 +1338,6 @@ async fn main() -> anyhow::Result<()> {
         )?)
         .collect();
     let port: u16 = env_or("PIIF_PORT", 7788)?;
-    let exit_when_unused: u64 = env_or("PIIF_EXIT_WHEN_UNUSED", 0)?;
     let audit_path: String = env_or("PIIF_AUDIT_LOG", "/tmp/piifence-audit.log".to_string())?;
     let audit_body_path = (env_or("PIIF_AUDIT_BODY", 0u8)? == 1)
         .then(|| "/tmp/piifence-redacted-bodies.jsonl".to_string());
@@ -1446,7 +1379,6 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let leases = Arc::new(Mutex::new(Leases::default()));
     let state = AppState {
         detector_tx,
         client: reqwest::Client::builder()
@@ -1458,7 +1390,6 @@ async fn main() -> anyhow::Result<()> {
         audit_body: audit_body.map(|file| Arc::new(Mutex::new(file))),
         stats: Arc::new(Mutex::new(Stats::default())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
-        leases: leases.clone(),
         session: String::new(),
     };
 
@@ -1483,20 +1414,9 @@ async fn main() -> anyhow::Result<()> {
         control_listener,
         app.layer(axum::middleware::from_fn(socket_only)),
     );
-    let unused = async move {
-        if exit_when_unused == 0 {
-            return std::future::pending::<anyhow::Result<()>>().await;
-        }
-        eprintln!("exits {exit_when_unused} s after the last piifence claude session ends");
-        until_unused(leases, Duration::from_secs(exit_when_unused)).await;
-        // Removed while both listeners still run: once the TCP port is free, another gateway may take it and bind this same path.
-        std::fs::remove_file(&socket_path)
-            .with_context(|| format!("remove the control socket {}", socket_path.display()))
-    };
     tokio::select! {
         served = tcp_server => served.context("serve on TCP")?,
         served = socket_server => served.context("serve on the control socket")?,
-        removed = unused => removed?,
     }
     Ok(())
 }
@@ -1570,9 +1490,34 @@ mod tests {
             audit_body: None,
             stats: Arc::new(Mutex::new(Stats::default())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            leases: Arc::new(Mutex::new(Leases::default())),
-            session: "0123456789abcdef0123456789abcdef".to_string(),
+            session: "0f0f0f0f-1111-2222-3333-444444444444".to_string(),
         }
+    }
+
+    #[test]
+    fn the_session_comes_from_claude_code_or_from_the_control_header() {
+        let id = "23C99764-ea7f-41c5-9f6e-ce7561a1a3ed";
+        let lower = id.to_ascii_lowercase();
+        let mut headers = HeaderMap::new();
+        headers.insert(CC_SESSION_HEADER, id.parse().unwrap());
+        assert_eq!(session_id("/v1/messages", &headers, b""), lower);
+        assert_eq!(session_id("/control/env", &headers, b""), "");
+
+        let user = serde_json::json!({"device_id": "d", "session_id": id}).to_string();
+        let body = serde_json::json!({"metadata": {"user_id": user}}).to_string();
+        assert_eq!(
+            session_id("/v1/messages", &HeaderMap::new(), body.as_bytes()),
+            lower
+        );
+
+        let mut control = HeaderMap::new();
+        control.insert(SESSION_HEADER, id.parse().unwrap());
+        assert_eq!(session_id("/control/env", &control, b""), lower);
+        assert_eq!(session_id("/v1/messages", &control, b""), "");
+
+        let mut bad = HeaderMap::new();
+        bad.insert(CC_SESSION_HEADER, "not-a-session-id".parse().unwrap());
+        assert_eq!(session_id("/v1/messages", &bad, b"not json"), "");
     }
 
     fn span(start: usize, end: usize) -> DetectedSpan {
@@ -1988,100 +1933,8 @@ mod tests {
     }
 
     #[test]
-    fn a_closing_gateway_refuses_a_lease() {
-        let mut leases = Leases::default();
-        assert!(take_lease(&mut leases, "a", 10));
-        leases.closing = true;
-        assert!(!take_lease(&mut leases, "b", 11));
-        assert_eq!(leases.pids.len(), 1);
-    }
-
-    #[test]
-    fn leases_of_launchers_that_exited_are_dropped() {
-        let mut leases = Leases::default();
-        take_lease(&mut leases, "a", 10);
-        take_lease(&mut leases, "b", 11);
-        let closing = expire_leases(
-            &mut leases,
-            Instant::now(),
-            Duration::from_secs(10),
-            |pid| pid == 11,
-        );
-        assert!(!closing);
-        assert_eq!(leases.pids.len(), 1);
-        assert!(leases.pids.contains_key("b"));
-    }
-
-    #[test]
-    fn the_gateway_closes_only_after_the_grace_passes_with_no_lease() {
-        let grace = Duration::from_secs(10);
-        let start = Instant::now();
-        let mut leases = Leases::default();
-        assert!(!expire_leases(&mut leases, start, grace, |_| true));
-        assert!(!expire_leases(
-            &mut leases,
-            start + grace - Duration::from_millis(1),
-            grace,
-            |_| true
-        ));
-        assert!(expire_leases(&mut leases, start + grace, grace, |_| true));
-        assert!(leases.closing);
-    }
-
-    #[test]
-    fn a_new_lease_restarts_the_grace() {
-        let grace = Duration::from_secs(10);
-        let start = Instant::now();
-        let mut leases = Leases::default();
-        expire_leases(&mut leases, start, grace, |_| true);
-        take_lease(&mut leases, "a", 10);
-        assert!(!expire_leases(&mut leases, start + grace, grace, |_| true));
-        leases.pids.clear();
-        assert!(!expire_leases(&mut leases, start + grace, grace, |_| true));
-        assert!(!expire_leases(
-            &mut leases,
-            start + grace * 2 - Duration::from_millis(1),
-            grace,
-            |_| true
-        ));
-        assert!(expire_leases(&mut leases, start + grace * 2, grace, |_| {
-            true
-        }));
-    }
-
-    #[test]
-    fn this_process_is_alive_and_a_reaped_child_is_not() {
-        assert!(process_alive(std::process::id() as i32));
-        let mut child = std::process::Command::new("true").spawn().unwrap();
-        let pid = child.id() as i32;
-        child.wait().unwrap();
-        assert!(!process_alive(pid));
-    }
-
-    #[test]
-    fn the_launcher_pid_header_must_be_a_positive_number() {
-        let mut headers = HeaderMap::new();
-        assert_eq!(launcher_pid(&headers), None);
-        for (value, expected) in [
-            ("4242", Some(4242)),
-            ("0", None),
-            ("-5", None),
-            ("12x", None),
-        ] {
-            headers.insert(LAUNCHER_HEADER, value.parse().unwrap());
-            assert_eq!(launcher_pid(&headers), expected, "{value}");
-        }
-    }
-
-    #[test]
     fn paths_are_split_between_tcp_and_the_control_socket() {
-        for path in [
-            "/stats",
-            "/control/env",
-            "/control/conversation",
-            "/control/lease",
-            "/control/other",
-        ] {
+        for path in ["/stats", "/control/env", "/control/bind", "/control/other"] {
             assert!(
                 !served_on(Via::Tcp, path),
                 "{path} must not be served on TCP"

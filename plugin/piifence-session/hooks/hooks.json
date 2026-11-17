@@ -1,12 +1,12 @@
 {
-  "description": "piifence session hooks, run by the piifence binary that started this Claude Code",
+  "description": "piifence session hooks: bind the Claude Code session on the gateway and put real values into tool calls",
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "\"$PIIF_BIN\" session-start \"$PIIF_SESSION\" \"$PIIF_SESSION_PORT\" $PIIF_SESSION_NESTED"
+            "command": "@PIIFENCE@ session-start @PORT@"
           }
         ]
       }
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$PIIF_BIN\" restore \"$PIIF_SESSION\" \"$PIIF_SESSION_PORT\""
+            "command": "@PIIFENCE@ restore @PORT@"
           }
         ]
       }

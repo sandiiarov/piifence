@@ -40,8 +40,9 @@ SECRET_NAME = re.compile(r"\$(?:\{PIIF_SECRET_\d+\}|PIIF_SECRET_\d+)")
 
 
 def session_for(case_id):
-    """The case's own session id, 32 hex digits; the gateway refuses a messages request without one. Each case is its own conversation, so a value named in one case is not replaced in the others."""
-    return hashlib.md5(case_id.encode()).hexdigest()
+    """The case's own session id, a UUID like the one Claude Code sends; the gateway refuses a messages request without one. Each case is its own conversation, so a value named in one case is not replaced in the others."""
+    h = hashlib.md5(case_id.encode()).hexdigest()
+    return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
 
 
 # --- data walking ---------------------------------------------------------------
@@ -238,7 +239,7 @@ def post(port, path, body, case_id):
         f"http://127.0.0.1:{port}{path}", data=json.dumps(body).encode(), method="POST",
         headers={"content-type": "application/json", "x-api-key": "test",
                  "anthropic-version": "2023-06-01", "x-piif-case": case_id,
-                 "x-piifence-session": session_for(case_id)})
+                 "x-claude-code-session-id": session_for(case_id)})
     try:
         with urllib.request.urlopen(req, timeout=600) as resp:
             resp.read()
