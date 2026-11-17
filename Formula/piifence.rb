@@ -1,8 +1,8 @@
 class Piifence < Formula
   desc "Keeps secrets out of what Claude Code sends to the model provider"
   homepage "https://github.com/sandiiarov/piifence"
-  url "https://github.com/sandiiarov/piifence.git", revision: "99c97d206ad0745dfdb619bc021efeef86e21562"
-  version "0.1.0"
+  url "https://github.com/sandiiarov/piifence.git", revision: "8e9dd94d3675c17a950e4f4c86f14bddf02fa021"
+  version "0.2.0"
   head "https://github.com/sandiiarov/piifence.git", branch: "main"
 
   depends_on "rust" => :build
