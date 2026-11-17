@@ -83,7 +83,7 @@ fn hash_word() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     regex(
         &RE,
-        r"(?i)(?:^|[^a-z])(?:sha\d*|hash(?:es|ed)?|commits?|digest|md5|checksums?|integrity|etag|fingerprint|object|revs?|revision|blob|tree|parent|merge|git|image|layer|container|docker|cid|nonce|salt|iv)(?:[^a-z]|$)",
+        r"(?i)(?:^|[^a-z])(?:sha\d*|hash(?:es|ed)?|commits?|digest|md5|checksums?|integrity|etag|fingerprint|object|revs?|revision|blob|tree|parent|merge|git|image|layer|container|docker|cid|nonce|salt|iv|head|index)(?:[^a-z]|$)|[a-z](?-i:Hash|Sha|Digest|Revision|Commit|Checksum)(?:[^a-z]|$)",
     )
 }
 
@@ -201,6 +201,15 @@ fn cue_value(value: &str) -> bool {
     bytes.iter().any(|b| b"!@#%^&*+=~?".contains(b)) || (switches >= 2 && bytes.len() >= 10)
 }
 
+/// Whether `line` has a secret word that stands on its own, not inside a file name or identifier such as `03-tokens-motion.sh`.
+fn free_cue(line: &str) -> bool {
+    let glued = |c: char| c.is_ascii_alphanumeric() || "/._-=".contains(c);
+    cue_word().find_iter(line).any(|cue| {
+        !line[..cue.start()].chars().next_back().is_some_and(glued)
+            && !line[cue.end()..].chars().next().is_some_and(glued)
+    })
+}
+
 const CUE_REACH: usize = 6;
 const LABEL_MAX: usize = 60;
 
@@ -247,7 +256,7 @@ pub fn cue_spans(text: &str) -> Vec<(usize, usize)> {
                     && !above.contains('=')
                     && (random_looking(stripped) || uuid().is_match(stripped))
                     && above.len() <= LABEL_MAX
-                    && cue_word().is_match(above)
+                    && free_cue(above)
                     && !hash_word().is_match(above)
                 {
                     let start = offset + (body.len() - body.trim_start().len());
@@ -290,6 +299,20 @@ const API_IDS: [&str; 6] = [
 ];
 const PREFIX_SWITCHES: usize = 4;
 
+/// Whether `before`, the text up to a value, ends in a JSON key or HTML attribute that names the value as an id: `"node_id":"`, `data-dpl-id="`.
+fn id_named(before: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let mut from = before.len().saturating_sub(40);
+    while !before.is_char_boundary(from) {
+        from += 1;
+    }
+    regex(
+        &RE,
+        r#"(?:"[\w\-]*(?:_id|-id|Id)"\s*:\s*|[\s<][\w\-:]*(?:[_\-]id|Id)=)\\?["']$"#,
+    )
+    .is_match(&before[from..])
+}
+
 /// Byte ranges of keys in the common `<prefix>_<random>` shape of any provider (`tvly-dev-…`, `pa-…`, `rnd_…`): a short prefix of up to three parts (not a hash word such as `sha512-` or `nonce-`), then 20 to 128 characters of mixed case that switch between letters and digits at least four times. Single-case ids (`db-2PSR…`, pod names) are left to the exact provider rules. Not inside a path, host, longer word or base64 run (`sha512-…+…/…==`), not a UUID-bearing id, and not an id of the Messages API (`toolu_…`, `msg_…`).
 pub fn prefix_spans(text: &str) -> Vec<(usize, usize)> {
     let edge = |c: char| c.is_ascii_alphanumeric() || "_-./".contains(c);
@@ -303,6 +326,7 @@ pub fn prefix_spans(text: &str) -> Vec<(usize, usize)> {
                 .is_some_and(|c| c.is_ascii_alphanumeric() || "_-+/=".contains(c))
             || API_IDS.iter().any(|id| whole.as_str().starts_with(id))
             || uuid_inside().is_match(whole.as_str())
+            || id_named(&text[..whole.start()])
         {
             continue;
         }
@@ -408,6 +432,39 @@ mod tests {
         ] {
             assert_eq!(cue_found(&text), vec![want], "{text}");
         }
+    }
+
+    #[test]
+    fn hex_after_a_hash_cue_is_left_alone() {
+        let a = "121b07d9f00bce2368e8ba80250219594e2a2c39";
+        let b = "a11bf3b38de784f7b0c0d6b6a8c32e3c95473d0b";
+        for text in [
+            format!("https://ghe.acme.dev/apps/x/pull/717 head {a} (sort fix)"),
+            format!("pr_url: https://ghe.acme.dev/apis/x/pull/253\npr_head: {a}"),
+            format!("index {a}..{b} 100644"),
+            format!("      \"computedHash\": \"{a}{b}\",\n      \"sourceRevision\": \"{b}\""),
+        ] {
+            assert!(hex_spans(&text).is_empty(), "{text}");
+        }
+        assert_eq!(hex_spans(&format!("api_key {a}")).len(), 1);
+    }
+
+    #[test]
+    fn a_prefixed_value_named_as_an_id_is_left_alone() {
+        let id = "dpl_8Hk2Lm9Qp4Rt7Vw3Xy6Zb1Cd5Fg";
+        assert_eq!(prefix_spans(&format!("x {id} y")).len(), 1);
+        for text in [
+            format!(r#"<html data-dpl-id="{id}" lang="en">"#),
+            format!(r#"{{"deploy_id":"{id}"}}"#),
+        ] {
+            assert!(prefix_spans(&text).is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_secret_word_inside_a_file_name_is_not_a_label() {
+        let text = "02-size-up.sh\n03-tokens-motion.sh\n04-fixtures-dir-check.sh\n";
+        assert!(cue_spans(text).is_empty());
     }
 
     #[test]

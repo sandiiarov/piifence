@@ -53,8 +53,12 @@ pub struct Guards {
     stand_in: Regex,
     /// A URL query parameter name that says its value is secret: `token`, `apiKey`, `X-Amz-Signature`, `code`.
     secret_param: Regex,
-    /// A JSON key whose value names a thing rather than holding a secret: `"slug"`, `"id"`, `"sha"`.
+    /// A JSON key or HTML attribute that names the value after it as an id: `"slug":"`, `"node_id":"`, `data-dpl-id="`.
     id_key: Regex,
+    /// A word in prose that says the value after it is an id: `ids`, `nanoid`, `identifier`.
+    id_prose: Regex,
+    /// `tokens` right before a value, as in `<subagent_tokens>` or `input tokens:`: a number there is a count.
+    token_count: Regex,
     /// A secret keyword and its separator, ending right where the span starts.
     keyword_before: Regex,
     /// A strong secret keyword in key position on the two lines above the span's line: followed by `:`, `=`, `{` or the end of the line, as in `variable "API_KEY" {`, `"credentials": {`, `echo $API_KEY`. A keyword in prose or a table column (`=== token ===`, `secret\t2026-…`) does not count, and plain `key` is too common to count there.
@@ -119,6 +123,14 @@ impl Guards {
                 r"^\.{1,2}/[\w.\-@+~/]+$",
                 // A file name with a content hash: index-3f9a1c2b.js, app.3f9a1c2b.css
                 r"^[\w\-]+[.\-][0-9a-f]{6,}\.[A-Za-z][A-Za-z0-9]{0,7}$",
+                // ls -l permissions: drwxr-xr-x@, -rw-r--r--+
+                r"^[\-dlcbps][rwxsStT\-]{9}[@+.]?$",
+                // Calendar event instances: <event id>_20261116T150000Z
+                r"^[A-Za-z0-9]+_\d{8}T\d{6}Z$",
+                // Audio formats with a sample rate: LEI16@16000
+                r"^[A-Z]{2,6}\d{1,3}@\d{4,6}$",
+                // Chat mentions: @U0ABC12DEF, #C0ABC12DEF
+                r"^[@#][UWCGBS][0-9A-Z]{6,14}$",
             ])?,
             code: regexes(&[
                 // Paths and macros: token::Paren, Token![:]
@@ -153,8 +165,10 @@ impl Guards {
                 r"(?i)token|jwt|secret|key|sig|pass|pwd|auth|credential|session|sid|code",
             )?,
             id_key: Regex::new(
-                r#"(?:^|[^\w\\])\\?"(?:slug|id|sha|hash|digest|etag|uuid|name|title|ref)\\?"\s*:\s*\\?"$"#,
+                r#"(?:^|[^\w\\])\\?"(?:slug|id|sha|hash|digest|etag|uuid|name|title|ref|[\w\-]*(?:_id|-id|Id|_ids|Ids))\\?"\s*:\s*\\?"$|[\s<][\w\-:]*(?:[_\-]id|Id)=\\?["']$"#,
             )?,
+            id_prose: Regex::new(r"(?i)\b(?:ids?|identifiers?|nanoids?|uuids?|slugs?)\b")?,
+            token_count: Regex::new(r"(?i)tokens\W*$")?,
             keyword_before: Regex::new(
                 r#"(?i)(?:key|token|secret|passw(?:or)?d|pwd|pass|auth|bearer|credentials?|signature|sig)\w*["'\]]?\s*(?:=|:=|:|=>|>|\s+(?:(?:is|was|of)\s+)?)\s*["'`]?$"#,
             )?,
@@ -224,7 +238,9 @@ impl Guards {
         let one_shape = [core, bare.as_ref(), token]
             .into_iter()
             .any(|value| self.is_identifier(value))
-            || is_base64_blob(base64_run(text, core_start, core_start + core.len()));
+            || is_base64_blob(base64_run(text, core_start, core_start + core.len()))
+            || self.called_an_id(text, token_start.min(core_start))
+            || lone_camel_case(text, token_start, token);
         // A list (`U01ABCDEF U02GHIJKL`) or phrase (`mint endpoint`): every piece must be a shape.
         let all_pieces = core.contains(char::is_whitespace)
             && core
@@ -243,7 +259,9 @@ impl Guards {
             from += 1;
         }
         let before = &before[from..];
-        if self.keyword_before.is_match(before) {
+        // A number after `tokens` is a count: `<subagent_tokens>123456</subagent_tokens>`.
+        let count = core.bytes().all(|b| b.is_ascii_digit()) && self.token_count.is_match(before);
+        if self.keyword_before.is_match(before) && !count {
             return None;
         }
         let above_start = text[..line_start.saturating_sub(1)]
@@ -275,6 +293,16 @@ impl Guards {
             from += 1;
         }
         self.id_key.is_match(&before[from..])
+    }
+
+    /// Whether the prose just before `start` on its line calls the value an id: `Ids are opaque nanoid strings (e.g. <value>)`.
+    fn called_an_id(&self, text: &str, start: usize) -> bool {
+        let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
+        let mut from = line_start.max(start.saturating_sub(48));
+        while !text.is_char_boundary(from) {
+            from += 1;
+        }
+        self.id_prose.is_match(&text[from..start])
     }
 
     /// An identifier, hash, path, number, version, time, upper-case id or plain word: a shape that is not a secret by itself.
@@ -422,6 +450,71 @@ fn single_character(value: &str) -> bool {
     value.chars().count() >= 4 && chars.all(|c| Some(c) == first)
 }
 
+/// A CamelCase name alone on its line, as an enum variant or a list entry (`    WhisperLargeV3Turbo,`). Each word is a capital and two or more lower-case letters with a vowel, or a short run of capitals or digits; a random string breaks into short words without vowels.
+fn lone_camel_case(text: &str, token_start: usize, token: &str) -> bool {
+    let line_start = text[..token_start].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = text[token_start..]
+        .find('\n')
+        .map_or(text.len(), |i| token_start + i);
+    let name = token.trim_end_matches([',', ';']);
+    let line = text[line_start..line_end].trim_start();
+    let numbered = line.trim_start_matches(|c: char| c.is_ascii_digit());
+    let line = match numbered.strip_prefix(['\t', '→']) {
+        Some(rest) if numbered.len() < line.len() => rest,
+        _ => line,
+    };
+    if line.trim().trim_end_matches([',', ';']) != name
+        || !name.starts_with(|c: char| c.is_ascii_uppercase())
+        || !name.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        return false;
+    }
+    let mut words = 0;
+    let mut rest = name;
+    while !rest.is_empty() {
+        let len = if rest.starts_with(|c: char| c.is_ascii_digit()) {
+            let digits = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            if digits > 4 {
+                return false;
+            }
+            digits
+        } else {
+            let lower = rest[1..]
+                .find(|c: char| !c.is_ascii_lowercase())
+                .map_or(rest.len(), |i| i + 1);
+            if lower > 1 {
+                if lower < 3
+                    || !rest[..lower]
+                        .to_ascii_lowercase()
+                        .contains(['a', 'e', 'i', 'o', 'u', 'y'])
+                {
+                    return false;
+                }
+                lower
+            } else {
+                let caps = rest
+                    .find(|c: char| !c.is_ascii_uppercase())
+                    .unwrap_or(rest.len());
+                let caps = if caps > 1 && rest[caps..].starts_with(|c: char| c.is_ascii_lowercase())
+                {
+                    caps - 1
+                } else {
+                    caps
+                };
+                if caps == 0 || caps > 4 {
+                    return false;
+                }
+                caps
+            }
+        };
+        words += 1;
+        rest = &rest[len..];
+    }
+    words >= 2
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,6 +529,81 @@ mod tests {
             .find(needle)
             .unwrap_or_else(|| panic!("{needle} in {text}"));
         g.suppress_model(text, start, start + needle.len())
+    }
+
+    #[test]
+    fn ids_named_by_their_key_or_prose_are_dropped() {
+        let g = guards();
+        let id = "V1StGXR8Z5jdHi6BmyT2q";
+        for text in [
+            format!(r#"{{"node_label":"Project","node_id":"{id}","name":"scout"}}"#),
+            format!(r#"<html data-dpl-id="{id}" lang="en">"#),
+            format!("Ids are opaque nanoid strings (e.g. `{id}`), not integers."),
+        ] {
+            assert_eq!(
+                model(&g, &text, id),
+                Some(Suppression::Identifier),
+                "{text}"
+            );
+        }
+        let text = "\"text\": \"<@U0ABCD1234> hi\"";
+        assert_eq!(
+            model(&g, text, "@U0ABCD1234"),
+            Some(Suppression::Identifier)
+        );
+        for text in [
+            format!(r#"{{"client_secret":"{id}"}}"#),
+            format!("the api token is {id}"),
+        ] {
+            assert_eq!(model(&g, &text, id), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn lone_camel_case_names_are_dropped() {
+        let g = guards();
+        let text =
+            "pub enum Model {\n    ParakeetV3,\n    WhisperLargeV3Turbo,\n    Qwen3Asr06B,\n}";
+        for name in ["ParakeetV3", "WhisperLargeV3Turbo", "Qwen3Asr06B"] {
+            assert_eq!(
+                model(&g, text, name),
+                Some(Suppression::Identifier),
+                "{name}"
+            );
+        }
+        for random in ["Xk9PqLmZr2Tw8VbN", "AbCdEfGh12345678"] {
+            let text = format!("\n    {random},\n");
+            assert!(
+                !lone_camel_case(&text, 5, &format!("{random},")),
+                "{random}"
+            );
+        }
+    }
+
+    #[test]
+    fn numbered_lines_and_token_counts_are_dropped() {
+        let g = guards();
+        let text = "     6\t    WhisperLargeV3Turbo,\n     7\t    ParakeetV3,\n";
+        assert_eq!(model(&g, text, "ParakeetV3"), Some(Suppression::Identifier));
+        let text = "<usage><subagent_tokens>482913</subagent_tokens><tool_uses>33</tool_uses>";
+        assert_eq!(model(&g, text, "482913"), Some(Suppression::Identifier));
+        assert_eq!(model(&g, "the password: 482913", "482913"), None);
+    }
+
+    #[test]
+    fn listing_shapes_are_dropped() {
+        let g = guards();
+        let perms = format!("{}@", "drwxr-xr-x");
+        let text = format!("{perms}  4 jdoe  staff   128 Nov 17 08:38 cache");
+        assert_eq!(model(&g, &text, &perms), Some(Suppression::Identifier));
+        let event = "4kq0v9s3mlc1hd2bu7tp8gfj6n_20261116T150000Z";
+        let text = format!("2026-11-16  Home  {event}");
+        assert_eq!(model(&g, &text, event), Some(Suppression::Identifier));
+        let text = format!("afconvert -f WAVE -d {}@16000 in.aiff", "LEI16");
+        assert_eq!(
+            model(&g, &text, "LEI16@16000"),
+            Some(Suppression::Identifier)
+        );
     }
 
     #[test]

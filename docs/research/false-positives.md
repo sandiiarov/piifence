@@ -44,3 +44,19 @@ Keep everything gitleaks and provider-format rules find. Filter only the spans t
 4. **Later, if 1–3 are not enough:** a small local second-stage classifier over the span and a few lines around it, as Nosey Parker does. Live verification is out of scope, because it would send users' keys to outside services.
 
 The risk is a real secret that looks like an identifier and has no keyword before it. Filter 3 limits that risk, and the secret suite's 100 formats and 31 mined real secrets must still pass.
+
+## What piifence does now
+
+Filters 1–3 are in place. Provider-format rules and gitleaks are untouched; only spans the model or the key rule finds alone are filtered, and the existing keyword rescue (`keyword_before`, `keyword_above` in `src/guards.rs`) still keeps a value with a secret word right before it.
+
+| Rule | Where | Fixes |
+|---|---|---|
+| `head`, `index` and camelCase keys ending in `Hash`, `Sha`, `Digest`, `Revision`, `Commit` or `Checksum` count as hash words before bare hex | `hash_word` in `src/keyrule.rs` | `pr_head_sha`, `pr_head_yaml`, `diff_index_line`, `skills_lock_hashes` |
+| A secret word inside a file name (`03-tokens-motion.sh`) does not make the next line a labelled value | `free_cue` in `src/keyrule.rs` | `numbered_scripts` |
+| A prefixed value under a JSON key or HTML attribute ending in `_id`, `-id` or `Id` is not a provider key | `id_named` in `src/keyrule.rs` | `deploy_id_attribute` |
+| A model span under such a key or attribute, or after prose that calls it an id (`ids`, `nanoid`, `identifier`, `uuid`, `slug`) within 48 characters on its line, is an identifier | `id_key`, `called_an_id` in `src/guards.rs` | `graph_node_ids`, `nanoid_in_prose`, `deploy_id_attribute` |
+| A CamelCase name alone on its line (also after a `cat -n` line number) whose words are a capital plus lower-case letters with a vowel, or short runs of capitals or digits | `lone_camel_case` in `src/guards.rs` | `rust_enum_variants` |
+| `ls -l` permissions, calendar event instance ids (`<id>_20261116T150000Z`), audio format specs (`<FORMAT><bits>@<rate>`) and chat mentions (`@U…`, `#C…`) are identifier shapes | `identifiers` in `src/guards.rs` | `ls_long_listing`, `calendar_event_ids`, `afconvert_format`, `slack_mention_json` |
+| A number right after `tokens` is a count, not a token, even though `tokens` is a secret word | `token_count` in `src/guards.rs` | `subagent_usage` |
+
+The secret suite went from 30 known gaps to 4, with no regressions and no leaks among the real-secret cases. Left: three false positives mined from real sessions (an app id in prose, a phrase of plain words, a variable name) and `skill_names` (hyphenated skill names in prose), which need the identifier-shape check of filter 2 for hyphenated and snake_case words, or filter 4.
