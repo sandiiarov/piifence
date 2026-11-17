@@ -37,6 +37,10 @@ fn main() {
         Some("env") => print_env(&args[1..]),
         Some("restore") => restore(&args[1..]),
         Some("nested-claude") => run_nested_claude(&args[1..]),
+        // For apps that run Claude Code themselves (docs/embedding.md).
+        Some("gateway") => run_gateway(&args[1..]),
+        Some("session") => new_session(&args[1..]),
+        Some("reveal") => reveal(&args[1..]),
         Some("-h") | Some("--help") | Some("help") | None => {
             usage();
             Ok(0)
@@ -63,7 +67,14 @@ fn usage() {
          Starts the redaction gateway if needed, points this Claude Code session at\n\
          it, and streams responses back untouched. The gateway forwards redacted requests\n\
          to PIIF_UPSTREAM, else the ANTHROPIC_BASE_URL set in your shell or Claude Code\n\
-         settings. No default provider is assumed; one of these must be set."
+         settings. No default provider is assumed; one of these must be set.\n\n\
+         For programs that embed Claude Code (docs/embedding.md):\n  \
+         piifence gateway [--upstream URL] [--pid PID]\n      \
+         Reuse or start the gateway; prints {{\"url\",\"port\",\"upstream\"}}.\n  \
+         piifence session [--session ID] [--qualify-foreign]\n      \
+         Prints {{\"session\",\"port\",\"settings\"}}: env and hooks for one session.\n  \
+         piifence reveal [--session ID | --conversation UUID] [--json]\n      \
+         Prints stdin with names replaced by their values, read only."
     );
 }
 
@@ -135,7 +146,13 @@ fn run_claude(args: &[String]) -> Result<i32> {
     )?;
 
     let session_id = new_session_id().context("cannot create a session id")?;
-    ensure_gateway(&data, port, &upstream, &session_id)?;
+    ensure_gateway(
+        &data,
+        port,
+        &upstream,
+        &session_id,
+        std::process::id() as i32,
+    )?;
     let claude = env::var_os("CLAUDE_BIN").unwrap_or_else(|| "claude".into());
     run_session(
         &gateway_url,
@@ -158,7 +175,13 @@ fn plugins(data: &Path) -> Result<PathBuf> {
 }
 
 /// Make sure a gateway that forwards to `upstream` runs on `port`, starting one if none answers, and lease it so it keeps running while this launcher does. A gateway that is shutting down is waited out and replaced. The launcher never stops a gateway: one it started exits by itself after the last lease ends.
-fn ensure_gateway(data: &Path, port: u16, upstream: &str, session_id: &str) -> Result<()> {
+fn ensure_gateway(
+    data: &Path,
+    port: u16,
+    upstream: &str,
+    session_id: &str,
+    pid: i32,
+) -> Result<()> {
     let gateway_url = format!("http://127.0.0.1:{port}");
     let socket = control_socket(port)?;
     for _ in 0..2 {
@@ -172,7 +195,7 @@ fn ensure_gateway(data: &Path, port: u16, upstream: &str, session_id: &str) -> R
             ),
             None => start_gateway(data, port, &socket, upstream)?,
         }
-        if lease(&socket, session_id)? {
+        if lease(&socket, session_id, pid)? {
             return Ok(());
         }
         wait_until_closed(port)?;
@@ -181,11 +204,8 @@ fn ensure_gateway(data: &Path, port: u16, upstream: &str, session_id: &str) -> R
 }
 
 /// Ask the gateway whose control socket is `socket` to keep running while this process runs session `session_id`. False when the gateway is shutting down (503) or no longer answers. Any other answer means the gateway predates leases.
-fn lease(socket: &Path, session_id: &str) -> Result<bool> {
-    let headers = format!(
-        "x-piifence-session: {session_id}\r\nx-piifence-launcher-pid: {}\r\n",
-        std::process::id()
-    );
+fn lease(socket: &Path, session_id: &str, pid: i32) -> Result<bool> {
+    let headers = format!("x-piifence-session: {session_id}\r\nx-piifence-launcher-pid: {pid}\r\n");
     let Ok(response) = control_get(socket, "/control/lease", &headers, Duration::from_secs(5))
     else {
         return Ok(false);
@@ -451,13 +471,22 @@ fn custom_headers(session_id: &str) -> Result<String> {
         Ok(headers) => Some(headers),
         Err(_) => user_settings_env("ANTHROPIC_CUSTOM_HEADERS")?,
     };
+    Ok(with_session_header(existing.as_deref(), session_id))
+}
+
+/// `existing` headers without any piifence header, which a shell inside another piifence session carries, plus this session's id header.
+fn with_session_header(existing: Option<&str>, session_id: &str) -> String {
+    let mut lines: Vec<&str> = existing
+        .unwrap_or("")
+        .lines()
+        .filter(|line| {
+            let name = line.split_once(':').map_or(*line, |(name, _)| name);
+            !line.trim().is_empty() && !name.trim().to_ascii_lowercase().starts_with("x-piifence-")
+        })
+        .collect();
     let ours = format!("x-piifence-session: {session_id}");
-    Ok(
-        match existing.filter(|headers| !headers.trim().is_empty()) {
-            Some(existing) => format!("{}\n{ours}", existing.trim_end()),
-            None => ours,
-        },
-    )
+    lines.push(&ours);
+    lines.join("\n")
 }
 
 /// The environment the `piifence-session` plugin's hooks read: `PIIF_BIN`, this binary's path, runs `session-start "$PIIF_SESSION" "$PIIF_SESSION_PORT" $PIIF_SESSION_NESTED` and `restore "$PIIF_SESSION" "$PIIF_SESSION_PORT"`. The hooks ship in a plugin rather than in the `--settings` override because a managed policy can drop the hooks of settings files while it still loads plugins. `PIIF_SESSION_NESTED` is set even when empty, so a `claude` started inside a session never keeps its parent's value.
@@ -531,6 +560,7 @@ fn session_start(args: &[String]) -> Result<i32> {
     std::io::stdin()
         .read_to_string(&mut input)
         .context("read the hook input")?;
+    let (args, qualify) = split_flag(args, "qualify");
     let (args, nested) = split_nested(args);
     let (session, port) = session_args(args)?;
     let hook: serde_json::Value =
@@ -558,16 +588,32 @@ fn session_start(args: &[String]) -> Result<i32> {
     if !nested {
         bind_conversation(session, port, conversation)?;
     }
+    let note = if qualify {
+        format!("{VARIABLES_NOTE}\n{QUALIFIED_NOTE}")
+    } else {
+        VARIABLES_NOTE.to_string()
+    };
     println!(
         "{}",
         serde_json::json!({
             "hookSpecificOutput": {
                 "hookEventName": "SessionStart",
-                "additionalContext": VARIABLES_NOTE,
+                "additionalContext": note,
             }
         })
     );
     Ok(0)
+}
+
+/// Added to VARIABLES_NOTE for a session started with `piifence session --qualify-foreign`.
+const QUALIFIED_NOTE: &str = "- Text from another conversation's transcript shows its names as `[[piif:<8 hex>:<n>]]`. Each stands for a value from that other conversation, kept on this machine. Write it exactly as it appears when you mention it, and never put it in a command or a tool argument: nothing fills it in there.";
+
+/// `args` without a trailing `flag`, and whether it was there.
+fn split_flag<'a>(args: &'a [String], flag: &str) -> (&'a [String], bool) {
+    match args {
+        [rest @ .., last] if last == flag => (rest, true),
+        _ => (args, false),
+    }
 }
 
 /// `existing` env file content with every earlier `piifence env` line dropped and `line` added. A resumed conversation keeps its env file, so without this it would also run the lines of its earlier sessions, some through a binary an upgrade has removed.
@@ -740,6 +786,210 @@ fn run_nested_claude(args: &[String]) -> Result<i32> {
         true,
         claude.as_os_str(),
     )
+}
+
+/// Options from `args`: `--name value` or `--name=value` for the names in `with_value`, and bare `--name` for those in `flags`. Anything else is an error.
+fn options(
+    args: &[String],
+    with_value: &[&str],
+    flags: &[&str],
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut found = std::collections::HashMap::new();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        let (name, inline) = match arg.split_once('=') {
+            Some((name, value)) => (name, Some(value.to_string())),
+            None => (arg.as_str(), None),
+        };
+        if with_value.contains(&name) {
+            let value = match inline {
+                Some(value) => value,
+                None => rest
+                    .next()
+                    .with_context(|| format!("{name} needs a value"))?
+                    .clone(),
+            };
+            found.insert(name.to_string(), value);
+        } else if flags.contains(&name) && inline.is_none() {
+            found.insert(name.to_string(), String::new());
+        } else {
+            bail!("unknown option `{arg}`");
+        }
+    }
+    Ok(found)
+}
+
+/// A session id given on the command line: 32 hex digits.
+fn session_option(id: &str) -> Result<String> {
+    if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("--session must be 32 hex digits");
+    }
+    Ok(id.to_ascii_lowercase())
+}
+
+/// `piifence gateway [--upstream <url>] [--pid <pid>]`: make sure a gateway runs, starting one detached when none answers, and print `{"url", "port", "upstream"}`. The gateway is leased for process `--pid`, by default the caller (this command's parent), so it keeps running while that process lives. A gateway on the port that forwards elsewhere is an error, as for `piifence claude`.
+fn run_gateway(args: &[String]) -> Result<i32> {
+    let opts = options(args, &["--upstream", "--pid"], &[])?;
+    let port = port()?;
+    let url = format!("http://127.0.0.1:{port}");
+    let upstream = match opts.get("--upstream") {
+        Some(upstream) if !upstream.is_empty() => upstream.clone(),
+        _ => resolve_upstream(&url)?.context(
+            "no upstream configured: pass --upstream, or set PIIF_UPSTREAM or ANTHROPIC_BASE_URL in your shell or Claude settings",
+        )?,
+    };
+    let pid = match opts.get("--pid") {
+        Some(pid) => pid
+            .parse::<i32>()
+            .ok()
+            .filter(|p| *p > 0)
+            .context("--pid must be a process id")?,
+        None => std::os::unix::process::parent_id() as i32,
+    };
+    let lease_id = new_session_id().context("cannot create a lease id")?;
+    ensure_gateway(&data_dir()?, port, &upstream, &lease_id, pid)?;
+    println!(
+        "{}",
+        serde_json::json!({"url": url, "port": port, "upstream": upstream})
+    );
+    Ok(0)
+}
+
+/// `piifence session [--session <id>] [--qualify-foreign]`: a session for an app that runs Claude Code itself. Prints `{"session", "port", "settings"}`, where `settings` is a Claude Code settings object: the gateway URL, the user's own `ANTHROPIC_CUSTOM_HEADERS` plus the session header, and the `SessionStart` and `PreToolUse` hooks that `piifence claude` gets from the `piifence-session` plugin. `--qualify-foreign` also sends `x-piifence-qualify-foreign`, so the gateway writes other conversations' names as `[[piif:<8 hex>:<n>]]`, and adds a line about them to the session-start note. Start the gateway first with `piifence gateway`.
+fn new_session(args: &[String]) -> Result<i32> {
+    let opts = options(args, &["--session"], &["--qualify-foreign"])?;
+    let port = port()?;
+    let session = match opts.get("--session") {
+        Some(id) => session_option(id)?,
+        None => new_session_id().context("cannot create a session id")?,
+    };
+    let qualify = opts.contains_key("--qualify-foreign");
+    let mut headers = custom_headers(&session)?;
+    if qualify {
+        headers.push_str("\nx-piifence-qualify-foreign: 1");
+    }
+    let exe = shell_quote(&real_exe()?.to_string_lossy());
+    let tail = if qualify { " qualify" } else { "" };
+    let settings = serde_json::json!({
+        "env": {
+            "ANTHROPIC_BASE_URL": format!("http://127.0.0.1:{port}"),
+            "ANTHROPIC_CUSTOM_HEADERS": headers,
+        },
+        "hooks": {
+            "SessionStart": [{"hooks": [{
+                "type": "command",
+                "command": format!("{exe} session-start {session} {port}{tail}"),
+            }]}],
+            "PreToolUse": [{"matcher": "*", "hooks": [{
+                "type": "command",
+                "command": format!("{exe} restore {session} {port}"),
+            }]}],
+        },
+    });
+    println!(
+        "{}",
+        serde_json::json!({"session": session, "port": port, "settings": settings})
+    );
+    Ok(0)
+}
+
+/// The stored table of `conversation` as `{name: value}`, read without changing it. None when there is no Keychain key yet; an empty map when the conversation has no table.
+fn stored_values(
+    names_dir: &Path,
+    conversation: &str,
+) -> Result<Option<std::collections::HashMap<String, String>>> {
+    let Some(key) = piifence::names::read_key()? else {
+        return Ok(None);
+    };
+    let entries = piifence::names::open(&names_dir.join(conversation), conversation, &key)?;
+    Ok(Some(
+        entries
+            .into_iter()
+            .map(|(name, value, _)| (name, value))
+            .collect(),
+    ))
+}
+
+/// `piifence reveal [--session <id> | --conversation <uuid>] [--json]`: the text on stdin with real values in place of names, on stdout. Own names (`$PIIF_SECRET_<n>`, `${PIIF_SECRET_<n>}`) come from the live session through the gateway (`--session`), or from a conversation's stored table (`--conversation`). A qualified name, `[[piif:<8 hex>:<n>]]`, comes from the stored table of the one conversation whose id starts with those 8 hex digits. Stored tables are only read, never saved again. A name that does not resolve stays as it is; `--json` prints `{"text", "unresolved"}` with those names. Values are never logged.
+fn reveal(args: &[String]) -> Result<i32> {
+    let opts = options(args, &["--session", "--conversation"], &["--json"])?;
+    if opts.contains_key("--session") && opts.contains_key("--conversation") {
+        bail!("pass --session or --conversation, not both");
+    }
+    let mut text = String::new();
+    std::io::stdin()
+        .read_to_string(&mut text)
+        .context("read stdin")?;
+    let names_dir = piifence::control::state_dir()?.join("names");
+    let own: std::collections::HashMap<String, String> = if let Some(id) = opts.get("--session") {
+        session_values(&session_option(id)?, port()?)?
+            .into_iter()
+            .filter_map(|(name, value)| Some((name, value.as_str()?.to_string())))
+            .collect()
+    } else if let Some(conversation) = opts.get("--conversation") {
+        if !piifence::names::is_conversation_id(conversation) {
+            bail!("--conversation must be a Claude Code conversation id");
+        }
+        stored_values(&names_dir, conversation)?.unwrap_or_default()
+    } else {
+        Default::default()
+    };
+    let mut unresolved: Vec<String> = Vec::new();
+    let mut miss = |name: &str| {
+        if !unresolved.iter().any(|n| n == name) {
+            unresolved.push(name.to_string());
+        }
+    };
+    let mut tables: std::collections::HashMap<
+        String,
+        Option<std::collections::HashMap<String, String>>,
+    > = Default::default();
+    let qualified =
+        piifence::qualify::qualified_pattern().replace_all(&text, |caps: &regex::Captures| {
+            let prefix = &caps[1];
+            let table = tables.entry(prefix.to_string()).or_insert_with(|| {
+                match piifence::names::conversations_with_prefix(&names_dir, prefix) {
+                    Ok(ids) if ids.len() == 1 => match stored_values(&names_dir, &ids[0]) {
+                        Ok(table) => table,
+                        Err(err) => {
+                            eprintln!("piifence: cannot read the names of {}: {err:#}", ids[0]);
+                            None
+                        }
+                    },
+                    _ => None,
+                }
+            });
+            match table
+                .as_ref()
+                .and_then(|t| t.get(&format!("PIIF_SECRET_{}", &caps[2])))
+            {
+                Some(value) => value.clone(),
+                None => {
+                    miss(&caps[0]);
+                    caps[0].to_string()
+                }
+            }
+        });
+    let revealed = name_pattern().replace_all(&qualified, |caps: &regex::Captures| {
+        let number = caps.get(2).or(caps.get(3)).map_or("", |m| m.as_str());
+        match own.get(&format!("PIIF_SECRET_{number}")) {
+            Some(value) => format!("{}{value}", &caps[1]),
+            None => {
+                let name = caps[0].trim_start_matches('\\');
+                miss(name);
+                caps[0].to_string()
+            }
+        }
+    });
+    if opts.contains_key("--json") {
+        println!(
+            "{}",
+            serde_json::json!({"text": revealed, "unresolved": unresolved})
+        );
+    } else {
+        print!("{revealed}");
+    }
+    Ok(0)
 }
 
 /// Tools whose input a shell reads, which expands `$PIIF_SECRET_<N>` itself from the exported variables, so the hook fills in only the names the shell would not expand (`piifence::shellfill`). The hook leaves `PowerShell` commands alone.
@@ -1080,6 +1330,41 @@ mod tests {
         assert_eq!(nested_session(Some(&headers), None), None);
     }
 
+    #[test]
+    fn session_headers_drop_inherited_piifence_headers() {
+        let session = "b".repeat(32);
+        let parent = format!(
+            "X-Mine: 1\nx-piifence-session: {}\nX-Piifence-Qualify-Foreign: 1\n",
+            "a".repeat(32)
+        );
+        assert_eq!(
+            with_session_header(Some(&parent), &session),
+            format!("X-Mine: 1\nx-piifence-session: {session}")
+        );
+        assert_eq!(
+            with_session_header(None, &session),
+            format!("x-piifence-session: {session}")
+        );
+    }
+
+    #[test]
+    fn options_take_values_and_flags() {
+        let args: Vec<String> = ["--session", "abc", "--json", "--upstream=http://x"]
+            .map(String::from)
+            .to_vec();
+        let found = options(&args, &["--session", "--upstream"], &["--json"]).unwrap();
+        assert_eq!(found["--session"], "abc");
+        assert_eq!(found["--upstream"], "http://x");
+        assert!(found.contains_key("--json"));
+        let bad = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            options(&args, &["--session"], &["--json"]).is_err()
+        };
+        assert!(bad(&["--session"]));
+        assert!(bad(&["--json=1"]));
+        assert!(bad(&["--other"]));
+    }
+
     /// A fresh directory in the temp dir for the test `name`, removed first if it exists.
     fn test_dir(name: &str) -> PathBuf {
         let dir = env::temp_dir().join(format!("piif-test-{name}-{}", std::process::id()));
@@ -1262,18 +1547,24 @@ mod tests {
     #[test]
     fn a_lease_is_held_on_200_and_refused_on_503_or_no_answer() {
         let session = "0".repeat(32);
-        assert!(lease(&socket_answering("HTTP/1.1 200 OK"), &session).unwrap());
+        assert!(lease(&socket_answering("HTTP/1.1 200 OK"), &session, 1).unwrap());
         assert!(!lease(
             &socket_answering("HTTP/1.1 503 Service Unavailable"),
-            &session
+            &session,
+            1
         )
         .unwrap());
-        assert!(!lease(&unused_socket_path(), &session).unwrap());
+        assert!(!lease(&unused_socket_path(), &session, 1).unwrap());
     }
 
     #[test]
     fn a_lease_on_a_gateway_that_predates_leases_is_an_error() {
-        let err = lease(&socket_answering("HTTP/1.1 404 Not Found"), &"0".repeat(32)).unwrap_err();
+        let err = lease(
+            &socket_answering("HTTP/1.1 404 Not Found"),
+            &"0".repeat(32),
+            1,
+        )
+        .unwrap_err();
         assert!(format!("{err:#}").contains("older piifence"), "{err:#}");
     }
 

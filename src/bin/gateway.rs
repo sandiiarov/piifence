@@ -196,6 +196,41 @@ struct Session {
     conversation: Option<String>,
     /// The table's `counter` when it was last saved; None when it must be saved.
     saved: Option<usize>,
+    /// Set once a request carries `QUALIFY_HEADER`: names from other conversations in tool results are rewritten (`qualify_tool_results`).
+    qualify_foreign: bool,
+}
+
+/// The header a session sends (through `ANTHROPIC_CUSTOM_HEADERS`, set by `piifence session --qualify-foreign`) to have names from other conversations rewritten as `[[piif:<8 hex>:<n>]]`. It is stripped before forwarding.
+const QUALIFY_HEADER: &str = "x-piifence-qualify-foreign";
+
+/// Rewrite, in every `tool_result` text of `payload`, each name that belongs to another conversation than `own` as `[[piif:<8 hex>:<n>]]` (`piifence::qualify`). Runs before redaction, so it sees only the names the tool output itself held.
+fn qualify_tool_results(payload: &mut Value, own: Option<&str>) {
+    let rewrite = |text: &mut Value| {
+        if let Some(qualified) = text
+            .as_str()
+            .and_then(|t| piifence::qualify::qualify(t, own))
+        {
+            *text = Value::String(qualified);
+        }
+    };
+    for message in payload["messages"].as_array_mut().into_iter().flatten() {
+        for block in message["content"].as_array_mut().into_iter().flatten() {
+            if block["type"] != "tool_result" {
+                continue;
+            }
+            match block.get_mut("content") {
+                Some(content @ Value::String(_)) => rewrite(content),
+                Some(Value::Array(parts)) => {
+                    for part in parts.iter_mut().filter(|p| p["type"] == "text") {
+                        if let Some(text) = part.get_mut("text") {
+                            rewrite(text);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Where each conversation's table is kept, one encrypted file per conversation id, set once in `main`. The agent's own messages and the files it wrote hold `$PIIF_SECRET_<N>` names, and `claude --resume` or `-c` can bring them back after this gateway has stopped, so the names must outlive it.
@@ -207,28 +242,12 @@ const NAMES_KEPT_DAYS: u64 = 30;
 /// The header the session-start hook sends Claude Code's conversation id in.
 const CONVERSATION_HEADER: &str = "x-piifence-conversation";
 
-/// Apple's Keychain tool, which holds the key the tables are encrypted with. The gateway goes through it rather than the Keychain API so the item belongs to a program that does not change when piifence is updated; otherwise macOS asks for access after every update.
-const SECURITY_TOOL: &str = "/usr/bin/security";
-
-/// The Keychain item (service and account) holding the key.
-const KEY_SERVICE: &str = "piifence";
-const KEY_ACCOUNT: &str = "names-key";
-
-/// `security`'s exit code when no item matches.
-const KEYCHAIN_NOT_FOUND: i32 = 44;
+use piifence::names::{read_key, KEY_ACCOUNT, KEY_SERVICE, SECURITY_TOOL};
 
 static NAMES_KEY: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn unhex(text: &str) -> anyhow::Result<Vec<u8>> {
-    anyhow::ensure!(text.len().is_multiple_of(2) && text.is_ascii(), "not hex");
-    (0..text.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).context("not hex"))
-        .collect()
 }
 
 fn random_bytes<const N: usize>() -> anyhow::Result<[u8; N]> {
@@ -238,33 +257,6 @@ fn random_bytes<const N: usize>() -> anyhow::Result<[u8; N]> {
         .and_then(|mut f| f.read_exact(&mut bytes))
         .context("read /dev/urandom")?;
     Ok(bytes)
-}
-
-/// The key as stored, or None when there is none yet.
-fn read_key() -> anyhow::Result<Option<[u8; 32]>> {
-    let out = std::process::Command::new(SECURITY_TOOL)
-        .args([
-            "find-generic-password",
-            "-s",
-            KEY_SERVICE,
-            "-a",
-            KEY_ACCOUNT,
-            "-w",
-        ])
-        .output()
-        .context("run security")?;
-    if out.status.code() == Some(KEYCHAIN_NOT_FOUND) {
-        return Ok(None);
-    }
-    anyhow::ensure!(
-        out.status.success(),
-        "read piifence's key from the Keychain: {}",
-        String::from_utf8_lossy(&out.stderr).trim()
-    );
-    let key = unhex(String::from_utf8_lossy(&out.stdout).trim())?;
-    Ok(Some(key.try_into().map_err(|_| {
-        anyhow::anyhow!("piifence's Keychain key is not 32 bytes")
-    })?))
 }
 
 /// The key the tables are encrypted with, created in the Keychain on first use. It is added without `-U`, so when two gateways race the second add fails and both read the one that won.
@@ -307,44 +299,11 @@ fn names_path(conversation: &str) -> anyhow::Result<PathBuf> {
 
 /// The stored `(name, value, kind)` table of `conversation`, empty when it has none.
 fn load_names(conversation: &str) -> anyhow::Result<Vec<(String, String, String)>> {
-    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
     let path = names_path(conversation)?;
-    let sealed = match std::fs::read(&path) {
-        Ok(sealed) => sealed,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
-    };
-    anyhow::ensure!(sealed.len() > 24, "{} is cut short", path.display());
-    let cipher = chacha20poly1305::XChaCha20Poly1305::new(&names_key()?.into());
-    let (nonce, data) = sealed.split_at(24);
-    let plain = cipher
-        .decrypt(
-            nonce.into(),
-            Payload {
-                msg: data,
-                aad: conversation.as_bytes(),
-            },
-        )
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "{} does not decrypt with piifence's Keychain key",
-                path.display()
-            )
-        })?;
-    let entries: Vec<Value> =
-        serde_json::from_slice(&plain).context("the stored table is not a JSON list")?;
-    entries
-        .iter()
-        .map(|e| {
-            let field = |key: &str| {
-                e[key]
-                    .as_str()
-                    .map(str::to_string)
-                    .with_context(|| format!("a stored entry has no {key}"))
-            };
-            Ok((field("name")?, field("value")?, field("kind")?))
-        })
-        .collect()
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    piifence::names::open(&path, conversation, &names_key()?)
 }
 
 /// Save the session's table when it is bound to a conversation and has changed since the last save. The file is written whole under a temporary name and renamed, so a reader never sees half of it.
@@ -1200,6 +1159,10 @@ fn sweep(
 async fn redact_request(state: &AppState, body: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut payload: Value = serde_json::from_slice(body).context("request body is not JSON")?;
     let started = std::time::Instant::now();
+    let (qualify, own) = with_session(state, |s| (s.qualify_foreign, s.conversation.clone()));
+    if qualify {
+        qualify_tool_results(&mut payload, own.as_deref());
+    }
     let mut audit = redact_payload(state, &mut payload).await?;
     audit.append(&mut sweep_values(state, &mut payload)?);
     save_names(state)?;
@@ -1240,6 +1203,9 @@ async fn proxy(
         session: session_id(&headers),
         ..state
     };
+    if !state.session.is_empty() && headers.contains_key(QUALIFY_HEADER) {
+        with_session(&state, |session| session.qualify_foreign = true);
+    }
     let path = uri.path();
     if path == "/health" {
         // The launcher reads this header on the control socket and compares it to its own upstream before reusing a gateway. `tcp_only` removes it from the answer on TCP.
@@ -1361,7 +1327,12 @@ async fn proxy(
     for (name, value) in headers.iter() {
         if matches!(
             name.as_str(),
-            "host" | "content-length" | "accept-encoding" | "connection" | SESSION_HEADER
+            "host"
+                | "content-length"
+                | "accept-encoding"
+                | "connection"
+                | SESSION_HEADER
+                | QUALIFY_HEADER
         ) {
             continue;
         }
@@ -1533,6 +1504,29 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qualifying_rewrites_only_tool_results() {
+        let name = format!("${}_3", "PIIF_SECRET");
+        let other = "abcdef01-2222-3333-4444-555555555555";
+        let own = "11111111-2222-3333-4444-555555555555";
+        let line = format!("{other}\ttoken {name}");
+        let mut payload = serde_json::json!({"messages": [
+            {"role": "user", "content": line},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": line},
+                {"type": "tool_result", "tool_use_id": "b", "content": [{"type": "text", "text": line}]},
+                {"type": "tool_result", "tool_use_id": "c", "content": format!("{own}\t{name}")},
+            ]},
+        ]});
+        super::qualify_tool_results(&mut payload, Some(own));
+        let qualified = format!("{other}\ttoken [[piif:abcdef01:3]]");
+        assert_eq!(payload["messages"][0]["content"], line.as_str());
+        let blocks = &payload["messages"][1]["content"];
+        assert_eq!(blocks[0]["content"], qualified.as_str());
+        assert_eq!(blocks[1]["content"][0]["text"], qualified.as_str());
+        assert_eq!(blocks[2]["content"], format!("{own}\t{name}").as_str());
+    }
 
     #[test]
     fn only_agent_turns_offer_tools() {

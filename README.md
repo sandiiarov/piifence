@@ -300,6 +300,7 @@ PIIF_MODEL_DIR=/tmp/piifence-model scripts/check.sh    # every check, including 
 |---|---|
 | [`CLAUDE.md`](CLAUDE.md) | Architecture, module ownership and contracts. |
 | [`tests/secrets/README.md`](tests/secrets/README.md) | The end-to-end secret suite: 943 cases through the real gateway. |
+| [`docs/embedding.md`](docs/embedding.md) | `piifence gateway`, `session` and `reveal`, for programs that run Claude Code themselves. |
 | [`docs/model-options.md`](docs/model-options.md) | Why piifence uses SporeLabs Scrub, with the benchmarks. |
 | [`docs/research/`](docs/research/README.md) | What other secret detectors, redaction proxies and papers do, and what piifence can take from them. |
 | [`plugin/piifence-notice/README.md`](plugin/piifence-notice/README.md) | The plugin that shows what was replaced. |
