@@ -1139,7 +1139,7 @@ fn conversation_values(
 /// Tools whose input a shell reads, which expands `$PIIF_SECRET_<N>` itself from the exported variables, so the hook fills in only the names the shell would not expand (`piifence::shellfill`). The hook leaves `PowerShell` commands alone.
 const SHELL_TOOLS: &[&str] = &["Bash", "Monitor"];
 
-/// `piifence restore <port>`, the `PreToolUse` hook. The agent only ever sees names, so it writes `$PIIF_SECRET_<N>` into file contents, edits, and MCP tool arguments, where no shell expands it. This puts each known name's real value back into the tool's input before the tool runs. A backslash that escapes a name's `$` goes with the name. In `Bash` and `Monitor` commands only the names the shell would not expand are filled in, escaped for where they stand (`SHELL_TOOLS`). `PowerShell` and inputs without a name are left alone. A failure exits 2, which blocks the call, so a tool never runs with a name where a value belongs.
+/// `piifence restore <port>`, the `PreToolUse` hook. The agent only ever sees names, so it writes `$PIIF_SECRET_<N>` into file contents, edits, and MCP tool arguments, where no shell expands it. This puts each known name's real value back into the tool's input before the tool runs. A backslash that escapes a name's `$` goes with the name. In `Bash` and `Monitor` commands only the names the shell would not expand are filled in, escaped for where they stand (`SHELL_TOOLS`); their other fields, such as the description, get every name filled. `PowerShell` and inputs without a name are left alone. A failure exits 2, which blocks the call, so a tool never runs with a name where a value belongs.
 fn restore(args: &[String]) -> Result<i32> {
     match restored_input(args) {
         Ok(Some(input)) => {
@@ -1169,31 +1169,47 @@ fn restored_input(args: &[String]) -> Result<Option<serde_json::Value>> {
     if tool == "PowerShell" {
         return Ok(None);
     }
-    let mut tool_input = hook
+    let tool_input = hook
         .get("tool_input")
         .context("the hook input has no tool_input")?
         .clone();
-    if SHELL_TOOLS.contains(&tool) {
-        let Some(command) = tool_input["command"].as_str() else {
-            return Ok(None);
-        };
-        if !name_pattern().is_match(command) {
-            return Ok(None);
-        }
-        let values = session_values(&session, port)?;
-        let value_of = |var: &str| values.get(var).and_then(|v| v.as_str()).map(str::to_string);
-        let Some(command) = piifence::shellfill::fill_command(command, &value_of)? else {
-            return Ok(None);
-        };
-        tool_input["command"] = command.into();
-        return Ok(Some(tool_input));
-    }
     if !names_in(&tool_input) {
         return Ok(None);
     }
     let values = session_values(&session, port)?;
-    fill_values(&mut tool_input, &values)?;
-    Ok(Some(tool_input))
+    fill_tool_input(tool, tool_input, &values)
+}
+
+/// `input` with names replaced by values, or None when nothing changes. In the `command` of a shell tool (`SHELL_TOOLS`) only the names the shell would not expand are filled (`piifence::shellfill`); every other string, such as a shell tool's `description`, which Claude Code shows in its task list, gets every name filled.
+fn fill_tool_input(
+    tool: &str,
+    mut input: Value,
+    values: &serde_json::Map<String, Value>,
+) -> Result<Option<Value>> {
+    if !SHELL_TOOLS.contains(&tool) {
+        fill_values(&mut input, values)?;
+        return Ok(Some(input));
+    }
+    let Some(fields) = input.as_object_mut() else {
+        return Ok(None);
+    };
+    let mut changed = false;
+    for (key, field) in fields.iter_mut() {
+        if !names_in(field) {
+            continue;
+        }
+        if let ("command", Value::String(command)) = (key.as_str(), &*field) {
+            let value_of = |var: &str| values.get(var).and_then(|v| v.as_str()).map(str::to_string);
+            if let Some(filled) = piifence::shellfill::fill_command(command, &value_of)? {
+                *field = filled.into();
+                changed = true;
+            }
+        } else {
+            fill_values(field, values)?;
+            changed = true;
+        }
+    }
+    Ok(changed.then_some(input))
 }
 
 /// `$PIIF_SECRET_12` or `${PIIF_SECRET_12}`; the number is read whole, so `_1` never matches inside `_12`. Group 1 holds the backslashes right before the `$`: an odd count escapes the `$`, so the escaping backslash belongs to the name.
@@ -1683,6 +1699,36 @@ mod tests {
         assert!(plist.contains("<key>KeepAlive</key><true/>"));
         assert_eq!(agent_label(DEFAULT_PORT), "com.piifence.gateway");
         assert_eq!(agent_label(7797), "com.piifence.gateway.7797");
+    }
+
+    #[test]
+    fn a_shell_tool_gets_its_description_filled_and_its_command_left_to_the_shell() {
+        let values = serde_json::json!({"PIIF_SECRET_1": "imbi"});
+        let values = values.as_object().unwrap();
+        let input = serde_json::json!({
+            "command": format!("npm run dev -- --name \"{}\"", bare(1)),
+            "description": format!("Start the {} UI dev server", bare(1)),
+            "run_in_background": true,
+        });
+        let filled = fill_tool_input("Bash", input.clone(), values)
+            .unwrap()
+            .unwrap();
+        assert_eq!(filled["command"], input["command"]);
+        assert_eq!(filled["description"], "Start the imbi UI dev server");
+        assert_eq!(filled["run_in_background"], true);
+        let keys: Vec<&String> = filled.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["command", "description", "run_in_background"]);
+
+        let quoted =
+            serde_json::json!({"command": format!("echo '{}'", bare(1)), "description": "x"});
+        let filled = fill_tool_input("Monitor", quoted, values).unwrap().unwrap();
+        assert_eq!(filled["command"], "echo 'imbi'");
+
+        let expanded = serde_json::json!({"command": format!("echo \"{}\"", braced(1)), "description": "plain"});
+        assert_eq!(fill_tool_input("Bash", expanded, values).unwrap(), None);
+
+        let unknown = serde_json::json!({"command": "true", "description": bare(2)});
+        assert!(fill_tool_input("Bash", unknown, values).is_err());
     }
 
     #[test]
